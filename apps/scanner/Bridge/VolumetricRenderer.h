@@ -33,8 +33,8 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///               `drawableSize` must already be set in **pixels**.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
-- (nullable instancetype)initWithLayer:(CAMetalLayer *)layer
-                                 error:(NSError **)error
+- (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
+                                 error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
@@ -50,16 +50,16 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @param size   The drawable size in pixels.
 /// @param error  Populated on a hard failure.
 /// @return `YES` if the frame was drawn or legitimately skipped.
-- (BOOL)renderFrameWithDrawableSize:(CGSize)size error:(NSError **)error;
+- (BOOL)renderFrameWithDrawableSize:(CGSize)size error:(NSError**)error;
 
 /// @brief Block until the renderer's queues are idle. Call before teardown.
 - (void)waitIdle;
 
 /// The GPU the renderer selected, e.g. "Apple M5 GPU".
-@property(nonatomic, readonly, copy) NSString *deviceName;
+@property(nonatomic, readonly, copy) NSString* deviceName;
 
 /// The negotiated Vulkan API version, e.g. "1.4.357".
-@property(nonatomic, readonly, copy) NSString *apiVersion;
+@property(nonatomic, readonly, copy) NSString* apiVersion;
 
 /// Frames successfully presented since bring-up.
 @property(nonatomic, readonly) uint64_t framesPresented;

@@ -32,8 +32,8 @@ void set_error(NSError** error, const vg::Status& status, const char* stage) {
   if (error == nullptr) {
     return;
   }
-  NSString* message = [NSString
-      stringWithFormat:@"%s: %s", stage, status.message().c_str()];
+  NSString* message =
+      [NSString stringWithFormat:@"%s: %s", stage, status.message().c_str()];
   *error = [NSError errorWithDomain:kErrorDomain
                                code:static_cast<NSInteger>(status.code())
                            userInfo:@{NSLocalizedDescriptionKey : message}];

@@ -9,8 +9,10 @@
 # bridging header is both more robust and how Apple lays these projects out
 # anyway.
 #
+# ~~~
 #   scanner_bridge  Objective-C++ + C++  -- owns Vulkan, recon, gfx
 #   scanner         Swift                -- owns the app, view, lifecycle
+# ~~~
 #
 # This step brings up gfx on a CAMetalLayer and draws a procedural triangle.
 # ARKit capture and recon fusion land on top of the same seam.
@@ -43,14 +45,13 @@ vr_embed_shaders(
 target_include_directories(scanner_bridge
                            PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-target_link_libraries(
-  scanner_bridge PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core)
+target_link_libraries(scanner_bridge PUBLIC volumetric_kit::gfx_app
+                                            volumetric_kit::gfx_core)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
-  ${VI_APP_NAME} MACOSX_BUNDLE
-  Swift/AppDelegate.swift Swift/MetalView.swift
-  Swift/ScannerViewController.swift)
+  ${VI_APP_NAME} MACOSX_BUNDLE Swift/AppDelegate.swift Swift/MetalView.swift
+                               Swift/ScannerViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
 
@@ -60,35 +61,42 @@ target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
 # slice will need.
 target_link_libraries(
   ${VI_APP_NAME}
-  PRIVATE "-framework Metal" "-framework Foundation" "-framework QuartzCore"
-          "-framework IOSurface" "-framework CoreGraphics"
-          "-framework CoreVideo" "-framework UIKit")
+  PRIVATE "-framework Metal"
+          "-framework Foundation"
+          "-framework QuartzCore"
+          "-framework IOSurface"
+          "-framework CoreGraphics"
+          "-framework CoreVideo"
+          "-framework UIKit")
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
 
 set_target_properties(
   ${VI_APP_NAME}
-  PROPERTIES
-    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
-    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${VI_BUNDLE_ID}"
-    # Universal (1 = iPhone, 2 = iPad). This must be the *build setting*, not a
-    # UIDeviceFamily key in Info.plist.in: Xcode rewrites that key from
-    # TARGETED_DEVICE_FAMILY while processing the plist, so a value set there is
-    # silently overwritten. Left at the iPhone-only default, an iPad runs the app
-    # in compatibility mode and hands the CAMetalLayer a 750x1334 letterboxed
-    # drawable instead of the real display.
-    XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
-    XCODE_ATTRIBUTE_SWIFT_VERSION "5.0"
-    # The header that makes VolumetricRenderer visible to Swift.
-    XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER
-    "${CMAKE_CURRENT_SOURCE_DIR}/Bridge/Scanner-Bridging-Header.h"
-    # A Swift target linking C++ needs the C++ standard library named
-    # explicitly; the Swift driver does not infer it from the linked archive.
-    XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"
-    XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
-    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${VI_DEVELOPMENT_TEAM}"
-    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development")
+  PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+             XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${VI_BUNDLE_ID}"
+             # ~~~
+             # Universal (1 = iPhone, 2 = iPad). This must be the *build
+             # setting*, not a UIDeviceFamily key in Info.plist.in: Xcode
+             # rewrites that key from TARGETED_DEVICE_FAMILY while processing
+             # the plist, so a value set there is silently overwritten. Left at
+             # the iPhone-only default, an iPad runs the app in compatibility
+             # mode and hands the CAMetalLayer a 750x1334 letterboxed drawable
+             # instead of the real display.
+             # ~~~
+             XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+             XCODE_ATTRIBUTE_SWIFT_VERSION "5.0"
+             # The header that makes VolumetricRenderer visible to Swift.
+             XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER
+             "${CMAKE_CURRENT_SOURCE_DIR}/Bridge/Scanner-Bridging-Header.h"
+             # A Swift target linking C++ needs the C++ standard library named
+             # explicitly; the Swift driver does not infer it from the linked
+             # archive.
+             XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"
+             XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+             XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${VI_DEVELOPMENT_TEAM}"
+             XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development")
 
 if(NOT VI_DEVELOPMENT_TEAM)
   message(
