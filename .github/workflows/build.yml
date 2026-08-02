@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # glslc compiles the GLSL to SPIR-V at build time. It is a *host* tool
       # here -- the toolchain file resolves it with NO_CMAKE_FIND_ROOT_PATH so a
@@ -33,7 +33,7 @@ jobs:
       # vendored. Cache it on the pinned version so a run costs one download.
       - name: Cache MoltenVK
         id: cache-moltenvk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: third_party/MoltenVK
           key: moltenvk-ios-${{ hashFiles('tools/fetch_moltenvk.sh') }}
@@ -46,7 +46,7 @@ jobs:
       # the CMakeLists that pins them, so a pin bump re-fetches and nothing else
       # does.
       - name: Cache FetchContent dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build-ios/_deps
           key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}

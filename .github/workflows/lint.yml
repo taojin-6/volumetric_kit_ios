@@ -18,14 +18,14 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       # Cache pre-commit's installed hook environments (incl. the pinned
       # clang-format) keyed on the config so they're only rebuilt when it
       # changes.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
@@ -35,7 +35,7 @@ jobs:
             pre-commit-${{ runner.os }}-
       # Pin the runner so a new upstream pre-commit release cannot change the
       # merge gate's behavior without a commit here.
-      - run: python -m pip install pre-commit==4.0.1
+      - run: python -m pip install pre-commit==4.6.1
       - name: Report the swift-format in use
         run: xcrun swift-format --version
       - run: pre-commit run --all-files --show-diff-on-failure
