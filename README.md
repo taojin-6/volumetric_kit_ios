@@ -92,6 +92,14 @@ that no longer compiles, all of which happened while standing this repo up. A
 final step asserts each bundle is really iOS arm64 (`LC_BUILD_VERSION`
 `platform 2`), since a host-vs-target mixup would otherwise pass silently.
 
+It also runs **nightly**, not only on push and pull request. recon is consumed
+at `GIT_TAG main` rather than a fixed tag, so the sibling breakage above arrives
+on upstream's schedule, not on ours — without a scheduled run it would sit
+undetected until the next push here. For the same reason the dependency cache is
+keyed on recon's resolved tip commit and carries no `restore-keys`: a key that
+ignored the moving ref would go on hitting a pre-drift source tree and report
+green against stale sources.
+
 ## Apps
 
 ### `compute_smoke`

@@ -13,9 +13,18 @@ name: lint
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   lint:
-    runs-on: macos-latest
+    # Pinned, and here it decides the gate's behavior rather than just the
+    # build's: the swift-format hook is whatever `xcrun` finds in the image's
+    # Xcode, so an image rollover under macos-latest can reformat Swift and fail
+    # a PR that touched no Swift at all. Pinning removes the rollover; it cannot
+    # remove Xcode updates within the image, which is why the version is still
+    # printed below -- a drift shows up in the log rather than as a mystery.
+    runs-on: macos-26
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

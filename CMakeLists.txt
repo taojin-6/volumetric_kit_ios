@@ -45,7 +45,10 @@ set(VI_BUNDLE_PREFIX
 #
 # For local development against a working tree, point CMake at it instead of the
 # remote:
-# -DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON=/path/to/volumetric_kit_recon
+#
+# ~~~
+#   -DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON=/path/to/volumetric_kit_recon
+# ~~~
 include(FetchContent)
 
 # --- glm, header-only ---------------------------------------------------------
