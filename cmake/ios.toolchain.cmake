@@ -49,6 +49,13 @@ if(NOT VI_MOLTENVK_DIR)
       CACHE PATH "MoltenVK iOS distribution root (contains include/ + static/)")
 endif()
 
+# CMake re-runs this toolchain inside the throwaway projects it builds for
+# compiler ABI detection, and those do NOT inherit the outer cache -- so a
+# -DVI_MOLTENVK_DIR pointing outside the default location would be lost there
+# and the existence check below would fail the configure before the real project
+# was ever reached. Forwarding it keeps an explicit override working.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES VI_MOLTENVK_DIR)
+
 set(_vi_mvk_lib
     "${VI_MOLTENVK_DIR}/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a")
 set(_vi_mvk_inc "${VI_MOLTENVK_DIR}/include")

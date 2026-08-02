@@ -9,7 +9,11 @@ project(
   DESCRIPTION
     "iOS application shell for the volumetric_kit family: ARKit capture -> volumetric_kit_recon fusion -> volumetric_kit_gfx rendering, on MoltenVK"
   HOMEPAGE_URL "https://github.com/taojin-6/volumetric_kit_ios"
-  LANGUAGES CXX)
+  # Swift for the app shell and UI, Objective-C++ for the seam onto the C++
+  # libraries. ARKit and UIKit are Swift-first, and the UI grows from here;
+  # Objective-C++ stays the bridge because an .mm is the only translation unit
+  # where an ARFrame and a C++ move-only type are both first-class.
+  LANGUAGES CXX OBJCXX Swift)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -92,4 +96,21 @@ FetchContent_Declare(
 # force off here; that default is doing the work.
 FetchContent_MakeAvailable(volumetric_kit_recon)
 
+# gfx: the renderer. Its examples need GLFW and its tests need googletest, and
+# both default to "am I top level?" -- OFF for a fetched copy -- so only the
+# library tiers build. VG_WITH_GLFW gates examples only; the library tiers are
+# GLFW-free by design, which is exactly why gfx ports to iOS untouched: its
+# windowing tier takes a consumer-supplied surface rather than owning a window
+# system.
+FetchContent_Declare(
+  volumetric_kit_gfx
+  GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
+  GIT_TAG main
+  GIT_SHALLOW TRUE)
+set(VG_WITH_GLFW
+    OFF
+    CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(volumetric_kit_gfx)
+
 add_subdirectory(apps/compute_smoke)
+add_subdirectory(apps/scanner)

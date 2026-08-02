@@ -100,7 +100,49 @@ keyed on recon's resolved tip commit and carries no `restore-keys`: a key that
 ignored the moving ref would go on hitting a pre-drift source tree and report
 green against stale sources.
 
+## Language split
+
+Swift owns the app; Objective-C++ owns the seam; C++ is the engine.
+
+```
+Swift          app shell, UI, lifecycle (later: ARSession config, permissions)
+    ↓ bridging header
+Obj-C++ (.mm)  VolumetricRenderer — CAMetalLayer → VkSurfaceKHR, ARFrame → PODs
+    ↓
+C++            volumetric_kit_recon + volumetric_kit_gfx
+```
+
+The bridge is Objective-C++ rather than Swift because an `.mm` is the one
+translation unit where a `CAMetalLayer*` and a `vg::app::WindowedApp` are both
+first-class — no marshalling layer needed. Swift's C++ interop struggles exactly
+where these libraries live: recon and gfx are move-only types returning
+`Result<T>`, and Vulkan's `pNext` struct chains are unpleasant from Swift. So the
+seam stays a narrow Objective-C class that hands Swift plain values and
+`NSError`s.
+
+Each app is therefore **two CMake targets** — a static library for the
+Obj-C++/C++ bridge, and the Swift app linking it through a bridging header.
+Mixing Swift and C++ in a *single* target under the Xcode generator is the
+fragile configuration.
+
 ## Apps
+
+### `scanner`
+
+The live reconstruction app. Currently: gfx brought up on a `CAMetalLayer` and
+drawing a procedural triangle, driven by a `CADisplayLink`, with an on-screen
+read-out of GPU, API version, drawable size, presented frames, and fps.
+
+This step exists to retire two risks together — the `CAMetalLayer` →
+`VK_EXT_metal_surface` → swapchain → present path, and the mixed-language build.
+The triangle is deliberately *procedural* (positions from `gl_VertexIndex`, no
+vertex buffer), so it proves the whole **graphics** pipeline works under MoltenVK
+on iOS — shader modules, spirv-cross reflection, dynamic rendering, rasterised
+interpolation — without the distraction of geometry. `compute_smoke` proved the
+compute path; this proves the render path.
+
+Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the native
+2420×1668, triangle on screen.
 
 ### `compute_smoke`
 
@@ -142,17 +184,21 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 ## Roadmap
 
 1. ✅ **`compute_smoke`** — recon's compute path on device.
-2. **`triangle`** — gfx rendering to a `CAMetalLayer` surface via
-   `VK_EXT_metal_surface`, proving the render path.
+2. ✅ **`scanner` bring-up** — gfx rendering to a `CAMetalLayer` surface via
+   `VK_EXT_metal_surface`, proving the render path and the Swift/Obj-C++ build.
 3. **ARKit capture** — an `ICameraCapture` source in recon's `sensor` tier
    feeding `sceneDepth` (256×192 float metres), `capturedImage` (YCbCr 420, needs
    conversion), and `camera.transform`. ARKit is +Y up / −Z forward while recon
    projects +Z forward, so poses convert as
    `T_world_cv = T_world_arkit · diag(1, −1, −1, 1)`. Depth and colour have
    different resolutions, which recon already models as separate
-   `DepthCameraParams` and `ColorCameraParams`. Records sequences to disk so
-   captures replay on desktop through recon's `fuse_replica`.
-4. **`scanner`** — fuse and render live, one shared `VkDevice` built from
+   `DepthCameraParams` and `ColorCameraParams`. ARKit's depth is *registered* to
+   the colour camera, so the two share a pose and differ only in intrinsics
+   scale — which avoids the unregistered-camera caveats recon's integrator
+   documents.
+4. **Live fusion** — fuse and render live in `scanner`: ARKit frames feed recon
+   on a background thread while the render thread draws the growing mesh, the
+   `fuse_viewer` model. Then one shared `VkDevice` built from
    `vr::Device::requirements()` ∪ `vg::Device::requirements()` and handed to both
    via `Device::adopt`. Starts on interop seam A (host mesh, as `fuse_viewer`
    does) and moves to seam B (indirect draw over a mesh ring with a timeline

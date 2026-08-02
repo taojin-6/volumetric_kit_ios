@@ -51,6 +51,10 @@ set_target_properties(
   ${VI_APP_NAME}
   PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
              XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${VI_BUNDLE_ID}"
+             # Universal (1 = iPhone, 2 = iPad); see the note in apps/scanner.
+             # Xcode rewrites UIDeviceFamily from this setting, so the plist
+             # cannot carry it.
+             XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
              # Automatic signing: Xcode provisions the app against the team
              # below on first build, so no checked-in provisioning profile.
              XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"

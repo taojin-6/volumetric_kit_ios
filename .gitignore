@@ -4,7 +4,12 @@ DerivedData/
 
 # MoltenVK is fetched, not vendored: a 34 MB upstream binary artifact with a
 # stable release URL. tools/fetch_moltenvk.sh populates this.
-third_party/MoltenVK/
+#
+# No trailing slash: that form matches only a real directory, and a worktree
+# will typically *symlink* this to the main checkout's copy rather than
+# re-downloading 34 MB. Git sees a symlink as a file, so the directory-only
+# pattern would leave it untracked-but-visible.
+third_party/MoltenVK
 third_party/*.tar
 
 # macOS / Xcode
