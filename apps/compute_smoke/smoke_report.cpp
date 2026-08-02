@@ -91,14 +91,99 @@ std::string api_version_string(std::uint32_t v) {
 // the 1.2 floor recon requires (and the 1.3 floor gfx requires, for the shared
 // device later); is scalarBlockLayout there (recon's whole buffer ABI rests on
 // it); and are timeline semaphores there (the interop-seam handoff).
-void stage_device_caps(Report& report, VkPhysicalDevice physical) {
+//
+// IMPORTANT: this stage must NOT reuse recon's VkInstance. recon negotiates
+// VkApplicationInfo::apiVersion = 1.2 (it needs no more), and MoltenVK caps the
+// apiVersion a physical device *advertises* to what its instance asked for --
+// so querying through recon's instance can never report above 1.2 and would
+// make gfx's 1.3 floor look unsupported on hardware that in fact supports it.
+// The question here is "what can this GPU do", not "what did recon ask for", so
+// we probe through our own instance created at the implementation's maximum.
+struct ProbeInstance {
+  VkInstance handle = VK_NULL_HANDLE;
+  ~ProbeInstance() {
+    if (handle != VK_NULL_HANDLE) {
+      vkDestroyInstance(handle, nullptr);
+    }
+  }
+  ProbeInstance() = default;
+  ProbeInstance(const ProbeInstance&) = delete;
+  ProbeInstance& operator=(const ProbeInstance&) = delete;
+};
+
+// Create an instance at the highest API version the implementation supports, so
+// the physical device reports its true ceiling.
+bool create_probe_instance(ProbeInstance& out, std::uint32_t api_version) {
+  VkApplicationInfo app{};
+  app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app.pApplicationName = "volumetric_kit iOS capability probe";
+  app.apiVersion = api_version;
+
+  // Portability enumeration is how a portability driver (MoltenVK) becomes
+  // visible when a real loader is in play. Directly linked it is unnecessary,
+  // so a failure here retries without it rather than giving up.
+  const char* portability_ext = "VK_KHR_portability_enumeration";
+  VkInstanceCreateInfo ci{};
+  ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  ci.pApplicationInfo = &app;
+  ci.enabledExtensionCount = 1;
+  ci.ppEnabledExtensionNames = &portability_ext;
+#ifdef VK_KHR_portability_enumeration
+  ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
+  if (vkCreateInstance(&ci, nullptr, &out.handle) == VK_SUCCESS) {
+    return true;
+  }
+
+  ci.flags = 0;
+  ci.enabledExtensionCount = 0;
+  ci.ppEnabledExtensionNames = nullptr;
+  return vkCreateInstance(&ci, nullptr, &out.handle) == VK_SUCCESS;
+}
+
+void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   report.section("Stage 0: device capabilities");
+
+  // The instance-level ceiling: the most any instance on this implementation
+  // may request.
+  std::uint32_t instance_version = VK_API_VERSION_1_0;
+  if (vkEnumerateInstanceVersion(&instance_version) != VK_SUCCESS) {
+    instance_version = VK_API_VERSION_1_0;
+  }
+  report.field("instance API ceiling", api_version_string(instance_version));
+
+  ProbeInstance probe;
+  VkPhysicalDevice physical = recon_physical;
+  bool probed = false;
+  if (create_probe_instance(probe, instance_version)) {
+    std::uint32_t count = 0;
+    vkEnumeratePhysicalDevices(probe.handle, &count, nullptr);
+    if (count > 0) {
+      std::vector<VkPhysicalDevice> devices(count);
+      if (vkEnumeratePhysicalDevices(probe.handle, &count, devices.data()) ==
+          VK_SUCCESS) {
+        physical = devices[0];
+        probed = true;
+      }
+    }
+  }
+  report.field("capability source",
+               probed ? "dedicated max-version probe instance"
+                      : "recon's 1.2 instance (probe failed; API version and "
+                        "1.3 features below are CAPPED and not conclusive)");
 
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(physical, &props);
   report.field("device", props.deviceName);
   report.field("Vulkan API", api_version_string(props.apiVersion));
   report.field("driver version", std::to_string(props.driverVersion));
+
+  // For contrast: what recon's own 1.2 instance sees. Expected to read 1.2 even
+  // on a 1.3+ device -- that is the cap described above, not a limitation.
+  VkPhysicalDeviceProperties recon_props{};
+  vkGetPhysicalDeviceProperties(recon_physical, &recon_props);
+  report.field("as advertised to recon's 1.2 instance",
+               api_version_string(recon_props.apiVersion));
 
   VkPhysicalDeviceVulkan12Features features12{};
   features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;

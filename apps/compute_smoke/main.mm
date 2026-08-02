@@ -12,6 +12,7 @@
 
 #import <UIKit/UIKit.h>
 
+#include <cstdio>
 #include <string>
 
 #include "smoke_report.hpp"
@@ -73,8 +74,12 @@
         const std::string report =
             volumetric_kit::ios_app::run_smoke_report();
         NSString* text = [NSString stringWithUTF8String:report.c_str()];
-        // Also to the device console, so `devicectl` / Console.app captures the
-        // report without needing the screen.
+        // Also off-screen, two ways. stdout is what
+        // `devicectl device process launch --console` relays, which makes the
+        // smoke scriptable from the build host; NSLog additionally lands in the
+        // unified log for Console.app.
+        std::fputs(report.c_str(), stdout);
+        std::fflush(stdout);
         NSLog(@"%@", text);
         dispatch_async(dispatch_get_main_queue(), ^{
           [self->_spinner stopAnimating];
