@@ -1,0 +1,14 @@
+# Build trees
+build*/
+DerivedData/
+
+# MoltenVK is fetched, not vendored: a 34 MB upstream binary artifact with a
+# stable release URL. tools/fetch_moltenvk.sh populates this.
+third_party/MoltenVK/
+third_party/*.tar
+
+# macOS / Xcode
+.DS_Store
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist

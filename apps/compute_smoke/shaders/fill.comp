@@ -1,0 +1,23 @@
+#version 450
+
+// Compute smoke shader: write each element's global invocation index into a
+// storage buffer. The minimal kernel that proves the chain end to end on the
+// target GPU -- build a compute pipeline, bind an SSBO + push constants,
+// dispatch through MoltenVK on iOS, and hand back a result the host can verify.
+//
+// A flat uint array needs no scalar block layout; std430 and scalar agree for
+// uint. The scalar-layout ABI that recon's hash structs depend on is proven by
+// the next stage, which round-trips a real HashEntry through the volume tier.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer Output { uint values[]; };
+
+layout(push_constant) uniform Push { uint count; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < count) {
+    values[i] = i;
+  }
+}
