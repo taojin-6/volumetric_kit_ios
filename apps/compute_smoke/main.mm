@@ -60,7 +60,8 @@
                                         constant:-12],
     [_label.leadingAnchor constraintEqualToAnchor:content.leadingAnchor
                                          constant:12],
-    [_label.widthAnchor constraintEqualToAnchor:scroll.widthAnchor constant:-24],
+    [_label.widthAnchor constraintEqualToAnchor:scroll.widthAnchor
+                                       constant:-24],
 
     [_spinner.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
     [_spinner.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
@@ -69,23 +70,21 @@
   // Off the main thread: device + pipeline creation and three dispatches are
   // fast but not instant, and blocking the main thread through launch invites
   // the watchdog.
-  dispatch_async(
-      dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        const std::string report =
-            volumetric_kit::ios_app::run_smoke_report();
-        NSString* text = [NSString stringWithUTF8String:report.c_str()];
-        // Also off-screen, two ways. stdout is what
-        // `devicectl device process launch --console` relays, which makes the
-        // smoke scriptable from the build host; NSLog additionally lands in the
-        // unified log for Console.app.
-        std::fputs(report.c_str(), stdout);
-        std::fflush(stdout);
-        NSLog(@"%@", text);
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self->_spinner stopAnimating];
-          self->_label.text = text;
-        });
-      });
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    const std::string report = volumetric_kit::ios_app::run_smoke_report();
+    NSString* text = [NSString stringWithUTF8String:report.c_str()];
+    // Also off-screen, two ways. stdout is what
+    // `devicectl device process launch --console` relays, which makes the
+    // smoke scriptable from the build host; NSLog additionally lands in the
+    // unified log for Console.app.
+    std::fputs(report.c_str(), stdout);
+    std::fflush(stdout);
+    NSLog(@"%@", text);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self->_spinner stopAnimating];
+      self->_label.text = text;
+    });
+  });
 }
 
 @end

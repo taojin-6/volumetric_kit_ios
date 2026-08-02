@@ -60,6 +60,46 @@ xcrun devicectl device process launch --console --device <id> \
 The device must be **unlocked** — mounting the developer disk image fails on a
 locked device.
 
+## Development
+
+```sh
+pre-commit install     # once — formatting + hygiene hooks on every commit
+```
+
+The hooks mirror the sibling repos — the same pinned `clang-format` (22.1.5),
+the same `cmake-format`, and the same rule that Vulkan is reached only through
+gfx's `core/vulkan.hpp` umbrella — plus two of this repo's own: `swift-format`
+from the Xcode toolchain, and `shellcheck`.
+
+Two configuration notes specific to here:
+
+- `.clang-format` carries an **ObjC section as well as a Cpp one**. A config with
+  only `Language: Cpp` does not merely fall back for `.mm` files — clang-format
+  refuses them outright (*"Configuration file(s) do(es) not support
+  Objective-C"*). The Cpp section is byte-identical to the siblings'.
+- `swift-format` runs via `xcrun`, from whichever Xcode builds the app, rather
+  than a pinned pre-commit environment — there is no Swift toolchain to install
+  on a Linux hook runner. That is why the lint CI job runs on macOS while the
+  siblings lint on Linux.
+
+CI (`.github/workflows/`) cross-compiles every app target for iOS arm64 and runs
+the same hooks. The build is **unsigned** (`CODE_SIGNING_ALLOWED=NO`), so no
+certificate or provisioning secret is needed, and **build-only**: MoltenVK ships
+no simulator slice and ARKit scene depth needs LiDAR, so nothing here is
+runnable in CI. It still earns its place — it catches a sibling change that
+stops Xcode-generating, a toolchain regression, or a Swift/Objective-C++ seam
+that no longer compiles, all of which happened while standing this repo up. A
+final step asserts each bundle is really iOS arm64 (`LC_BUILD_VERSION`
+`platform 2`), since a host-vs-target mixup would otherwise pass silently.
+
+It also runs **nightly**, not only on push and pull request. recon is consumed
+at `GIT_TAG main` rather than a fixed tag, so the sibling breakage above arrives
+on upstream's schedule, not on ours — without a scheduled run it would sit
+undetected until the next push here. For the same reason the dependency cache is
+keyed on recon's resolved tip commit and carries no `restore-keys`: a key that
+ignored the moving ref would go on hitting a pre-drift source tree and report
+green against stale sources.
+
 ## Apps
 
 ### `compute_smoke`

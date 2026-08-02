@@ -1,0 +1,80 @@
+# Formatting + hygiene hooks. Run once after cloning:
+#   pre-commit install
+#
+# Mirrors volumetric_kit_recon's and volumetric_kit_gfx's configuration so the
+# three siblings format identically -- same pinned clang-format, same
+# cmake-format, same .clang-format / .cmake-format.yaml -- plus a Swift hook,
+# which is this repo's own concern.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # identify classifies .clang-format as YAML, and ours is a multi-document
+        # file (a Cpp section and an ObjC section separated by `---`), which the
+        # single-document default rejects.
+        args: [--allow-multiple-documents]
+
+  - repo: https://github.com/pocc/pre-commit-hooks
+    rev: v1.3.5
+    hooks:
+      - id: clang-format
+        args: [-i, --style=file]
+        # objective-c++ matters here: the .mm bridge is the bulk of this repo's
+        # C-family code.
+        types_or: [c, c++, objective-c++]
+        # Pin the clang-format binary so formatting is identical locally and in
+        # CI; pre-commit installs it, so contributors need not install it too.
+        # Same pin as the sibling repos.
+        additional_dependencies: ['clang-format==22.1.5']
+
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+        additional_dependencies: [cmakelang, pyyaml]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  - repo: local
+    hooks:
+      # Apple's swift-format, from the Xcode toolchain rather than a pinned
+      # pre-commit environment: there is no Swift toolchain to install on a
+      # Linux hook runner, and the version that matters is the one shipping with
+      # the Xcode that builds the app. This is why the lint CI job runs on macOS
+      # (see .github/workflows/lint.yml) -- unlike the siblings, whose
+      # C-family-only hooks run anywhere.
+      - id: swift-format
+        name: swift-format
+        entry: xcrun swift-format format --in-place --parallel
+        language: system
+        files: \.swift$
+
+      # Enforce the Vulkan-include umbrella, matching the rule both libraries
+      # hold: reach Vulkan through gfx's core/vulkan.hpp, never <vulkan/...>
+      # directly, so the loader/dispatch choice stays a detail of that one
+      # header. It applies here too -- the .mm bridge is first-party code
+      # against the same libraries. (VK_USE_PLATFORM_METAL_EXT is a compile
+      # definition, not an include, so the Metal surface path needs no
+      # exemption.)
+      - id: vulkan-include-umbrella
+        name: enforce gfx core/vulkan.hpp Vulkan-include umbrella
+        entry: '^\s*#\s*include\s*[<"]vulkan/'
+        language: pygrep
+        files: \.(h|hpp|hxx|inl|ipp|c|cc|cpp|cxx|m|mm)$
+
+# pre-commit.ci (https://pre-commit.ci) runs the hooks it can on every PR and
+# pushes auto-fixes back to the branch. It runs on Linux, so the swift-format
+# hook is skipped there -- CI's own macOS lint job is the gate that actually
+# enforces it.
+ci:
+  autofix_prs: true
+  autofix_commit_msg: "style: auto-fixes from pre-commit.ci hooks"
+  autoupdate_schedule: monthly
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
+  skip: [swift-format]

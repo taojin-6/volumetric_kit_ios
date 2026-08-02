@@ -17,9 +17,12 @@
 # libraries.
 #
 # Usage:
+#
+# ~~~
 #   tools/fetch_moltenvk.sh                       # once, populates third_party/
 #   cmake -S . -B build-ios -G Xcode \
 #     -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake
+# ~~~
 #
 # Override VI_MOLTENVK_DIR to point at a MoltenVK from the LunarG SDK instead of
 # the fetched copy.

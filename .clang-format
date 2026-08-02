@@ -1,0 +1,30 @@
+# Plain Google base, 80-column lines, left-aligned pointers, preserved include
+# blocks. The Cpp section matches volumetric_kit_recon's and
+# volumetric_kit_gfx's byte for byte, so all three siblings format C++
+# identically.
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 80
+IncludeBlocks: Preserve
+DerivePointerAlignment: false
+PointerAlignment: Left
+---
+# Objective-C++ is this repo's own concern -- it is where the .mm bridge onto
+# the C++ libraries lives, and the siblings have no Objective-C at all. A config
+# with only a Cpp section does not merely fall back for .mm files;
+# clang-format refuses them outright ("Configuration file(s) do(es) not support
+# Objective-C"), so this section is required, not cosmetic.
+#
+# Settings mirror the Cpp section so a file reads consistently across the
+# language boundary, plus the Objective-C-only knobs pinned explicitly rather
+# than derived from the file -- the same reason DerivePointerAlignment is
+# pinned above.
+Language: ObjC
+BasedOnStyle: Google
+ColumnLimit: 80
+IncludeBlocks: Preserve
+DerivePointerAlignment: false
+PointerAlignment: Left
+ObjCBlockIndentWidth: 2
+ObjCSpaceAfterProperty: false
+ObjCSpaceBeforeProtocolList: true

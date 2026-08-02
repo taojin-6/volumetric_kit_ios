@@ -1,0 +1,65 @@
+name: ci
+
+# Umbrella CI. The iOS build and lint fan out from here, and the single
+# `required` gate at the bottom succeeds only if both did. Branch protection
+# requires just that one check ("ci / required"), so the protected `main`
+# required-checks list stays stable as legs are added or renamed -- adding a job
+# never silently leaves an old required context unreported and blocking every
+# PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
+#
+# The nightly matters more here than in the siblings: CMakeLists.txt tracks
+# volumetric_kit_recon at `main`, not a fixed tag, so this repo's build depends
+# on a moving target. On push/PR triggers alone an upstream change that breaks
+# the iOS cross-compile stays invisible until someone happens to push here --
+# which is precisely the "sibling change that stops Xcode-generating" breakage
+# build.yml exists to catch. The nightly is what actually catches it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 09:17 UTC. Off the hour deliberately -- scheduled runs cluster (and get
+    # delayed) on the hour.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+# Least privilege: nothing here reads private data or writes back to the repo.
+# Explicit because this repo is public, so the default token grant is worth
+# stating rather than inheriting.
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the event as well as the ref: a scheduled run and a push to main
+  # both resolve to refs/heads/main, and without the event they would share a
+  # group and cancel each other.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  required:
+    # The single status check branch protection requires. It passes only when
+    # every leg succeeded, and FAILS (never skips) on any other outcome: a
+    # skipped required check never reports its result and would block every
+    # merge forever.
+    needs: [build, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert every required job succeeded
+        run: |
+          echo "build=${{ needs.build.result }}" "lint=${{ needs.lint.result }}"
+          if [ "${{ needs.build.result }}" = success ] \
+             && [ "${{ needs.lint.result }}" = success ]; then
+            echo "All required CI jobs passed."
+          else
+            echo "::error::one or more required CI jobs did not succeed (see results above)"
+            exit 1
+          fi

@@ -1,0 +1,116 @@
+name: build
+
+# Cross-compiles every app target for iOS arm64 (device).
+#
+# Build-only, by nature: MoltenVK ships no simulator slice and ARKit scene depth
+# needs LiDAR, so there is no runnable iOS target in CI. That is still worth
+# gating on -- the breakages this catches are exactly the ones that bit while
+# standing the repo up: a sibling change that stops Xcode-generating, a toolchain
+# regression, a Swift/Objective-C++ seam that no longer compiles.
+#
+# Unsigned: CODE_SIGNING_ALLOWED=NO means no Apple Development certificate or
+# provisioning profile is needed, so CI needs no secrets. Signing is only
+# required to install on hardware, which a human does.
+#
+# Invoked by ci.yml, which owns the triggers and the concurrency group.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Pinned rather than macos-latest. `-latest` rolls to a new OS image on
+    # GitHub's schedule, which swaps the whole Xcode toolchain underneath the
+    # build without a commit here; this repo cross-compiles against that SDK, so
+    # that rollover is a real variable. macos-26 is what macos-latest resolves to
+    # today, so pinning changes nothing now and stops the surprise later.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # glslc compiles the GLSL to SPIR-V at build time. It is a *host* tool
+      # here -- the toolchain file resolves it with NO_CMAKE_FIND_ROOT_PATH so a
+      # cross build does not look for it in the iOS sysroot.
+      - name: Install shaderc (glslc)
+        run: brew install shaderc
+
+      # MoltenVK is a 34 MB upstream release artifact, fetched rather than
+      # vendored. Cache it on the pinned version so a run costs one download.
+      - name: Cache MoltenVK
+        id: cache-moltenvk
+        uses: actions/cache@v6
+        with:
+          path: third_party/MoltenVK
+          key: moltenvk-ios-${{ hashFiles('tools/fetch_moltenvk.sh') }}
+
+      - name: Fetch MoltenVK
+        if: steps.cache-moltenvk.outputs.cache-hit != 'true'
+        run: tools/fetch_moltenvk.sh
+
+      # recon is declared with GIT_TAG main -- a moving ref, not a pin. So
+      # CMakeLists.txt is byte-identical when upstream advances, and hashing it
+      # alone would hold the cache key steady at exactly the moment the cached
+      # sources went stale. Resolve the tip and fold it into the key.
+      #
+      # Deps that really are pinned (glm at 1.0.3) stay covered by the hash.
+      - name: Resolve moving sibling refs
+        id: pins
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/taojin-6/volumetric_kit_recon.git main | cut -f1)
+          test -n "${sha}"
+          echo "recon=${sha}" >>"${GITHUB_OUTPUT}"
+          echo "volumetric_kit_recon main is at ${sha}"
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v6
+        with:
+          path: build-ios/_deps
+          key: >-
+            deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}-${{
+            steps.pins.outputs.recon }}
+          # No restore-keys, deliberately. A partial hit would restore the
+          # source tree from before the ref moved, and FetchContent does not
+          # reliably re-clone over an already-populated _deps -- so the build
+          # could compile stale recon and report green, which is worse than no
+          # cache at all. A clean miss re-fetches; that is the run we most need
+          # to be honest.
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-ios -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake
+
+      # No VI_DEVELOPMENT_TEAM is passed, so CMake warns that the bundles cannot
+      # be installed on hardware -- expected and correct for a build-only gate.
+      - name: Build (unsigned)
+        run: |
+          cmake --build build-ios --config Debug -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      # A bundle that builds but is not actually an iOS arm64 binary would
+      # otherwise pass silently -- the exact failure mode a host-vs-target mixup
+      # produces. platform 2 is iOS (1 would be macOS).
+      - name: Assert the binaries are iOS arm64
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=0
+          for app in build-ios/apps/*/Debug-iphoneos/*.app; do
+            bin="${app}/$(basename "${app}" .app)"
+            echo "--- ${bin}"
+            lipo -info "${bin}"
+            if ! otool -l "${bin}" | grep -A3 LC_BUILD_VERSION | grep -q "platform 2"; then
+              echo "::error::${bin} is not built for iOS (expected LC_BUILD_VERSION platform 2)"
+              exit 1
+            fi
+            found=$((found + 1))
+          done
+          if [ "${found}" -eq 0 ]; then
+            echo "::error::no .app bundles were produced"
+            exit 1
+          fi
+          echo "${found} app bundle(s) verified as iOS arm64."
