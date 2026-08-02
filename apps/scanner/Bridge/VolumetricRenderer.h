@@ -64,6 +64,15 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Frames successfully presented since bring-up.
 @property(nonatomic, readonly) uint64_t framesPresented;
 
+/// How the one shared `VkDevice` was built and its queues carved up, e.g.
+/// "Apple M5 GPU, family 0, 2 queues (gfx + recon)".
+@property(nonatomic, readonly, copy) NSString* sharedDeviceSummary;
+
+/// Whether recon and gfx really hold the same `VkDevice` handle. Reported
+/// rather than assumed: it is the whole claim of this slice, and the two
+/// adopters could silently diverge without it.
+@property(nonatomic, readonly) BOOL sharesOneDevice;
+
 @end
 
 NS_ASSUME_NONNULL_END

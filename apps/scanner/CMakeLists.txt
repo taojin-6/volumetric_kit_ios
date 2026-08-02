@@ -22,10 +22,11 @@ set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
 add_library(scanner_bridge STATIC Bridge/VolumetricRenderer.mm
-                                  Bridge/ARKitCapture.mm)
+                                  Bridge/ARKitCapture.mm Bridge/SharedDevice.mm)
 
-set_source_files_properties(Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm
-                            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(
+  Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
 # VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella

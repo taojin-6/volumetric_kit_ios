@@ -118,6 +118,8 @@ final class ScannerViewController: UIViewController {
     var text = """
       \(renderer.deviceName)
       Vulkan \(renderer.apiVersion) via MoltenVK
+      device    \(renderer.sharedDeviceSummary)
+      shared    \(renderer.sharesOneDevice ? "yes - recon and gfx hold one VkDevice" : "NO - separate devices")
       drawable  \(Int(size.width)) x \(Int(size.height)) px
       presented \(renderer.framesPresented)
       \(String(format: "%.0f", fps)) fps

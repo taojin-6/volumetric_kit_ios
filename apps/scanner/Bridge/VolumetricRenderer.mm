@@ -7,8 +7,11 @@
 
 #import "VolumetricRenderer.h"
 
+#import "SharedDevice.hpp"
+
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "triangle_frag.spv.hpp"
@@ -19,8 +22,11 @@
 #include "volumetric_kit/gfx/core/result.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/core/vulkan.hpp"
+#include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/device.hpp"
 
 namespace vg = volumetric_kit::gfx;
+namespace vr = volumetric_kit::recon;
 
 namespace {
 
@@ -50,7 +56,20 @@ std::string api_version_string(std::uint32_t v) {
 // Everything C++ lives here so the header stays Objective-C only and Swift
 // never sees a move-only type.
 struct RendererImpl {
+  // Declared first, destroyed last: both adopters borrow its handles and
+  // destroy nothing, so the device has to outlive them.
+  volumetric_kit::ios_app::SharedDevice shared;
   vg::app::WindowedApp app;
+  // recon's view of the same VkDevice. Unused until fusion lands, but adopted
+  // here because *proving both libraries share one device* is what this slice
+  // is for -- and because a failure to adopt must surface at bring-up, not
+  // later.
+  // optional, not a plain member: recon's Device and Allocator are
+  // create-or-adopt only and have no public default constructor -- which is the
+  // invariant working, not an inconvenience. There is no such thing as an empty
+  // one to default-construct.
+  std::optional<volumetric_kit::recon::Device> recon_device;
+  std::optional<volumetric_kit::recon::Allocator> recon_allocator;
   vg::ShaderModule vertex_shader;
   vg::ShaderModule fragment_shader;
   vg::GraphicsPipeline pipeline;
@@ -69,16 +88,21 @@ struct RendererImpl {
   }
   _impl = std::make_unique<RendererImpl>();
 
+  // --- One VkDevice, adopted by both libraries ------------------------------
+  // Not an optimisation: a VkBuffer is valid only on the VkDevice that created
+  // it, so the zero-copy mesh handoff needs *one* device. Two devices on this
+  // same GPU would still cost a round trip through host memory.
+  const vr::Status built = _impl->shared.build((__bridge const void*)layer,
+                                               "volumetric_kit_ios scanner");
+  if (!built) {
+    set_error(error, vg::Status::unsupported(built.message()), "SharedDevice");
+    return nil;
+  }
+
   vg::app::WindowedAppConfig config;
   config.app_name = "volumetric_kit_ios scanner";
-  // No validation layer: MoltenVK is linked directly on iOS, with no loader to
-  // interpose one. Diagnostics come from MoltenVK's own logging.
+  // Ignored by adopt (the embedder owns the instance), left for documentation.
   config.enable_validation = false;
-  // What GLFW would hand us on desktop. The windowing tier is window-system
-  // agnostic by design, so the platform surface extension is the consumer's to
-  // name -- on iOS that is VK_EXT_metal_surface.
-  config.instance_extensions = {VK_KHR_SURFACE_EXTENSION_NAME,
-                                VK_EXT_METAL_SURFACE_EXTENSION_NAME};
   config.swapchain.extent = {
       static_cast<std::uint32_t>(layer.drawableSize.width),
       static_cast<std::uint32_t>(layer.drawableSize.height)};
@@ -87,35 +111,48 @@ struct RendererImpl {
   // frames that are then discarded -- straight thermal cost for no benefit.
   config.swapchain.preferred_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 
-  vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::create(
-      config, [layer](VkInstance instance) -> vg::Result<VkSurfaceKHR> {
-        // Resolve through vkGetInstanceProcAddr rather than linking the symbol:
-        // it works whether MoltenVK is linked directly (as here) or reached
-        // through a loader later.
-        auto create_metal_surface =
-            reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(
-                vkGetInstanceProcAddr(instance, "vkCreateMetalSurfaceEXT"));
-        if (create_metal_surface == nullptr) {
-          return vg::Status::unsupported(
-              "vkCreateMetalSurfaceEXT unavailable (VK_EXT_metal_surface not "
-              "enabled?)");
+  vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
+      _impl->shared.gfx_payload(), config,
+      [self](VkInstance instance) -> vg::Result<VkSurfaceKHR> {
+        // The surface already exists -- picking a present-capable device
+        // required one -- so hand over the bootstrap's rather than making a
+        // second. Ownership transfers with it, which is why the bootstrap
+        // releases it: destroying it twice is a use-after-free at teardown.
+        if (instance != self->_impl->shared.instance()) {
+          return vg::Status::invalid_argument(
+              "surface factory: adopted a different VkInstance than the "
+              "bootstrap created the surface on");
         }
-        VkMetalSurfaceCreateInfoEXT info{};
-        info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
-        info.pLayer = layer;
-        VkSurfaceKHR surface = VK_NULL_HANDLE;
-        const VkResult r =
-            create_metal_surface(instance, &info, nullptr, &surface);
-        if (r != VK_SUCCESS) {
-          return vg::vk_error(r, "vkCreateMetalSurfaceEXT");
-        }
-        return surface;
+        return self->_impl->shared.release_surface();
       });
   if (!app) {
-    set_error(error, app.status(), "WindowedApp::create");
+    set_error(error, app.status(), "WindowedApp::adopt");
     return nil;
   }
   _impl->app = std::move(app).value();
+
+  // recon adopts the same device. Nothing consumes it until fusion lands, but
+  // adopting now is the point of this slice -- and a mismatch between what the
+  // bootstrap enabled and what recon requires must fail at bring-up, where the
+  // message is actionable, rather than at the first dispatch.
+  vr::Result<vr::Device> recon_device =
+      vr::Device::adopt(_impl->shared.recon_payload(), {});
+  if (!recon_device) {
+    set_error(error, vg::Status::unsupported(recon_device.status().message()),
+              "recon Device::adopt");
+    return nil;
+  }
+  _impl->recon_device.emplace(std::move(recon_device).value());
+
+  vr::Result<vr::Allocator> recon_allocator =
+      vr::Allocator::create(_impl->shared.instance(), *_impl->recon_device);
+  if (!recon_allocator) {
+    set_error(error,
+              vg::Status::unsupported(recon_allocator.status().message()),
+              "recon Allocator::create");
+    return nil;
+  }
+  _impl->recon_allocator.emplace(std::move(recon_allocator).value());
 
   VkDevice device = _impl->app.device().handle();
   vg::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
@@ -232,6 +269,17 @@ struct RendererImpl {
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
   return [NSString
       stringWithUTF8String:api_version_string(props.apiVersion).c_str()];
+}
+
+- (NSString*)sharedDeviceSummary {
+  return [NSString stringWithUTF8String:_impl->shared.summary().c_str()];
+}
+
+- (BOOL)sharesOneDevice {
+  // Compared through each library's own accessor, not against the bootstrap's
+  // record -- that is what makes this evidence rather than a restatement.
+  return _impl->app.device().handle() == _impl->recon_device->handle() &&
+         _impl->app.device().handle() != VK_NULL_HANDLE;
 }
 
 - (uint64_t)framesPresented {
