@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
+import ARKit
 import UIKit
 
 /// Drives the renderer from a `CADisplayLink` and shows what it reports.
@@ -12,12 +13,14 @@ import UIKit
 final class ScannerViewController: UIViewController {
   private var metalView: MetalView!
   private var renderer: VolumetricRenderer?
+  private let arSession = ARSessionController()
   private var displayLink: CADisplayLink?
   private let statusLabel = UILabel()
 
   private var lastFPSUpdate = CFAbsoluteTimeGetCurrent()
   private var framesSinceUpdate = 0
   private var fps = 0.0
+  private var shouldLog = false
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -48,12 +51,14 @@ final class ScannerViewController: UIViewController {
     // Bring up on first appearance, not in viewDidLoad: the layer has no valid
     // drawableSize until the view has been laid out in a window.
     startRendererIfNeeded()
+    arSession.start()
     startDisplayLink()
   }
 
   override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
     stopDisplayLink()
+    arSession.pause()
     renderer?.waitIdle()
   }
 
@@ -92,6 +97,10 @@ final class ScannerViewController: UIViewController {
       stopDisplayLink()
       return
     }
+    // Poll once per rendered frame -- the same cadence the fuse loop will use,
+    // so the capture path is exercised exactly as it will be consumed. The
+    // returned frame is not used yet; fusion is the next slice.
+    _ = arSession.capture.pollLatest()
     updateStatus(renderer)
   }
 
@@ -103,14 +112,51 @@ final class ScannerViewController: UIViewController {
       fps = Double(framesSinceUpdate) / elapsed
       framesSinceUpdate = 0
       lastFPSUpdate = now
+      shouldLog = true
     }
     let size = metalView.metalLayer.drawableSize
-    statusLabel.text = """
+    var text = """
       \(renderer.deviceName)
       Vulkan \(renderer.apiVersion) via MoltenVK
       drawable  \(Int(size.width)) x \(Int(size.height)) px
       presented \(renderer.framesPresented)
       \(String(format: "%.0f", fps)) fps
+
       """
+
+    if let reason = arSession.unsupportedReason {
+      text += "ARKit: \(reason)"
+    } else if let failure = arSession.sessionError {
+      text += "ARKit session failed: \(failure)"
+    } else {
+      let s = arSession.capture.stats
+      // Formatted up front rather than inside the literal: a `\`-continuation
+      // inside a \(...) interpolation is not something the Swift parser accepts.
+      let kept = String(format: "%.0f%%", s.confidence_kept * 100)
+      let intrinsics = String(
+        format: "fx %.1f  cx %.1f  cy %.1f", s.depth_fx, s.depth_cx, s.depth_cy)
+      let position = String(
+        format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
+      let convert = String(format: "%.1f", s.convert_ms)
+      let counts =
+        "\(s.frames_submitted) in / \(s.frames_polled) polled / \(s.frames_dropped) dropped"
+      text += """
+        ARKit capture
+          frames    \(counts)
+          depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)
+          colour    \(s.color_width) x \(s.color_height)
+          intrinsic \(intrinsics)
+          position  \(position) m
+          convert   \(convert) ms
+        """
+    }
+    statusLabel.text = text
+    if shouldLog {
+      shouldLog = false
+      // Same text as the on-screen read-out, to stdout, so
+      // `devicectl device process launch --console` can verify capture from the
+      // build host instead of someone reading the screen.
+      print(text)
+    }
   }
 }
