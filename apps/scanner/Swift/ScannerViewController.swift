@@ -126,9 +126,13 @@ final class ScannerViewController: UIViewController {
 
     if let reason = arSession.unsupportedReason {
       text += "ARKit: \(reason)"
-    } else if let failure = arSession.sessionError {
-      text += "ARKit session failed: \(failure)"
     } else {
+      if let failure = arSession.sessionError {
+        // Alongside the counters, not instead of them: a session can fail and
+        // recover, and replacing the read-out meant a single transient
+        // interruption hid capture for the rest of the run.
+        text += "ARKit session failed: \(failure)\n\n"
+      }
       let s = arSession.capture.stats
       // Formatted up front rather than inside the literal: a `\`-continuation
       // inside a \(...) interpolation is not something the Swift parser accepts.
@@ -139,7 +143,8 @@ final class ScannerViewController: UIViewController {
         format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
       let convert = String(format: "%.1f", s.convert_ms)
       let counts =
-        "\(s.frames_submitted) in / \(s.frames_polled) polled / \(s.frames_dropped) dropped"
+        "\(s.frames_submitted) in / \(s.frames_polled) polled"
+        + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
       text += """
         ARKit capture
           frames    \(counts)

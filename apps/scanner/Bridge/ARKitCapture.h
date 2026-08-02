@@ -24,9 +24,17 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// Plain scalars so Swift reads them without touching a C++ type.
 typedef struct {
-  uint64_t frames_submitted;  ///< ARFrames handed over by Swift.
-  uint64_t frames_polled;     ///< Frames a consumer actually took.
-  uint64_t frames_dropped;    ///< Superseded before anyone polled them.
+  /// Frames converted and staged. Not every `ARFrame` Swift hands over: those
+  /// arriving before the depth sensor has a result are skipped silently, and
+  /// those that fail conversion land in @ref frames_rejected instead.
+  uint64_t frames_submitted;
+  uint64_t frames_polled;   ///< Frames a consumer actually took.
+  uint64_t frames_dropped;  ///< Superseded before anyone polled them.
+  /// Frames that carried depth but could not be converted -- an unreadable
+  /// pixel buffer, or intrinsics recon refused. Counted rather than dropped on
+  /// the floor, so a persistent failure reads as a rising number instead of a
+  /// submitted count stuck at zero.
+  uint64_t frames_rejected;
   uint32_t depth_width;
   uint32_t depth_height;
   uint32_t color_width;
@@ -51,14 +59,22 @@ typedef struct {
 ///
 /// Frames are **dropped, not queued**: a consumer slower than the sensor gets
 /// the newest frame, never a backlog.
+///
+/// Thread-safe in exactly one shape, which is the one `ARSessionController`
+/// sets up: @ref submitFrame: on the session's delegate queue, everything else
+/// on the consumer's thread. Staging, polling and @ref stats share the bridge's
+/// lock; @ref submitFrame: additionally owns a scratch buffer of its own and so
+/// must not be called from two threads at once.
 @interface VolumetricCapture : NSObject
 
 - (instancetype)init NS_DESIGNATED_INITIALIZER;
 
-/// @brief Convert and stage one ARKit frame. Call from the session delegate.
+/// @brief Convert and stage one ARKit frame. Call from the session delegate,
+///        and from that queue only.
 ///
-/// Frames without `sceneDepth` are ignored (the first frames of a session
-/// arrive before the depth sensor has a result), so a caller need not filter.
+/// Prefers `smoothedSceneDepth` and falls back to `sceneDepth`; frames carrying
+/// neither are ignored (the first frames of a session arrive before the depth
+/// sensor has a result), so a caller need not filter.
 - (void)submitFrame:(ARFrame*)frame;
 
 /// @brief Take the newest staged frame, if a new one has arrived.
