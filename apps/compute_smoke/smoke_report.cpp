@@ -21,6 +21,7 @@
 #include "fill_comp.spv.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
+#include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/compute_pipeline.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -463,7 +464,7 @@ void stage_vertical_slice(Report& report, vr::Device& device,
   // A 160x120 depth frame at a constant 0.5 m -- a flat wall filling the view.
   // Deliberately close to ARKit's 256x192 sceneDepth resolution rather than a
   // desktop 640x480, so the dispatch shape is representative.
-  vol::DepthCameraParams cam{};
+  vr::DepthCameraParams cam{};
   cam.width = 160;
   cam.height = 120;
   cam.fx = 130.0f;

@@ -21,9 +21,10 @@ set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
-add_library(scanner_bridge STATIC Bridge/VolumetricRenderer.mm)
+add_library(scanner_bridge STATIC Bridge/VolumetricRenderer.mm
+                                  Bridge/ARKitCapture.mm)
 
-set_source_files_properties(Bridge/VolumetricRenderer.mm
+set_source_files_properties(Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm
                             PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
@@ -45,13 +46,19 @@ vr_embed_shaders(
 target_include_directories(scanner_bridge
                            PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-target_link_libraries(scanner_bridge PUBLIC volumetric_kit::gfx_app
-                                            volumetric_kit::gfx_core)
+# recon_sensor carries the capture contract and the camera-convention
+# conversions. Since the camera parameter blocks moved into core it links
+# recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
+# to implement ICameraCapture -- fusion arrives with the next slice.
+target_link_libraries(
+  scanner_bridge PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
+                        volumetric_kit::recon_sensor)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
-  ${VI_APP_NAME} MACOSX_BUNDLE Swift/AppDelegate.swift Swift/MetalView.swift
-                               Swift/ScannerViewController.swift)
+  ${VI_APP_NAME} MACOSX_BUNDLE
+  Swift/AppDelegate.swift Swift/ARSessionController.swift Swift/MetalView.swift
+  Swift/ScannerViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
 
@@ -67,6 +74,11 @@ target_link_libraries(
           "-framework IOSurface"
           "-framework CoreGraphics"
           "-framework CoreVideo"
+          # ARKit supplies the posed depth/colour frames; Accelerate's vImage
+          # does the YCbCr -> RGB conversion, which at 1920x1440 would dominate
+          # the capture path as a scalar loop.
+          "-framework ARKit"
+          "-framework Accelerate"
           "-framework UIKit")
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"

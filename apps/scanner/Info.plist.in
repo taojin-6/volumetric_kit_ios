@@ -25,9 +25,19 @@
        "a plain launch screen matching the system background". -->
   <key>UILaunchScreen</key>
   <dict/>
+  <!-- Required before AVFoundation will hand ARKit the camera. Without it the
+       session fails at run() with no visible cause. -->
+  <key>NSCameraUsageDescription</key>
+  <string>Scanner uses the camera and LiDAR scanner to reconstruct the space around you.</string>
   <key>UIRequiredDeviceCapabilities</key>
   <array>
     <string>arm64</string>
+    <!-- Gates installation on ARKit support, which is not the same as LiDAR:
+         scene depth needs the scanner, and this key cannot express that. The
+         app checks supportsFrameSemantics for the exact semantics it requests
+         at runtime, so a device that clears this bar but has no scanner
+         explains itself rather than appearing to hang. -->
+    <string>arkit</string>
     <!-- MoltenVK translates Vulkan to Metal; Metal 2 is the floor on every
          device this app targets. -->
     <string>metal</string>
