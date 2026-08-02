@@ -31,8 +31,8 @@ target_include_directories(${VI_APP_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 # Every recon tier the smoke exercises. recon_core comes in transitively, but
 # the stages name volume/tsdf/mesh directly, so link them directly.
 target_link_libraries(
-  ${VI_APP_NAME} PRIVATE volumetric_kit::recon_volume volumetric_kit::recon_tsdf
-                         volumetric_kit::recon_mesh)
+  ${VI_APP_NAME} PRIVATE volumetric_kit::recon_volume
+                         volumetric_kit::recon_tsdf volumetric_kit::recon_mesh)
 
 # MoltenVK is a static archive, so its own platform dependencies do not come
 # along automatically the way a dylib's would -- the app is where they resolve.

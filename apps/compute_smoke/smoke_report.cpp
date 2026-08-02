@@ -353,8 +353,9 @@ void stage_compute_dispatch(Report& report, vr::Device& device,
       ++mismatches;
     }
   }
-  report.check(mismatches == 0, "readback matched (" +
-                                    std::to_string(mismatches) + " mismatches)");
+  report.check(
+      mismatches == 0,
+      "readback matched (" + std::to_string(mismatches) + " mismatches)");
 }
 
 // The grid shape the remaining stages share: 5 mm voxels in 8^3 blocks, sized
@@ -403,15 +404,15 @@ void stage_scalar_abi(Report& report, vr::Device& device,
     b.coord = vr::Vec3i(i - 3, 2 * i + 1, -5 * i);
     blocks.push_back(b);
   }
-  vr::Result<std::uint32_t> overflow =
-      vbg.map().allocate(blocks.data(), static_cast<std::uint32_t>(blocks.size()));
+  vr::Result<std::uint32_t> overflow = vbg.map().allocate(
+      blocks.data(), static_cast<std::uint32_t>(blocks.size()));
   if (!overflow) {
     report.abort_stage("allocate: " + overflow.status().message());
     return;
   }
-  report.check(overflow.value() == 0,
-               "allocated " + std::to_string(blocks.size()) +
-                   " blocks with no overflow");
+  report.check(overflow.value() == 0, "allocated " +
+                                          std::to_string(blocks.size()) +
+                                          " blocks with no overflow");
 
   vr::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
@@ -436,8 +437,8 @@ void stage_scalar_abi(Report& report, vr::Device& device,
   }
   report.check(found == blocks.size(),
                "every Vec3i coordinate survived the GPU round-trip (" +
-                   std::to_string(found) + "/" +
-                   std::to_string(blocks.size()) + ")");
+                   std::to_string(found) + "/" + std::to_string(blocks.size()) +
+                   ")");
 }
 
 // --- Stage 3: the vertical slice --------------------------------------------

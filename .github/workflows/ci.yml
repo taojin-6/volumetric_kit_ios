@@ -1,0 +1,44 @@
+name: ci
+
+# Umbrella CI. The iOS build and lint fan out from here, and the single
+# `required` gate at the bottom succeeds only if both did. Branch protection
+# requires just that one check ("ci / required"), so the protected `main`
+# required-checks list stays stable as legs are added or renamed -- adding a job
+# never silently leaves an old required context unreported and blocking every
+# PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  required:
+    # The single status check branch protection requires. It passes only when
+    # every leg succeeded, and FAILS (never skips) on any other outcome: a
+    # skipped required check never reports its result and would block every
+    # merge forever.
+    needs: [build, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert every required job succeeded
+        run: |
+          echo "build=${{ needs.build.result }}" "lint=${{ needs.lint.result }}"
+          if [ "${{ needs.build.result }}" = success ] \
+             && [ "${{ needs.lint.result }}" = success ]; then
+            echo "All required CI jobs passed."
+          else
+            echo "::error::one or more required CI jobs did not succeed (see results above)"
+            exit 1
+          fi
