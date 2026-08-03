@@ -231,11 +231,18 @@ final class ScannerViewController: UIViewController {
       // What the buffer declared, not what we assumed. The matrix is separate
       // from the transfer and primaries -- it reconstructs chroma, they
       // describe the result -- so all three are shown rather than collapsed.
+      //
+      // `(refused)` means the buffer named an encoding the driver cannot
+      // represent, so it dropped this frame's colour rather than fusing it
+      // through a curve it had guessed at. The three names still show what was
+      // read, which is the whole point: the alternative is colour quietly going
+      // missing with nothing on screen saying why.
       let encoding = String(
         format: "%@ matrix -> %@ / %@%@",
         String(cString: s.color_matrix), String(cString: s.color_transfer),
         String(cString: s.color_primaries),
-        s.color_was_canonical ? "" : "  (converted)")
+        s.color_declaration_refused
+          ? "  (refused)" : (s.color_was_canonical ? "" : "  (converted)"))
       let position = String(
         format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
       // Colour split out from the total: the combined figure cannot answer a
