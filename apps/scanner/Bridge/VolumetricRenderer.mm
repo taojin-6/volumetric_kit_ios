@@ -857,13 +857,20 @@ struct RendererImpl {
                 "  allocate  %.1f ms\n"
                 "  integrate %.1f ms\n"
                 "  extract   %.1f ms\n"
+                "  arena     %u tris planned / %u blocks -> %.1f MB (%.2f%% "
+                "full)\n"
                 "  texture   %.1f ms%s%s%s",
                 static_cast<unsigned long long>(s.frames_fused),
                 static_cast<unsigned long long>(s.remeshes), s.mesh_version,
                 s.vertices, s.triangles, s.allocate_ms, s.integrate_ms,
-                s.extract_ms, s.texture_ms,
-                s.last_error.empty() ? "" : "\n  ! ", s.last_error.c_str(),
-                upload.c_str());
+                s.extract_ms, s.triangle_capacity, s.active_blocks,
+                static_cast<double>(s.arena_bytes) / (1024.0 * 1024.0),
+                s.triangle_capacity > 0
+                    ? 100.0 * static_cast<double>(s.triangles) /
+                          static_cast<double>(s.triangle_capacity)
+                    : 0.0,
+                s.texture_ms, s.last_error.empty() ? "" : "\n  ! ",
+                s.last_error.c_str(), upload.c_str());
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`

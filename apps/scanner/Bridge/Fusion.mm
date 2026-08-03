@@ -197,8 +197,9 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
 void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   const auto t_extract = Clock::now();
+  vr::mesh::ExtractTimings extract_timings{};
   vr::Result<vr::mesh::DeviceMesh> device_mesh =
-      marching_cubes_->extract_device(*grid_);
+      marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
   if (!device_mesh) {
     std::lock_guard<std::mutex> lock(mutex_);
     stats_.last_error = "extract: " + device_mesh.status().message();
@@ -248,6 +249,9 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.triangles = mesh_.triangle_count;
   stats_.mesh_version = mesh_version_;
   stats_.extract_ms = extract_ms;
+  stats_.triangle_capacity = extract_timings.triangle_capacity;
+  stats_.active_blocks = extract_timings.active_blocks;
+  stats_.arena_bytes = extract_timings.arena_bytes;
   stats_.texture_ms = texture_ms;
 }
 

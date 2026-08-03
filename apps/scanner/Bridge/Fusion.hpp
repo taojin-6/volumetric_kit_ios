@@ -159,6 +159,14 @@ struct FusionStats {
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
+  /// What the last extract's arena was *planned* for, and what it cost.
+  ///
+  /// Reported because the mesh size does not imply either: the arena is sized
+  /// from a per-block triangle estimate times the active-block count, so a plan
+  /// that drifts high allocates hundreds of megabytes to hold a few thousand
+  /// triangles -- and the read-out showed only the few thousand.
+  std::uint32_t triangle_capacity = 0;
+  std::uint64_t arena_bytes = 0;
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
   std::string last_error;
