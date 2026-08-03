@@ -61,7 +61,22 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   integrator_.emplace(std::move(integrator).value());
 
   vr::Result<vr::mesh::MarchingCubes> mc =
-      vr::mesh::MarchingCubes::create(device, allocator);
+      vr::mesh::MarchingCubes::create(device, allocator, [&] {
+        vr::mesh::MarchingCubesConfig mc_config;
+        // The renderer binds these buffers as geometry rather than being handed
+        // a host copy, so it needs its own usage bits on the same allocation --
+        // only it knows which, which is why this tier takes them.
+        mc_config.extra_vertex_usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        mc_config.extra_index_usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        mc_config.slot_count = config.mesh_slots;
+        // Held by value there, so copied rather than pointed at -- the config
+        // outlives this lambda's temporaries.
+        for (std::uint32_t i = 0; i < config.queue_family_count; ++i) {
+          mc_config.queue_families[i] = config.queue_families[i];
+        }
+        mc_config.queue_family_count = config.queue_family_count;
+        return mc_config;
+      }());
   if (!mc) {
     return mc.status();
   }
@@ -211,45 +226,26 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
     texture_ms = ms_since(t_texture);
   }
 
-  // One host copy, after both GPU passes -- the mesh crosses to the host once
-  // rather than once per tier.
-  vr::Result<vr::mesh::Mesh> host =
-      marching_cubes_->download(device_mesh.value());
-  if (!host) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    stats_.last_error = "download: " + host.status().message();
-    return;
-  }
-
-  // The atlas the uv0 just written indexes: this frame's colour image, copied
-  // before the lock because it is 11 MB and the fuse thread would otherwise
-  // hold the publish mutex for the length of the memcpy -- the cost the mesh
-  // hand-off was already restructured to avoid.
-  //
-  // Copied rather than referenced: `frame.color` is a non-owning view into the
-  // capture's buffer, valid only until the next poll, and this fuse thread is
-  // what polls. The render thread reads it later, by which time it is gone.
-  std::vector<std::uint32_t> atlas;
-  std::uint32_t atlas_width = 0;
-  std::uint32_t atlas_height = 0;
-  if (config_.texture && frame.has_color() && frame.color_camera.width > 0 &&
-      frame.color_camera.height > 0) {
-    atlas_width = frame.color_camera.width;
-    atlas_height = frame.color_camera.height;
-    const std::size_t count =
-        static_cast<std::size_t>(atlas_width) * atlas_height;
-    atlas.assign(frame.color, frame.color + count);
-  }
-
+  // No host copy. The renderer draws these very buffers -- interop seam B --
+  // so the ~53 MB round trip per remesh that seam A cost is simply not here.
+  // What replaces it is the release contract below: the slot this mesh lives in
+  // is not extracted into again until the consumer says it has finished.
   std::lock_guard<std::mutex> lock(mutex_);
-  mesh_ = std::move(host).value();
-  atlas_ = std::move(atlas);
-  atlas_width_ = atlas_width;
-  atlas_height_ = atlas_height;
+
+  // A mesh published but never taken still holds a slot. Fusion outruns the
+  // render loop routinely -- it remeshes every fused frame -- so without this
+  // the ring drains to nothing within a second and every later extract fails
+  // with "every output slot is still outstanding".
+  if (!published_taken_ && published_generation_ != 0) {
+    marching_cubes_->release_through(published_generation_);
+  }
+  mesh_ = device_mesh.value();
+  published_generation_ = device_mesh.value().generation;
+  published_taken_ = false;
   ++mesh_version_;
   ++stats_.remeshes;
-  stats_.vertices = static_cast<std::uint32_t>(mesh_.vertices.size());
-  stats_.triangles = static_cast<std::uint32_t>(mesh_.indices.size() / 3);
+  stats_.vertices = mesh_.vertex_count;
+  stats_.triangles = mesh_.triangle_count;
   stats_.mesh_version = mesh_version_;
   stats_.extract_ms = extract_ms;
   stats_.texture_ms = texture_ms;
@@ -258,24 +254,29 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
 std::optional<Fusion::Published> Fusion::take_mesh(
     std::uint32_t known_version) {
   std::lock_guard<std::mutex> lock(mutex_);
-  // The emptiness check does double duty: nothing has been meshed yet, or this
-  // version has already been taken and moved out below.
-  if (mesh_version_ == known_version || mesh_.vertices.empty()) {
+  // The validity check does double duty: nothing has been meshed yet, or this
+  // version has already been taken.
+  if (mesh_version_ == known_version || !mesh_.valid()) {
     return std::nullopt;
   }
-  // Moved, not copied. At room scale mesh_ is ~53 MB and this runs under the
-  // very mutex the fuse thread publishes through, so copying stalled every
-  // remesh for the length of a 53 MB memcpy. The consumer is the render thread,
-  // which uploads what it takes before returning and never comes back for it --
-  // and a repeat call is refused by the version check above, not by mesh_ still
-  // holding the bytes.
+  // Copied, not moved -- it is a handful of handles and counts now, and the
+  // buffers it names stay the extractor's. The consumer must call
+  // release_through once the frames drawing them retire; marking it taken here
+  // is what stops the next publish releasing a slot the renderer is using.
+  published_taken_ = true;
+
   Published out;
-  out.mesh = std::move(mesh_);
+  out.mesh = mesh_;
   out.version = mesh_version_;
-  out.atlas = std::move(atlas_);
-  out.atlas_width = atlas_width_;
-  out.atlas_height = atlas_height_;
   return out;
+}
+
+void Fusion::release_through(std::uint64_t generation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!marching_cubes_) {
+    return;
+  }
+  marching_cubes_->release_through(generation);
 }
 
 void Fusion::note_error(const std::string& message) {

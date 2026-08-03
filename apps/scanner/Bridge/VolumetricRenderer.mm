@@ -262,7 +262,17 @@ struct RendererImpl {
   // this file neither set nor read. It sets it now (see -initWithLayer:), so
   // the two cannot drift.
   static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
-  vg::pipelines::GpuMesh mesh_slots[kMeshSlots];
+  // The meshes in flight -- borrowed views of recon's buffers, not storage.
+  // Copying one is copying a few handles.
+  vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
+  // The generation each in-flight frame drew, so it can be released once that
+  // frame's fence has signalled. begin_frame is what waits on it: by the time
+  // it returns for frame N, frame N - kFramesInFlight has completed, so the
+  // generation parked in that slot is finished with. That wait is the only
+  // completion signal gfx gives, and it is enough -- no fence is exposed, and
+  // no semaphore may cross the seam.
+  std::uint64_t frame_generations[kFramesInFlight] = {};
+  std::size_t frame_slot = 0;
   std::size_t mesh_slot = 0;
 
   ~RendererImpl() {
@@ -497,8 +507,23 @@ struct RendererImpl {
       0, _impl->atlas_texture.view(), _impl->atlas_sampler->handle(),
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+  app::FusionConfig fusion_config;
+  // One slot per frame in flight, plus one. The renderer draws the extractor's
+  // buffers in place now, so an extract must never land on geometry a pending
+  // frame is still reading -- and the ring is what makes that impossible rather
+  // than merely unlikely.
+  fusion_config.mesh_slots = RendererImpl::kMeshSlots;
+  // Both families, always. Under the two-families plan a phone actually gets,
+  // recon writes these buffers on one and gfx reads them on the other, and an
+  // EXCLUSIVE buffer read by a family that does not own it is undefined with no
+  // error. recon collapses the pair to EXCLUSIVE wherever they are the same
+  // family, so this needs no branch on the plan.
+  fusion_config.queue_families[0] = _impl->shared.compute_family();
+  fusion_config.queue_families[1] = _impl->shared.graphics_family();
+  fusion_config.queue_family_count = 2;
+
   const vr::Status fusion_started = _impl->fusion.start(
-      *_impl->recon_device, *_impl->recon_allocator, app::FusionConfig{});
+      *_impl->recon_device, *_impl->recon_allocator, fusion_config);
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
     // OutOfMemory that must reach Swift as one.
@@ -530,58 +555,39 @@ struct RendererImpl {
   // wait for it: the render loop draws the previous mesh rather than stalling,
   // which is what keeps presentation smooth while a remesh is in flight.
   //
-  // Done *before* the render scope opens. The upload below is gfx's blocking
-  // one-shot overload -- begin, record, submit, vkWaitForFences(UINT64_MAX) --
-  // and sandwiching a synchronous queue round trip between target->begin and
-  // target->end held a command buffer open across it for no reason. This does
-  // not make the upload non-blocking; see the note on -startFusionWithCapture:.
+  // Take the newest mesh, if fusion published one since the last. Nothing is
+  // uploaded and nothing is copied: interop seam B hands over the extractor's
+  // own VkBuffers, which the draw below reads in place. What used to be here
+  // was a ~53 MB download plus a blocking one-shot upload, every remesh, for
+  // geometry that never left the device.
   if (std::optional<app::Fusion::Published> fresh =
           _impl->fusion.take_mesh(_impl->uploaded_version)) {
-    vg::assets::Mesh gfx_mesh;
-    // A bulk copy, not a field-by-field rebuild: recon's mesh::Vertex *is*
-    // gfx::assets::Vertex since the 2026-08-02 layout decision. Size alone does
-    // not say so -- a reorder within the 64 bytes would pass it and misread
-    // every vertex -- so the field offsets are pinned too, matching the
-    // assertions recon's own to_gfx_mesh carries.
-    using RVertex = vr::mesh::Vertex;
-    using GVertex = vg::assets::Vertex;
-    static_assert(sizeof(RVertex) == sizeof(GVertex),
-                  "recon and gfx vertex layouts have diverged: size");
-    static_assert(offsetof(RVertex, position) == offsetof(GVertex, position),
-                  "recon and gfx vertex layouts have diverged: position");
-    static_assert(offsetof(RVertex, normal) == offsetof(GVertex, normal),
-                  "recon and gfx vertex layouts have diverged: normal");
-    static_assert(offsetof(RVertex, tangent) == offsetof(GVertex, tangent),
-                  "recon and gfx vertex layouts have diverged: tangent");
-    static_assert(offsetof(RVertex, uv0) == offsetof(GVertex, uv0),
-                  "recon and gfx vertex layouts have diverged: uv0");
-    static_assert(offsetof(RVertex, color) == offsetof(GVertex, color),
-                  "recon and gfx vertex layouts have diverged: color");
-    static_assert(std::is_trivially_copyable<RVertex>::value &&
-                      std::is_trivially_copyable<GVertex>::value,
-                  "vertex bulk copy requires trivially copyable layouts");
-    gfx_mesh.vertices.resize(fresh->mesh.vertices.size());
-    std::memcpy(gfx_mesh.vertices.data(), fresh->mesh.vertices.data(),
-                fresh->mesh.vertices.size() * sizeof(GVertex));
-    // Moved: the indices are the one half of the mesh that needs no conversion,
-    // and at room scale the copy this replaces was ~3 MB per frame.
-    gfx_mesh.indices = std::move(fresh->mesh.indices);
-
-    vg::Result<vg::pipelines::GpuMesh> uploaded = vg::pipelines::upload_mesh(
-        _impl->app.device(), _impl->app.allocator(), gfx_mesh);
-    if (uploaded) {
+    // Verified, not assumed. recon reports the usage its buffers were actually
+    // created with precisely because Vulkan cannot be asked, and binding one
+    // that lacks the bit is a validation-layer-only diagnostic -- undefined
+    // behaviour in the shipping configuration, which is this one.
+    const vr::mesh::DeviceMesh& m = fresh->mesh;
+    const bool bindable =
+        m.valid() && m.indirect != VK_NULL_HANDLE &&
+        (m.vertex_usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) != 0 &&
+        (m.index_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0 &&
+        (m.indirect_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+    if (bindable) {
+      // A slot per frame in flight, holding the *generation* rather than the
+      // geometry: the buffers are recon's, and this only has to remember which
+      // one to release once this frame's fence has signalled.
       _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
-      _impl->mesh_slots[_impl->mesh_slot] = std::move(uploaded).value();
+      _impl->mesh_slots[_impl->mesh_slot] = m;
       _impl->uploaded_version = fresh->version;
       _impl->have_mesh = true;
       _impl->mesh_upload_error.clear();
     } else {
-      // Recorded, not dropped. This is the one stage between "fusion says it
-      // produced geometry" and "the geometry is on screen", so a silent failure
-      // here shows a rising vertex count next to a frozen mesh -- or next to
-      // the bring-up triangle -- with nothing anywhere naming the upload.
+      // Released immediately: refusing to draw it must not also strand its slot
+      // in recon's ring, or one bad mesh stops every later extract.
+      _impl->fusion.release_through(m.generation);
       ++_impl->mesh_upload_failures;
-      _impl->mesh_upload_error = uploaded.status().message();
+      _impl->mesh_upload_error =
+          "mesh is not bindable as geometry (usage bits or handles missing)";
     }
   }
 
@@ -625,8 +631,27 @@ struct RendererImpl {
 
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
   if (draw_mesh) {
-    vg::pipelines::HybridMeshDraw draw{};
-    draw.mesh = &_impl->mesh_slots[_impl->mesh_slot];
+    // recon's buffers, named rather than copied. LiveMesh owns nothing and
+    // reads the index count GPU-side out of the indirect command, so the count
+    // never crosses the CPU either.
+    const vr::mesh::DeviceMesh& live_src = _impl->mesh_slots[_impl->mesh_slot];
+    vg::pipelines::LiveMesh live;
+    live.vertices = live_src.vertices;
+    live.indices = live_src.indices;
+    live.indirect = live_src.indirect;
+    const vg::pipelines::HybridMeshDraw draw{live};
+
+    // Park the generation this frame draws, and release the one the frame that
+    // just retired drew. begin_frame already waited on that frame's fence, so
+    // its slot is genuinely free -- and releasing here rather than at teardown
+    // is what keeps recon's ring turning.
+    const std::size_t retiring =
+        _impl->frame_slot % RendererImpl::kFramesInFlight;
+    if (_impl->frame_generations[retiring] != 0) {
+      _impl->fusion.release_through(_impl->frame_generations[retiring]);
+    }
+    _impl->frame_generations[retiring] = live_src.generation;
+    ++_impl->frame_slot;
 
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(std::max(extent.height, 1u));

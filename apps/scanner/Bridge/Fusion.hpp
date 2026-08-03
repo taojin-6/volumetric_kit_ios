@@ -127,6 +127,24 @@ struct FusionConfig {
   /// binds per slot -- is not built yet, and *this flag is what gates the
   /// feature on it*. Flip it in the change that lands the ring.
   bool texture = false;
+
+  /// @brief How many extracted meshes may be outstanding at once.
+  ///
+  /// Passed through to `MarchingCubesConfig::slot_count`. One is the host-copy
+  /// behaviour; the renderer drawing the extractor's buffers directly needs its
+  /// frames in flight plus one, so an extract never overwrites geometry a
+  /// pending frame is still reading.
+  std::uint32_t mesh_slots = 1;
+
+  /// @brief The queue families that will touch the mesh buffers.
+  ///
+  /// Both of them, unconditionally -- recon reduces the pair to its distinct
+  /// entries and picks EXCLUSIVE where they turn out to be one family. Under
+  /// the two-family queue plan a phone actually gets, they differ, and a mesh
+  /// created EXCLUSIVE would be read by a family that does not own it: silently
+  /// undefined, not an error.
+  std::uint32_t queue_families[2] = {0, 0};
+  std::uint32_t queue_family_count = 0;
 };
 
 /// @brief What the last fuse/remesh cost and produced, for the read-out.
@@ -197,18 +215,35 @@ class Fusion {
   /// textured triangle samples the wrong place. They are published, versioned,
   /// and taken as one.
   struct Published {
-    vr::mesh::Mesh mesh;
+    /// The extractor's own buffers, borrowed. Nothing is copied to the host at
+    /// all -- this is interop seam B, and the ~53 MB round trip per remesh that
+    /// seam A cost is exactly what it removes.
+    ///
+    /// Valid until its slot is reused, which cannot happen before the consumer
+    /// releases it: see @ref release_through.
+    vr::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
-    /// The colour frame that textured @ref mesh, canonical-encoded and packed
-    /// RGBA8. Empty when the frame carried no colour, or texturing is off.
-    std::vector<std::uint32_t> atlas;
-    std::uint32_t atlas_width = 0;
-    std::uint32_t atlas_height = 0;
-
-    bool has_atlas() const noexcept { return !atlas.empty(); }
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
+
+  /// @brief Report that every mesh up to @p generation has been drawn, so its
+  ///        slot may be extracted into again.
+  ///
+  /// The consumer half of the ring. Call it as the frames that drew a
+  /// @ref Published::mesh retire -- for the render loop, once the frame's fence
+  /// has signalled.
+  ///
+  /// Host-side, and that is the whole design rather than a simplification: a
+  /// semaphore the extract waited on would deadlock against a swapchain
+  /// rebuild, which drains the queue while holding the submit mutex (see the
+  /// warning at the top of this file). Reporting completion after the fact
+  /// cannot.
+  ///
+  /// Takes recon's @ref vr::mesh::DeviceMesh::generation, not @ref
+  /// Published::version -- the two number different things, and the ring is
+  /// recon's.
+  void release_through(std::uint64_t generation);
 
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
@@ -232,14 +267,17 @@ class Fusion {
   std::uint64_t captured_ = 0;
 
   mutable std::mutex mutex_;
-  vr::mesh::Mesh mesh_;
-  /// Published beside mesh_ and taken with it -- see Published. Refilled on the
-  /// fuse thread and moved out by the consumer, so neither the copy in nor the
-  /// hand-off costs anything under the lock.
-  std::vector<std::uint32_t> atlas_;
-  std::uint32_t atlas_width_ = 0;
-  std::uint32_t atlas_height_ = 0;
+  // The published view of the extractor's buffers -- handles and counts, not
+  // bytes. Copying it is copying five words.
+  vr::mesh::DeviceMesh mesh_;
   std::uint32_t mesh_version_ = 0;
+  // recon's generation for the mesh currently published, and whether anyone has
+  // taken it. A mesh superseded before the renderer ever asked for it still
+  // holds a slot, so publishing over one releases it -- without that the ring
+  // drains to nothing the moment fusion outruns the render loop, which it does
+  // routinely.
+  std::uint64_t published_generation_ = 0;
+  bool published_taken_ = true;
   vr::Mat4f last_pose_{1.0f};
   FusionStats stats_{};
 };

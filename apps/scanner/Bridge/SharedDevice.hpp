@@ -162,6 +162,24 @@ class SharedDevice {
     return queue_plan_ == QueuePlan::kSharedQueue ? &submit_mutex_ : nullptr;
   }
 
+ public:
+  /// @name The queue families the two libraries were handed
+  ///
+  /// A buffer one library writes and the other reads must be created naming
+  /// **both**, or it is `VK_SHARING_MODE_EXCLUSIVE` and reading it from the
+  /// family that does not own it is undefined -- silently, with the contents
+  /// simply not guaranteed to be there. Under @ref QueuePlan::kTwoFamilies
+  /// these differ, which is the plan a phone actually gets.
+  ///
+  /// Pass both to the producer unconditionally: recon's `BufferDesc` reduces
+  /// them to distinct entries and picks EXCLUSIVE when they turn out to be one
+  /// family, so a caller never has to branch on the plan.
+  /// @{
+  std::uint32_t graphics_family() const noexcept { return graphics_family_; }
+  std::uint32_t compute_family() const noexcept { return compute_family_; }
+  /// @}
+
+ private:
   VkInstance instance_ = VK_NULL_HANDLE;
   VkPhysicalDevice physical_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
