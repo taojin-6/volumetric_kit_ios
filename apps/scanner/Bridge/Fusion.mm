@@ -221,8 +221,31 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
     return;
   }
 
+  // The atlas the uv0 just written indexes: this frame's colour image, copied
+  // before the lock because it is 11 MB and the fuse thread would otherwise
+  // hold the publish mutex for the length of the memcpy -- the cost the mesh
+  // hand-off was already restructured to avoid.
+  //
+  // Copied rather than referenced: `frame.color` is a non-owning view into the
+  // capture's buffer, valid only until the next poll, and this fuse thread is
+  // what polls. The render thread reads it later, by which time it is gone.
+  std::vector<std::uint32_t> atlas;
+  std::uint32_t atlas_width = 0;
+  std::uint32_t atlas_height = 0;
+  if (config_.texture && frame.has_color() && frame.color_camera.width > 0 &&
+      frame.color_camera.height > 0) {
+    atlas_width = frame.color_camera.width;
+    atlas_height = frame.color_camera.height;
+    const std::size_t count =
+        static_cast<std::size_t>(atlas_width) * atlas_height;
+    atlas.assign(frame.color, frame.color + count);
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
   mesh_ = std::move(host).value();
+  atlas_ = std::move(atlas);
+  atlas_width_ = atlas_width;
+  atlas_height_ = atlas_height;
   ++mesh_version_;
   ++stats_.remeshes;
   stats_.vertices = static_cast<std::uint32_t>(mesh_.vertices.size());
@@ -232,7 +255,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.texture_ms = texture_ms;
 }
 
-std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> Fusion::take_mesh(
+std::optional<Fusion::Published> Fusion::take_mesh(
     std::uint32_t known_version) {
   std::lock_guard<std::mutex> lock(mutex_);
   // The emptiness check does double duty: nothing has been meshed yet, or this
@@ -246,7 +269,13 @@ std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> Fusion::take_mesh(
   // which uploads what it takes before returning and never comes back for it --
   // and a repeat call is refused by the version check above, not by mesh_ still
   // holding the bytes.
-  return std::make_pair(std::move(mesh_), mesh_version_);
+  Published out;
+  out.mesh = std::move(mesh_);
+  out.version = mesh_version_;
+  out.atlas = std::move(atlas_);
+  out.atlas_width = atlas_width_;
+  out.atlas_height = atlas_height_;
+  return out;
 }
 
 void Fusion::note_error(const std::string& message) {
