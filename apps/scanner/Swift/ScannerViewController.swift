@@ -60,6 +60,9 @@ final class ScannerViewController: UIViewController {
     // drawableSize until the view has been laid out in a window.
     startRendererIfNeeded()
     arSession.start()
+    // Fusion pulls from the capture bridge on its own thread; the render loop
+    // only ever picks up whatever mesh it has published.
+    renderer?.startFusion(with: arSession.capture)
     startDisplayLink()
   }
 
@@ -67,6 +70,8 @@ final class ScannerViewController: UIViewController {
     super.viewDidDisappear(animated)
     stopDisplayLink()
     arSession.pause()
+    // waitIdle stops fusion first -- it submits on the same queue, so joining
+    // after the drain would let it enqueue work behind the teardown.
     renderer?.waitIdle()
   }
 
@@ -78,8 +83,12 @@ final class ScannerViewController: UIViewController {
     do {
       brought = try VolumetricRenderer(layer: metalView.metalLayer)
     } catch {
-      statusLabel.text = "Renderer bring-up failed:\n\(error.localizedDescription)"
+      let message = "Renderer bring-up failed:\n\(error.localizedDescription)"
+      statusLabel.text = message
       statusLabel.textColor = .systemRed
+      // To stdout as well: this path never reaches updateStatus, so without it
+      // a bring-up failure is visible only on the screen.
+      print(message)
       return
     }
     renderer = brought
@@ -161,6 +170,8 @@ final class ScannerViewController: UIViewController {
         "\(s.frames_submitted) in / \(s.frames_polled) polled"
         + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
       text += """
+        \(renderer.fusionSummary)
+
         ARKit capture
           frames    \(counts)
           depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)

@@ -120,6 +120,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.frames_fused;
+    last_pose_ = frame.depth_camera.cam_to_world;
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
     stats_.last_error.clear();
@@ -187,6 +188,11 @@ std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> Fusion::take_mesh(
   // Copied, not moved: the fuse thread keeps publishing into mesh_, and the
   // render thread may take several frames to finish with what it got.
   return std::make_pair(mesh_, mesh_version_);
+}
+
+vr::Mat4f Fusion::last_pose() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_pose_;
 }
 
 FusionStats Fusion::stats() const {

@@ -7,25 +7,36 @@
 
 #import "VolumetricRenderer.h"
 
+#import "Fusion.hpp"
 #import "SharedDevice.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
+#include <glm/gtc/matrix_transform.hpp>
 #include "triangle_frag.spv.hpp"
 #include "triangle_vert.spv.hpp"
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
+
+#include "volumetric_kit/gfx/assets/mesh.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
 #include "volumetric_kit/gfx/core/render_target.hpp"
 #include "volumetric_kit/gfx/core/result.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/core/vulkan.hpp"
+#include "volumetric_kit/gfx/pipelines/gpu_mesh.hpp"
+#include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
+#include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
+namespace app = volumetric_kit::ios_app;
 
 NSErrorDomain const VolumetricRendererErrorDomain =
     @"io.taojin.volumetrickit.renderer";
@@ -156,6 +167,7 @@ struct RendererImpl {
   // has no public default constructor -- which is the invariant working, not an
   // inconvenience. There is no such thing as an empty one to default-construct.
   std::optional<volumetric_kit::recon::Device> recon_device;
+  std::optional<volumetric_kit::recon::Allocator> recon_allocator;
   vg::ShaderModule vertex_shader;
   vg::ShaderModule fragment_shader;
   vg::GraphicsPipeline pipeline;
@@ -169,6 +181,27 @@ struct RendererImpl {
   // structural instead of remembered.
   vg::app::WindowedApp app;
   std::uint64_t frames_presented = 0;
+
+  // --- Reconstruction ------------------------------------------------------
+  app::Fusion fusion;
+  std::thread fuse_thread;
+  std::atomic<bool> fusing{false};
+  vr::sensor::ICameraCapture* capture = nullptr;
+
+  std::optional<vg::pipelines::HybridMeshPipeline> mesh_pipeline;
+  // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
+  // use-after-free, and at per-frame meshing that would be every frame. With
+  // two frames in flight, a mesh uploaded now is untouched again by the time
+  // the ring comes back round -- which is the cheap version of the mesh-slot
+  // ring the interop decision describes, and avoids a wait_idle per frame.
+  static constexpr std::size_t kMeshSlots = 3;
+  vg::pipelines::GpuMesh mesh_slots[kMeshSlots];
+  std::size_t mesh_slot = 0;
+  std::uint32_t uploaded_version = 0;
+  bool have_mesh = false;
+  bool draw_mesh = true;
+  // The pose the newest mesh was fused at; the camera follows the scan.
+  vr::Mat4f camera_to_world{1.0f};
 };
 
 @implementation VolumetricRenderer {
@@ -205,6 +238,11 @@ struct RendererImpl {
   // display's cadence is what we want, and MAILBOX keeps the GPU busy producing
   // frames that are then discarded -- straight thermal cost for no benefit.
   config.swapchain.preferred_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+  // A depth attachment, which the triangle did not need but a reconstruction
+  // does: without it near geometry does not occlude far, and the mesh renders
+  // as whichever triangle happened to be emitted last. The swapchain owns one
+  // per image, so it is depth-safe at any frames-in-flight count.
+  config.swapchain.depth_format = VK_FORMAT_D32_SFLOAT;
 
   vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
       _impl->shared.gfx_payload(), config,
@@ -237,6 +275,19 @@ struct RendererImpl {
     return nil;
   }
   _impl->recon_device.emplace(std::move(recon_device).value());
+
+  // recon allocates its volume, mesh arena and staging buffers from its own
+  // VMA allocator on the shared device -- separate accounting from gfx's, one
+  // device underneath.
+  vr::Result<vr::Allocator> recon_allocator =
+      vr::Allocator::create(_impl->shared.instance(), *_impl->recon_device);
+  if (!recon_allocator) {
+    set_error(error,
+              vg::Status::unsupported(recon_allocator.status().message()),
+              "recon Allocator::create");
+    return nil;
+  }
+  _impl->recon_allocator.emplace(std::move(recon_allocator).value());
 
   VkDevice device = _impl->app.device().handle();
   vg::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
@@ -274,6 +325,26 @@ struct RendererImpl {
   }
   _impl->pipeline = std::move(pipeline).value();
 
+  // The renderer's hybrid path: it samples the projective-texturing atlas where
+  // a triangle carries a real uv0, and falls back to the per-vertex colour the
+  // TSDF fused elsewhere. That is exactly what recon's mesh emits.
+  vg::Result<vg::pipelines::HybridMeshPipeline> mesh_pipeline =
+      vg::pipelines::HybridMeshPipeline::create(
+          device, _impl->app.swapchain().layout());
+  if (!mesh_pipeline) {
+    set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
+    return nil;
+  }
+  _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
+
+  const vr::Status fusion_started = _impl->fusion.start(
+      *_impl->recon_device, *_impl->recon_allocator, app::FusionConfig{});
+  if (!fusion_started) {
+    set_error(error, vg::Status::unsupported(fusion_started.message()),
+              "Fusion::start");
+    return nil;
+  }
+
   return self;
 }
 
@@ -299,26 +370,78 @@ struct RendererImpl {
   begin.clear_color = {{0.05f, 0.06f, 0.09f, 1.0f}};
   f.target->begin(f.cmd, begin);
 
-  vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    _impl->pipeline.handle());
+  // Take the newest mesh, if fusion published one since the last upload. Never
+  // wait for it: the render loop draws the previous mesh rather than stalling,
+  // which is what keeps presentation smooth while a remesh is in flight.
+  if (std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> fresh =
+          _impl->fusion.take_mesh(_impl->uploaded_version)) {
+    vg::assets::Mesh gfx_mesh;
+    // A bulk copy, not a field-by-field rebuild: recon's mesh::Vertex *is*
+    // gfx::assets::Vertex since the 2026-08-02 layout decision.
+    static_assert(sizeof(vr::mesh::Vertex) == sizeof(vg::assets::Vertex),
+                  "recon and gfx vertex layouts have diverged");
+    gfx_mesh.vertices.resize(fresh->first.vertices.size());
+    std::memcpy(gfx_mesh.vertices.data(), fresh->first.vertices.data(),
+                fresh->first.vertices.size() * sizeof(vg::assets::Vertex));
+    gfx_mesh.indices = fresh->first.indices;
 
-  // Viewport and scissor are dynamic state, so they follow the swapchain
-  // through a rotation without rebuilding the pipeline.
-  VkViewport viewport{};
-  viewport.x = 0.0f;
-  viewport.y = 0.0f;
-  viewport.width = static_cast<float>(extent.width);
-  viewport.height = static_cast<float>(extent.height);
-  viewport.minDepth = 0.0f;
-  viewport.maxDepth = 1.0f;
-  vkCmdSetViewport(f.cmd, 0, 1, &viewport);
+    vg::Result<vg::pipelines::GpuMesh> uploaded = vg::pipelines::upload_mesh(
+        _impl->app.device(), _impl->app.allocator(), gfx_mesh);
+    if (uploaded) {
+      _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
+      _impl->mesh_slots[_impl->mesh_slot] = std::move(uploaded).value();
+      _impl->uploaded_version = fresh->second;
+      _impl->have_mesh = true;
+    }
+  }
 
-  VkRect2D scissor{};
-  scissor.offset = {0, 0};
-  scissor.extent = extent;
-  vkCmdSetScissor(f.cmd, 0, 1, &scissor);
+  const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
+  if (draw_mesh) {
+    // Follow the scan: view is the inverse of the camera-to-world pose fusion
+    // last used, so the render tracks where the device is looking.
+    vg::pipelines::HybridMeshDraw draw{};
+    draw.mesh = &_impl->mesh_slots[_impl->mesh_slot];
 
-  vkCmdDraw(f.cmd, 3, 1, 0, 0);
+    // Follow the device: the newest fused pose, taken every frame rather than
+    // only on remesh, so the view tracks smoothly even between mesh updates.
+    _impl->camera_to_world = _impl->fusion.last_pose();
+
+    const float aspect = static_cast<float>(extent.width) /
+                         static_cast<float>(std::max(extent.height, 1u));
+    glm::mat4 proj =
+        glm::perspective(glm::radians(60.0f), aspect, 0.05f, 20.0f);
+    // Vulkan's clip space has +Y down where GL's has it up, and glm targets GL.
+    proj[1][1] *= -1.0f;
+
+    vg::pipelines::HybridMeshFrame frame_info{};
+    frame_info.extent = extent;
+    frame_info.view_proj = proj * glm::inverse(_impl->camera_to_world);
+    frame_info.draws = &draw;
+    frame_info.draw_count = 1;
+    (void)_impl->mesh_pipeline->submit(f.cmd, frame_info);
+  } else {
+    vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      _impl->pipeline.handle());
+
+    // Viewport and scissor are dynamic state, so they follow the swapchain
+    // through a rotation without rebuilding the pipeline. (The hybrid pipeline
+    // sets its own from HybridMeshFrame::extent.)
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(f.cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = extent;
+    vkCmdSetScissor(f.cmd, 0, 1, &scissor);
+
+    vkCmdDraw(f.cmd, 3, 1, 0, 0);
+  }
 
   f.target->end(f.cmd);
 
@@ -341,6 +464,53 @@ struct RendererImpl {
   // destroyed. The app's own destructor drains too, but only once destruction
   // has already begun -- this puts the wait ahead of every member.
   [self waitIdle];
+}
+
+- (void)startFusionWithCapture:(VolumetricCapture*)capture {
+  if (_impl->fusing.load()) {
+    return;
+  }
+  _impl->capture =
+      static_cast<vr::sensor::ICameraCapture*>([capture captureHandle]);
+  _impl->fusing.store(true);
+  _impl->fuse_thread = std::thread([self] {
+    while (self->_impl->fusing.load()) {
+      vr::Result<std::optional<vr::sensor::CapturedFrame>> got =
+          self->_impl->capture->poll();
+      if (!got || !got.value()) {
+        // Nothing new: sleep briefly rather than spin. ARKit delivers at 60 Hz
+        // and this loop is otherwise free to burn a core doing nothing.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      self->_impl->fusion.fuse(*got.value());
+    }
+  });
+}
+
+- (void)stopFusion {
+  _impl->fusing.store(false);
+  if (_impl->fuse_thread.joinable()) {
+    _impl->fuse_thread.join();
+  }
+}
+
+- (NSString*)fusionSummary {
+  const app::FusionStats s = _impl->fusion.stats();
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "fused %llu / remesh %llu  v%u\n"
+                "  mesh      %u verts / %u tris\n"
+                "  allocate  %.1f ms\n"
+                "  integrate %.1f ms\n"
+                "  extract   %.1f ms\n"
+                "  texture   %.1f ms%s%s",
+                static_cast<unsigned long long>(s.frames_fused),
+                static_cast<unsigned long long>(s.remeshes), s.mesh_version,
+                s.vertices, s.triangles, s.allocate_ms, s.integrate_ms,
+                s.extract_ms, s.texture_ms,
+                s.last_error.empty() ? "" : "\n  ! ", s.last_error.c_str());
+  return [NSString stringWithUTF8String:buf];
 }
 
 - (void)waitIdle {

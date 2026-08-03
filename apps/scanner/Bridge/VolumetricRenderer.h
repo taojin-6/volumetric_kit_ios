@@ -17,6 +17,8 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#import "ARKitCapture.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// The `NSError` domain every failure below is reported in.
@@ -66,6 +68,28 @@ NS_SWIFT_NAME(VolumetricRenderer)
     NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
+
+/// @brief Begin fusing from @p capture on a background thread.
+///
+/// Fusion runs off the render thread so a slow remesh does not stall
+/// presentation. They still *serialize on the GPU* — iOS gives one queue, so
+/// both libraries submit through one mutex — but the CPU halves overlap, and
+/// the render loop never blocks waiting for a mesh: it draws the newest one
+/// published, or the previous one when nothing is newer.
+///
+/// @param capture  The ARKit source to poll. Must outlive the renderer.
+- (void)startFusionWithCapture:(VolumetricCapture*)capture;
+
+/// @brief Stop the fuse thread and join it.
+- (void)stopFusion;
+
+/// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
+/// stays reachable because when the mesh first renders wrong, being able to A/B
+/// against a known-good draw is worth more than the code it costs.
+@property(nonatomic) BOOL drawMesh;
+
+/// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
+@property(nonatomic, readonly, copy) NSString* fusionSummary;
 
 /// @brief Draw and present one frame at @p size.
 ///

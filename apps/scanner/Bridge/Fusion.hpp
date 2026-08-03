@@ -50,14 +50,18 @@ struct FusionConfig {
   float trunc_dist = 0.06f;
   /// Initial hash-table shape. Grows on overflow.
   std::int32_t num_buckets = 4096;
-  /// Fuse every Nth captured frame. ARKit delivers 60/s and the surface barely
-  /// moves between them, so fusing every frame mostly re-averages the same
-  /// voxels for the same result.
-  std::uint32_t fuse_every = 2;
-  /// Re-extract the mesh every Nth *fused* frame. The dominant cost by far --
-  /// marching cubes runs over the whole volume, so this is the knob that
-  /// decides whether the app feels live.
-  std::uint32_t remesh_every = 15;
+  /// Fuse every Nth captured frame; 1 = every frame.
+  std::uint32_t fuse_every = 1;
+  /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
+  ///
+  /// Per-frame meshing is affordable now, and was not always: recon's own
+  /// profiling found `extract` costing ~55 ms/frame, of which ~50 ms was
+  /// allocating a fresh worst-case vertex arena *every call* and only ~2 ms was
+  /// the marching-cubes dispatch. With the arena persistent and grow-only, a
+  /// 100-frame `--mesh-every 1` run went 6.3 s -> 0.8 s. So the knob stays --
+  /// a large enough volume will still outrun the frame budget -- but it starts
+  /// at 1, because a reconstruction that updates every frame is the point.
+  std::uint32_t remesh_every = 1;
   /// Project the current keyframe onto the mesh after each remesh.
   bool texture = true;
 };
@@ -105,6 +109,14 @@ class Fusion {
   /// the middle of.
   void fuse(const vr::sensor::CapturedFrame& frame);
 
+  /// @return The camera-to-world pose of the most recently fused frame.
+  ///
+  /// The render camera follows this. Without it the view stays at the world
+  /// origin looking down +Z while the scan happens somewhere else entirely --
+  /// which renders as a flat fill, because the camera ends up inside the
+  /// surface rather than looking at it.
+  vr::Mat4f last_pose() const;
+
   /// @brief Take the mesh if it is newer than @p known_version.
   /// @return The mesh and its version, or nothing when unchanged.
   std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> take_mesh(
@@ -130,6 +142,7 @@ class Fusion {
   mutable std::mutex mutex_;
   vr::mesh::Mesh mesh_;
   std::uint32_t mesh_version_ = 0;
+  vr::Mat4f last_pose_{1.0f};
   FusionStats stats_{};
 };
 
