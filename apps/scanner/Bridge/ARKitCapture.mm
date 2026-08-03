@@ -526,7 +526,20 @@ class ARKitCapture final : public sensor::ICameraCapture {
   FrameBuffers front_;
   FrameBuffers back_;
   bool staged_ = false;
-  VolumetricCaptureStats stats_{};
+  // The three `const char*` members need a non-null start, and `{}` does not
+  // give them one: it zero-initializes, and Swift imports them as
+  // implicitly-unwrapped pointers, so `String(cString:)` on a null traps. The
+  // read-out runs from the first display-link tick, which is before any ARFrame
+  // has been submitted -- so the null was reached on every launch, not on some
+  // edge case.
+  VolumetricCaptureStats stats_ = [] {
+    VolumetricCaptureStats s{};
+    s.color_matrix = "(none)";
+    s.color_transfer = "(none)";
+    s.color_primaries = "(none)";
+    s.color_was_canonical = true;
+    return s;
+  }();
 };
 
 }  // namespace
