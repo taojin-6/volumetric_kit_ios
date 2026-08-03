@@ -61,13 +61,26 @@ enum class QueuePlan {
   /// fuse thread and the render thread serialize, which is precisely what the
   /// background fuse thread exists to avoid.
   ///
-  /// @warning Not merely slower. gfx takes the same mutex across a full queue
-  ///          drain when it recreates the swapchain (every rotation), so once
-  ///          seam B lands a recon submit waiting on a gfx-signalled timeline
-  ///          value can deadlock against a concurrent rotation. Nothing the
-  ///          embedder can do about that — Vulkan requires the external
-  ///          synchronization — which is why this plan is last and why the two
-  ///          above it are worth the search.
+  /// @warning It also forbids a cross-library GPU-side wait, in *either*
+  ///          direction — a different sync design, not just a slower one.
+  ///
+  /// `Swapchain::recreate` drains on every rotation through gfx's
+  /// `Device::wait_idle`, which takes the mutex and *then* calls
+  /// `vkQueueWaitIdle`. On a shared queue that drain waits on **both**
+  /// libraries' in-flight work while holding the lock either one needs
+  /// to submit anything further.
+  ///
+  /// So once seam B lands, any command buffer already on the queue whose
+  /// completion depends on a submit the sibling has not made yet will
+  /// deadlock against a concurrent rotation: gfx's draw waiting on recon's
+  /// mesh-ready value and recon's extract waiting on a gfx-signalled value
+  /// are both that shape.
+  ///
+  /// Nothing the embedder can undo — Vulkan requires the external
+  /// synchronization, and the drain is gfx's to make. Under this plan both
+  /// sides must check readiness on the host and skip, never submit a wait
+  /// on a value the sibling has yet to signal. Avoiding that is what this
+  /// plan being last is for.
   kSharedQueue,
 };
 
