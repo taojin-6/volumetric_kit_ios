@@ -22,27 +22,116 @@
 #include "volumetric_kit/gfx/core/result.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/core/vulkan.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
 
+NSErrorDomain const VolumetricRendererErrorDomain =
+    @"io.taojin.volumetrickit.renderer";
+NSErrorUserInfoKey const VolumetricRendererVulkanResultKey =
+    @"VolumetricRendererVulkanResult";
+
 namespace {
 
-NSString* const kErrorDomain = @"io.taojin.volumetrickit.renderer";
+// Never nil, so a `nonnull` property cannot hand Swift a null it traps on:
+// `stringWithUTF8String:` returns nil for invalid UTF-8, and Vulkan promises
+// only that VkPhysicalDeviceProperties::deviceName is a NUL-terminated
+// char[256] -- a driver may put any bytes in it, and Swift imports the property
+// as a non-optional String.
+NSString* to_ns_string(const std::string& text) {
+  if (NSString* utf8 = [NSString stringWithUTF8String:text.c_str()]) {
+    return utf8;
+  }
+  // Latin-1 maps every byte to a code point, so this cannot fail in turn.
+  NSString* latin1 = [[NSString alloc] initWithBytes:text.data()
+                                              length:text.size()
+                                            encoding:NSISOLatin1StringEncoding];
+  return latin1 != nil ? latin1 : @"(unprintable)";
+}
 
-// Surface the library's Status as an NSError so Swift sees a native failure
-// instead of a status code it would have to interpret.
-void set_error(NSError** error, const vg::Status& status, const char* stage) {
+VolumetricRendererError error_code(vg::Status::Code domain) {
+  switch (domain) {
+    case vg::Status::Code::Ok:
+      return VolumetricRendererErrorUnknown;
+    case vg::Status::Code::InvalidArgument:
+      return VolumetricRendererErrorInvalidArgument;
+    case vg::Status::Code::NotFound:
+      return VolumetricRendererErrorNotFound;
+    case vg::Status::Code::Unsupported:
+      return VolumetricRendererErrorUnsupported;
+    case vg::Status::Code::OutOfMemory:
+      return VolumetricRendererErrorOutOfMemory;
+    case vg::Status::Code::IoError:
+      return VolumetricRendererErrorIoError;
+    case vg::Status::Code::Vulkan:
+      return VolumetricRendererErrorVulkan;
+  }
+  return VolumetricRendererErrorUnknown;
+}
+
+VolumetricRendererError error_code(vr::Status::Code domain) {
+  switch (domain) {
+    case vr::Status::Code::Ok:
+      return VolumetricRendererErrorUnknown;
+    case vr::Status::Code::InvalidArgument:
+      return VolumetricRendererErrorInvalidArgument;
+    case vr::Status::Code::NotFound:
+      return VolumetricRendererErrorNotFound;
+    case vr::Status::Code::Unsupported:
+      return VolumetricRendererErrorUnsupported;
+    case vr::Status::Code::OutOfMemory:
+      return VolumetricRendererErrorOutOfMemory;
+    case vr::Status::Code::IoError:
+      return VolumetricRendererErrorIoError;
+    // recon keeps its backend neutral, but here the backend *is* Vulkan and the
+    // detail code is the VkResult.
+    case vr::Status::Code::Backend:
+      return VolumetricRendererErrorVulkan;
+  }
+  return VolumetricRendererErrorUnknown;
+}
+
+// Surface a library Status as an NSError so Swift sees a native failure instead
+// of a status code it would have to interpret. The two libraries' Status types
+// are structurally alike (domain + optional backend code + message) but neither
+// imports the other, so each overload below reduces its own to these values.
+void set_error(NSError** error, const char* stage, VolumetricRendererError code,
+               std::optional<VkResult> vk_result, const std::string& message) {
   if (error == nullptr) {
     return;
   }
-  NSString* message =
-      [NSString stringWithFormat:@"%s: %s", stage, status.message().c_str()];
-  *error = [NSError errorWithDomain:kErrorDomain
-                               code:static_cast<NSInteger>(status.code())
-                           userInfo:@{NSLocalizedDescriptionKey : message}];
+  NSMutableDictionary* info = [NSMutableDictionary dictionary];
+  std::string described = std::string(stage) + ": " + message;
+  if (vk_result) {
+    described += " (";
+    described += std::string(vg::to_string(*vk_result));
+    described += ")";
+    info[VolumetricRendererVulkanResultKey] = @(static_cast<int>(*vk_result));
+  }
+  info[NSLocalizedDescriptionKey] = to_ns_string(described);
+  *error = [NSError errorWithDomain:VolumetricRendererErrorDomain
+                               code:code
+                           userInfo:info];
+}
+
+void set_error(NSError** error, const vg::Status& status, const char* stage) {
+  const bool vulkan = status.domain() == vg::Status::Code::Vulkan;
+  set_error(error, stage, error_code(status.domain()),
+            vulkan ? std::optional<VkResult>(status.code()) : std::nullopt,
+            status.message());
+}
+
+// Carried through rather than flattened into `unsupported`: a device-creation
+// failure on a user's phone should name its VkResult, not read as a capability
+// the driver lacks.
+void set_error(NSError** error, const vr::Status& status, const char* stage) {
+  const bool backend = status.domain() == vr::Status::Code::Backend;
+  set_error(
+      error, stage, error_code(status.domain()),
+      backend ? std::optional<VkResult>(static_cast<VkResult>(status.detail()))
+              : std::nullopt,
+      status.message());
 }
 
 std::string api_version_string(std::uint32_t v) {
@@ -56,23 +145,29 @@ std::string api_version_string(std::uint32_t v) {
 // Everything C++ lives here so the header stays Objective-C only and Swift
 // never sees a move-only type.
 struct RendererImpl {
-  // Declared first, destroyed last: both adopters borrow its handles and
-  // destroy nothing, so the device has to outlive them.
+  // Declared first, destroyed last: everything below borrows the VkDevice this
+  // owns and destroys nothing, so it has to outlive all of them.
   volumetric_kit::ios_app::SharedDevice shared;
-  vg::app::WindowedApp app;
   // recon's view of the same VkDevice. Unused until fusion lands, but adopted
   // here because *proving both libraries share one device* is what this slice
   // is for -- and because a failure to adopt must surface at bring-up, not
   // later.
-  // optional, not a plain member: recon's Device and Allocator are
-  // create-or-adopt only and have no public default constructor -- which is the
-  // invariant working, not an inconvenience. There is no such thing as an empty
-  // one to default-construct.
+  // optional, not a plain member: recon's Device is create-or-adopt only and
+  // has no public default constructor -- which is the invariant working, not an
+  // inconvenience. There is no such thing as an empty one to default-construct.
   std::optional<volumetric_kit::recon::Device> recon_device;
-  std::optional<volumetric_kit::recon::Allocator> recon_allocator;
   vg::ShaderModule vertex_shader;
   vg::ShaderModule fragment_shader;
   vg::GraphicsPipeline pipeline;
+  // Declared LAST, so reverse member destruction tears it down FIRST. gfx warns
+  // that resources created after the app destruct before it while its frame
+  // loop may still have frames in flight referencing them -- destroying a
+  // VkPipeline a submitted frame still uses is
+  // VUID-vkDestroyPipeline-pipeline-00765. The app's own teardown drains the
+  // loop, so putting it here orders that drain ahead of the objects it protects
+  // rather than after them. -dealloc waits as well; this makes the ordering
+  // structural instead of remembered.
+  vg::app::WindowedApp app;
   std::uint64_t frames_presented = 0;
 };
 
@@ -95,7 +190,7 @@ struct RendererImpl {
   const vr::Status built = _impl->shared.build((__bridge const void*)layer,
                                                "volumetric_kit_ios scanner");
   if (!built) {
-    set_error(error, vg::Status::unsupported(built.message()), "SharedDevice");
+    set_error(error, built, "SharedDevice");
     return nil;
   }
 
@@ -138,21 +233,10 @@ struct RendererImpl {
   vr::Result<vr::Device> recon_device =
       vr::Device::adopt(_impl->shared.recon_payload(), {});
   if (!recon_device) {
-    set_error(error, vg::Status::unsupported(recon_device.status().message()),
-              "recon Device::adopt");
+    set_error(error, recon_device.status(), "recon Device::adopt");
     return nil;
   }
   _impl->recon_device.emplace(std::move(recon_device).value());
-
-  vr::Result<vr::Allocator> recon_allocator =
-      vr::Allocator::create(_impl->shared.instance(), *_impl->recon_device);
-  if (!recon_allocator) {
-    set_error(error,
-              vg::Status::unsupported(recon_allocator.status().message()),
-              "recon Allocator::create");
-    return nil;
-  }
-  _impl->recon_allocator.emplace(std::move(recon_allocator).value());
 
   VkDevice device = _impl->app.device().handle();
   vg::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
@@ -252,34 +336,59 @@ struct RendererImpl {
   return YES;
 }
 
+- (void)dealloc {
+  // gfx's prescribed teardown: idle before anything created after the app is
+  // destroyed. The app's own destructor drains too, but only once destruction
+  // has already begun -- this puts the wait ahead of every member.
+  [self waitIdle];
+}
+
 - (void)waitIdle {
-  if (_impl && _impl->app.valid()) {
+  if (!_impl) {
+    return;
+  }
+  if (_impl->app.valid()) {
     (void)_impl->app.wait_idle();
   }
+  // gfx idles only the queues it was assigned, and recon's Device exposes no
+  // wait at all -- so on a two-family plan recon's queue is one nobody else
+  // would ever drain. The bootstrap owns them both and waits on both.
+  _impl->shared.wait_idle();
 }
 
 - (NSString*)deviceName {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return [NSString stringWithUTF8String:props.deviceName];
+  return to_ns_string(props.deviceName);
 }
 
 - (NSString*)apiVersion {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return [NSString
-      stringWithUTF8String:api_version_string(props.apiVersion).c_str()];
+  return to_ns_string(api_version_string(props.apiVersion));
 }
 
 - (NSString*)sharedDeviceSummary {
-  return [NSString stringWithUTF8String:_impl->shared.summary().c_str()];
+  return to_ns_string(_impl->shared.summary());
 }
 
 - (BOOL)sharesOneDevice {
-  // Compared through each library's own accessor, not against the bootstrap's
-  // record -- that is what makes this evidence rather than a restatement.
-  return _impl->app.device().handle() == _impl->recon_device->handle() &&
-         _impl->app.device().handle() != VK_NULL_HANDLE;
+  if (!_impl->app.valid() || !_impl->recon_device) {
+    return NO;
+  }
+  const VkDevice bootstrap = _impl->shared.device();
+  if (bootstrap == VK_NULL_HANDLE) {
+    return NO;
+  }
+  // The handle comparison is a post-condition, not a discovery: both wrappers
+  // were handed this same field and cannot come back differing. It is worth
+  // reporting only alongside owns_device(), which is false purely because each
+  // went through `adopt` -- a library that quietly created a device of its own
+  // is the divergence this can actually catch.
+  return _impl->app.device().handle() == bootstrap &&
+         _impl->recon_device->handle() == bootstrap &&
+         !_impl->app.device().owns_device() &&
+         !_impl->recon_device->owns_device();
 }
 
 - (uint64_t)framesPresented {

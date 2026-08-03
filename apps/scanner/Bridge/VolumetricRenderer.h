@@ -19,6 +19,34 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// The `NSError` domain every failure below is reported in.
+FOUNDATION_EXPORT NSErrorDomain const VolumetricRendererErrorDomain;
+
+/// @brief `NSError.code` values: the *domain* of the library `Status` that
+///        failed.
+///
+/// The domain is the primary discriminator on both sides of the seam — recon
+/// and gfx each document their numeric result code as meaningful only for a
+/// backend/Vulkan failure and zero everywhere else, so surfacing that code as
+/// `NSError.code` would report almost every failure as `0`. The `VkResult`,
+/// when there is one, rides in @ref VolumetricRendererVulkanResultKey instead
+/// and is named in the localized description.
+typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
+    VolumetricRendererErrorUnknown = 0,
+    VolumetricRendererErrorInvalidArgument = 1,
+    VolumetricRendererErrorNotFound = 2,
+    VolumetricRendererErrorUnsupported = 3,
+    VolumetricRendererErrorOutOfMemory = 4,
+    VolumetricRendererErrorIoError = 5,
+    /// A Vulkan call failed; the `VkResult` is in
+    /// @ref VolumetricRendererVulkanResultKey.
+    VolumetricRendererErrorVulkan = 6,
+};
+
+/// The failing `VkResult` as an `NSNumber`, present only on a
+/// @ref VolumetricRendererErrorVulkan.
+FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -68,9 +96,15 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// "Apple M5 GPU, family 0, 2 queues (gfx + recon)".
 @property(nonatomic, readonly, copy) NSString* sharedDeviceSummary;
 
-/// Whether recon and gfx really hold the same `VkDevice` handle. Reported
-/// rather than assumed: it is the whole claim of this slice, and the two
-/// adopters could silently diverge without it.
+/// Whether recon and gfx both hold the bootstrap's one `VkDevice` *and* neither
+/// owns it.
+///
+/// Handle equality alone would be a post-condition, not evidence: both wrappers
+/// were handed the same field, so they cannot differ once bring-up succeeds.
+/// What makes this worth reporting is the second half — `owns_device()` is
+/// false only because each went through `adopt`, so a library that quietly fell
+/// back to creating a device of its own is the one thing this can actually
+/// catch.
 @property(nonatomic, readonly) BOOL sharesOneDevice;
 
 @end

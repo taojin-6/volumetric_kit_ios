@@ -144,6 +144,36 @@ compute path; this proves the render path.
 Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the native
 2420×1668, triangle on screen.
 
+#### The duplicated bootstrap
+
+`Bridge/SharedDevice.{hpp,mm}` builds one `VkDevice` from
+`vr::Device::requirements()` ∪ `vg::Device::requirements()` and hands the same
+handles to `recon::Device::adopt` and `gfx::app::WindowedApp::adopt`. recon's
+`examples/viewer/shared_device.hpp` does the same job for GLFW on desktop, so
+this is a second copy of one algorithm.
+
+It is copied rather than shared because there is nowhere yet for it to live:
+neither library can own it (it is the one piece that is *neither* library's, and
+both libraries' RAII owners start after it), and a third package for ~400 lines
+with two consumers buys less than it costs. What genuinely differs is small —
+surface creation (`VK_EXT_metal_surface` against a `CAMetalLayer` rather than
+GLFW) and returning a `Status` instead of printing to stderr.
+
+The rest is deliberately kept in step, and the parts that are load-bearing are
+the ones a copy loses quietly: the **queue-plan order** (one family with two
+queues, then two families, then a shared queue — MoltenVK reports several
+graphics + compute + present families of one queue each, so a phone lands on the
+second and taking the third hands back the concurrency the fuse thread exists
+for), the **pre-create support checks** (so a shortfall names the missing
+extension or feature instead of collapsing into `vkCreateDevice failed`), the
+**`feature_chain` splice** (gfx documents enabling its opaque chain as the
+embedder's job; it is null today), and the **field-wise feature merge**.
+
+Promote it to a shared package when a third consumer appears, or the first time
+the two copies disagree about any of the above — the family's rule is that
+duplication is answered at the second consumer, and the second consumer here is
+what makes the drift possible rather than what makes it wrong.
+
 ### `compute_smoke`
 
 The de-risk gate. The family's standing rule is *validate MoltenVK compute on
