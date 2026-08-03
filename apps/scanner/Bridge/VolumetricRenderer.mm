@@ -25,10 +25,14 @@
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
 
 #include "volumetric_kit/gfx/assets/mesh.hpp"
+#include "volumetric_kit/gfx/core/descriptor.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
 #include "volumetric_kit/gfx/core/render_target.hpp"
 #include "volumetric_kit/gfx/core/result.hpp"
+#include "volumetric_kit/gfx/core/sampler.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
+#include "volumetric_kit/gfx/core/texture.hpp"
+#include "volumetric_kit/gfx/core/texture_upload.hpp"
 #include "volumetric_kit/gfx/core/vulkan.hpp"
 #include "volumetric_kit/gfx/pipelines/gpu_mesh.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
@@ -191,6 +195,16 @@ struct RendererImpl {
   vr::sensor::ICameraCapture* capture = nullptr;
 
   std::optional<vg::pipelines::HybridMeshPipeline> mesh_pipeline;
+  // The atlas binding the hybrid pipeline requires of every frame. Its fragment
+  // shader samples set 0 unconditionally, so submit() records *nothing at all*
+  // without one -- see the bring-up comment where these are filled in.
+  vg::Texture atlas_texture;
+  // optional for the same reason recon's Device is: Sampler keeps its default
+  // constructor private, so it is create-only and there is no empty one to
+  // default-construct. The other three do expose an empty state.
+  std::optional<vg::Sampler> atlas_sampler;
+  vg::DescriptorPool atlas_pool;
+  vg::DescriptorSet atlas_set;
   // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
   // use-after-free, and at per-frame meshing that would be every frame. With
   // two frames in flight, a mesh uploaded now is untouched again by the time
@@ -341,6 +355,60 @@ struct RendererImpl {
   }
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
 
+  // --- The atlas set, without which nothing draws ---------------------------
+  // Not optional and not a detail: HybridMeshPipeline::submit returns early on
+  // a VK_NULL_HANDLE atlas, recording no bind, no push constant and no draw. A
+  // frame missing this one field clears the screen and presents it, which is
+  // indistinguishable from a working renderer looking at empty space -- and is
+  // exactly what the scanner did until now.
+  //
+  // 1x1 white, which is what gfx prescribes for the vertex-colour path: the
+  // fragment shader samples the atlas unconditionally, but only where a
+  // triangle carries a real uv0. Where projective texturing did not win a
+  // camera, uv0 is the (-1,-1) sentinel and the TSDF's per-vertex colour is
+  // used instead -- so these texels are never selected there.
+  static const std::uint8_t kWhite[4] = {255, 255, 255, 255};
+  vg::ImageUploadDesc atlas_desc;
+  atlas_desc.extent = {1, 1};
+  atlas_desc.format = VK_FORMAT_R8G8B8A8_UNORM;
+  atlas_desc.pixels = kWhite;
+  atlas_desc.size = sizeof(kWhite);
+  vg::Result<vg::Texture> atlas_texture = vg::upload_texture(
+      _impl->app.device(), _impl->app.allocator(), atlas_desc);
+  if (!atlas_texture) {
+    set_error(error, atlas_texture.status(), "atlas upload_texture");
+    return nil;
+  }
+  _impl->atlas_texture = std::move(atlas_texture).value();
+
+  vg::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
+  if (!atlas_sampler) {
+    set_error(error, atlas_sampler.status(), "atlas Sampler::create");
+    return nil;
+  }
+  _impl->atlas_sampler.emplace(std::move(atlas_sampler).value());
+
+  const VkDescriptorPoolSize atlas_pool_size{
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+  vg::Result<vg::DescriptorPool> atlas_pool =
+      vg::DescriptorPool::create(device, &atlas_pool_size, 1, 1);
+  if (!atlas_pool) {
+    set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
+    return nil;
+  }
+  _impl->atlas_pool = std::move(atlas_pool).value();
+
+  vg::Result<vg::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
+      _impl->mesh_pipeline->descriptor_set_layout(0));
+  if (!atlas_set) {
+    set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
+    return nil;
+  }
+  _impl->atlas_set = std::move(atlas_set).value();
+  _impl->atlas_set.write_combined_image_sampler(
+      0, _impl->atlas_texture.view(), _impl->atlas_sampler->handle(),
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
   const vr::Status fusion_started = _impl->fusion.start(
       *_impl->recon_device, *_impl->recon_allocator, app::FusionConfig{});
   if (!fusion_started) {
@@ -431,9 +499,11 @@ struct RendererImpl {
     // Either the device pose or the turntable, depending on whether the user
     // has taken the camera over.
     frame_info.view_proj = proj * _impl->camera.view();
+    // Required. Leave it null and submit() records nothing whatsoever.
+    frame_info.atlas = _impl->atlas_set.handle();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
-    (void)_impl->mesh_pipeline->submit(f.cmd, frame_info);
+    _impl->mesh_pipeline->submit(f.cmd, frame_info);
   } else {
     vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       _impl->pipeline.handle());
