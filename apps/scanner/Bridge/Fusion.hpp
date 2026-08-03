@@ -46,21 +46,39 @@ namespace vr = volumetric_kit::recon;
 ///        `VoxelHashMap::resize` beats one sized for a whole room that takes
 ///        minutes to show anything.
 struct FusionConfig {
-  /// Voxel edge in metres. 2 cm is the coarse end of useful for LiDAR depth
-  /// this noisy, and keeps the block budget (and the remesh) affordable.
-  float voxel_size = 0.02f;
-  /// Truncation band; the conventional ~3 voxels.
-  float trunc_dist = 0.06f;
+  /// Voxel edge in metres.
+  ///
+  /// 1 cm is about where `sceneDepth` stops being the coarser term: the LiDAR
+  /// depth map is 256x192, so past this the extra voxels mostly resolve depth
+  /// noise rather than surface. It is not free -- a block is 8 voxels on an
+  /// edge, so halving this halves the block *span* (16 cm -> 8 cm) and the
+  /// blocks needed to shell a given surface goes up ~4x. Memory per bucket is
+  /// unchanged (it is per block), so what shrinks is the scene @ref
+  /// max_buckets can cover, by the same ~4x. See that field.
+  float voxel_size = 0.01f;
+  /// Truncation band; the conventional ~3 voxels, so it tracks @ref voxel_size.
+  ///
+  /// Scaled with the voxel rather than left at 6 cm, which would have made it
+  /// ~6 voxels and smoothed away exactly the detail the finer voxel buys --
+  /// `trunc_dist` is the distance over which a surface writes into the field.
+  /// The block band is unaffected either way: `truncationBlocks` is
+  /// `max(1, ceil(trunc / (8 * voxel)))`, and both 0.06/0.08 and 0.03/0.08
+  /// ceil to 1, so the surface shell stays one block thick and the ~4x above
+  /// is the whole of the cost.
+  float trunc_dist = 0.03f;
   /// Initial hash-table shape. Grows on overflow, up to @ref max_buckets.
   ///
   /// Sized in *memory* rather than in buckets, because that is what this costs:
   /// the grid commits `num_buckets * 8 blocks * 512 voxels * 12 B` of
   /// host-visible, permanently mapped, zero-filled device memory inside
   /// @ref start -- 48 MiB per 1024 buckets -- before the first frame is drawn.
-  /// 1024 covers a tabletop scan outright and reaches room scale in two
-  /// doublings, which is the trade the "fills quickly, then grows" default was
-  /// meant to be. 4096 was 192 MiB resident before first light, which is the
-  /// opposite one.
+  /// 1024 is 48 MiB either way -- the figure is per block, not per metre -- so
+  /// first light stays as quick as it was at 2 cm. What changed with the finer
+  /// voxel is the *area* it covers before the first doubling: roughly a
+  /// quarter of what 2 cm reached, so a tabletop now takes a doubling or two
+  /// rather than fitting outright. That is the "fills quickly, then grows"
+  /// trade still working, just starting smaller. 4096 up front was 192 MiB
+  /// resident before first light, which is the opposite trade.
   std::int32_t num_buckets = 1024;
   /// Ceiling on that growth, in buckets.
   ///
@@ -71,6 +89,15 @@ struct FusionConfig {
   /// surfacing the OutOfMemory that recon is written to report. Refusing to
   /// grow instead leaves a scan that is missing far geometry, still running,
   /// and saying so in @ref FusionStats::last_error.
+  ///
+  /// **At 1 cm this ceiling covers ~4x less scene than it did at 2 cm** -- it
+  /// bounds blocks, and the finer voxel needs ~4x of them for the same
+  /// surface. So this reaches roughly a large tabletop rather than a room. It
+  /// is deliberately *not* raised to compensate: 16384 would be 768 MiB
+  /// resident and ~1.1 GiB at the doubling, and the jetsam argument above is
+  /// the reason the number is what it is. Raise it for a room-scale scan on a
+  /// device with the headroom (an iPad Pro, not a phone) -- and know that the
+  /// failure it prevents is graceful and reported, not a crash.
   std::int32_t max_buckets = 4096;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
