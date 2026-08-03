@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -85,20 +86,19 @@ struct FusionConfig {
   std::uint32_t remesh_every = 1;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
-  /// **Off, and load-bearing that it is off.** `ProjectiveTexturer` does not
-  /// annotate the triangles it wins -- it *overwrites* their vertices' `uv0`
-  /// with a real atlas coordinate, replacing recon's `(-1, -1)` sentinel. gfx's
-  /// hybrid shader reads a non-sentinel `uv0` as "sample the atlas, ignore the
-  /// vertex colour". Nothing carries `frame.color` across this seam yet, so the
-  /// renderer binds a 1x1 white atlas -- which means texturing would render
-  /// every surface the depth camera is *currently* looking at flat white and
-  /// throw away the colour the TSDF fused there, while geometry that had
-  /// fallen out of view kept its colour. The white patch would track the camera
-  /// around the scan.
+  /// **Still off, and still load-bearing that it is.** `ProjectiveTexturer`
+  /// does not annotate the triangles it wins -- it *overwrites* their vertices'
+  /// `uv0`, replacing recon's `(-1, -1)` sentinel, and gfx's hybrid shader
+  /// reads a non-sentinel `uv0` as "sample the atlas, ignore the vertex
+  /// colour". So against the 1x1 white atlas the renderer still binds, this
+  /// would render every surface the depth camera is currently looking at flat
+  /// white and discard the colour the TSDF fused there.
   ///
-  /// Turn this back on in the same change that publishes the keyframe image as
-  /// the atlas the renderer binds -- the two halves are one feature, and either
-  /// alone is worse than neither.
+  /// @ref Fusion::Published now carries the colour frame across the seam beside
+  /// the mesh whose `uv0` indexes it, which is the producing half. The
+  /// consuming half -- a ring of atlas images the renderer streams into and
+  /// binds per slot -- is not built yet, and *this flag is what gates the
+  /// feature on it*. Flip it in the change that lands the ring.
   bool texture = false;
 };
 
@@ -161,8 +161,27 @@ class Fusion {
   /// remesh republishes.
   ///
   /// @return The mesh and its version, or nothing when unchanged or taken.
-  std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> take_mesh(
-      std::uint32_t known_version);
+  /// @brief A remesh's two halves, which are one value.
+  ///
+  /// `uv0` is a normalized coordinate into the image of the camera that
+  /// textured it, and @ref texture rewrites every vertex's `uv0` on every call
+  /// against the *current* frame. So a mesh and the atlas it indexes are only
+  /// meaningful together: draw a mesh against a later frame's image and every
+  /// textured triangle samples the wrong place. They are published, versioned,
+  /// and taken as one.
+  struct Published {
+    vr::mesh::Mesh mesh;
+    std::uint32_t version = 0;
+    /// The colour frame that textured @ref mesh, canonical-encoded and packed
+    /// RGBA8. Empty when the frame carried no colour, or texturing is off.
+    std::vector<std::uint32_t> atlas;
+    std::uint32_t atlas_width = 0;
+    std::uint32_t atlas_height = 0;
+
+    bool has_atlas() const noexcept { return !atlas.empty(); }
+  };
+
+  std::optional<Published> take_mesh(std::uint32_t known_version);
 
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
@@ -187,6 +206,12 @@ class Fusion {
 
   mutable std::mutex mutex_;
   vr::mesh::Mesh mesh_;
+  /// Published beside mesh_ and taken with it -- see Published. Refilled on the
+  /// fuse thread and moved out by the consumer, so neither the copy in nor the
+  /// hand-off costs anything under the lock.
+  std::vector<std::uint32_t> atlas_;
+  std::uint32_t atlas_width_ = 0;
+  std::uint32_t atlas_height_ = 0;
   std::uint32_t mesh_version_ = 0;
   vr::Mat4f last_pose_{1.0f};
   FusionStats stats_{};

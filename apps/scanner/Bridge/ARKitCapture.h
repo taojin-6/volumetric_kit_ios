@@ -47,27 +47,47 @@ typedef struct {
   float position_x, position_y, position_z;
   /// Milliseconds spent converting the last frame (depth + colour).
   float convert_ms;
-  /// Milliseconds of that spent in the YCbCr->RGB conversion alone.
+  /// Milliseconds of that spent in the colour path -- the attachment read, the
+  /// YCbCr->RGB conversion, and any `to_canonical` pass.
   ///
   /// Split out because the combined number cannot answer a question about
   /// either half: comparing @ref convert_ms across two runs to judge a change
   /// to the colour path measured the depth pass and the scene as well, and
   /// reported a 35% win as a small loss.
+  ///
+  /// It covers the *whole* colour path rather than its cheapest step, for the
+  /// same reason it exists at all. Timing the vImage call alone would omit the
+  /// `to_canonical` pass -- by far the most expensive thing this path can do --
+  /// and report a converted frame's cost as though no conversion had run, which
+  /// is the same blind spot one level down.
   float color_convert_ms;
   /// What the last colour buffer declared, read from its CVPixelBuffer
   /// attachments -- the YCbCr matrix used to reconstruct chroma, then the
-  /// transfer and primaries those R'G'B' values carry, then whether that
-  /// combination needed converting to recon's canonical form.
+  /// transfer and primaries those R'G'B' values carry.
   ///
   /// Reported because the whole point of declaring an encoding is that it is
   /// observed rather than assumed, and an assumption that stays off-screen is
-  /// indistinguishable from a correct reading. Static C strings, so Swift can
-  /// hold them without owning them.
+  /// indistinguishable from a correct reading. `"(none)"` when no colour buffer
+  /// was read; a tag this driver cannot represent names itself where it can
+  /// (`"BT.2100 HLG (unsupported)"`) and reads `"unrecognized"` otherwise,
+  /// setting @ref color_declaration_refused either way. Static C strings, so
+  /// Swift can hold them without owning them.
   const char* color_matrix;
   const char* color_transfer;
   const char* color_primaries;
   /// `true` when the frame arrived canonical and needed no conversion pass.
   bool color_was_canonical;
+  /// `true` when the declaration could not be honoured, so the frame's colour
+  /// was dropped rather than published -- a transfer or primaries
+  /// `ColorEncoding` has no enumerator for, a YCbCr matrix vImage ships no
+  /// conversion for, or one `to_canonical` itself refused (PQ).
+  ///
+  /// Distinct from "no colour this frame", and deliberately visible: the three
+  /// strings above still name what was read, so the reason is on screen rather
+  /// than inferred from colour having gone missing. Dropping is the point --
+  /// `ColorEncoding`'s default *is* a declaration, so falling through to it
+  /// would fuse an HDR curve as sRGB with nothing at all to notice.
+  bool color_declaration_refused;
 } VolumetricCaptureStats;
 
 /// @brief Bridges `ARFrame`s into recon's capture contract.

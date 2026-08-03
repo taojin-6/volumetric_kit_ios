@@ -82,10 +82,20 @@ struct FrameBuffers {
   /// What the frame carries once staged: always canonical, because
   /// `convert_color` brings a non-canonical source across before publishing.
   vr::ColorEncoding color_encoding{};
-  /// What the buffer *declared*, kept alongside for the read-out. The two
-  /// differ exactly when a conversion pass ran.
-  vr::ColorEncoding color_declared{};
+  /// What the buffer declared, for the read-out -- kept as the strings rather
+  /// than as a `ColorEncoding`, because a tag this driver cannot represent has
+  /// no enumerator to name it and is exactly the case worth showing. Retained
+  /// when a frame's colour is refused, so the read-out names the culprit
+  /// instead of merely losing colour.
   const char* color_matrix = "(none)";
+  const char* color_transfer = "(none)";
+  const char* color_primaries = "(none)";
+  /// `true` when a `to_canonical` pass ran, i.e. the declaration was not
+  /// already canonical.
+  bool color_converted = false;
+  /// `true` when the declaration could not be honoured and the colour was
+  /// dropped for it.
+  bool color_refused = false;
   float color_convert_ms = 0.0f;
   std::uint64_t timestamp_ns = 0;
   bool has_color = false;

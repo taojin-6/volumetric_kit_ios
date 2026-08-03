@@ -535,7 +535,7 @@ struct RendererImpl {
   // and sandwiching a synchronous queue round trip between target->begin and
   // target->end held a command buffer open across it for no reason. This does
   // not make the upload non-blocking; see the note on -startFusionWithCapture:.
-  if (std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> fresh =
+  if (std::optional<app::Fusion::Published> fresh =
           _impl->fusion.take_mesh(_impl->uploaded_version)) {
     vg::assets::Mesh gfx_mesh;
     // A bulk copy, not a field-by-field rebuild: recon's mesh::Vertex *is*
@@ -560,19 +560,19 @@ struct RendererImpl {
     static_assert(std::is_trivially_copyable<RVertex>::value &&
                       std::is_trivially_copyable<GVertex>::value,
                   "vertex bulk copy requires trivially copyable layouts");
-    gfx_mesh.vertices.resize(fresh->first.vertices.size());
-    std::memcpy(gfx_mesh.vertices.data(), fresh->first.vertices.data(),
-                fresh->first.vertices.size() * sizeof(GVertex));
+    gfx_mesh.vertices.resize(fresh->mesh.vertices.size());
+    std::memcpy(gfx_mesh.vertices.data(), fresh->mesh.vertices.data(),
+                fresh->mesh.vertices.size() * sizeof(GVertex));
     // Moved: the indices are the one half of the mesh that needs no conversion,
     // and at room scale the copy this replaces was ~3 MB per frame.
-    gfx_mesh.indices = std::move(fresh->first.indices);
+    gfx_mesh.indices = std::move(fresh->mesh.indices);
 
     vg::Result<vg::pipelines::GpuMesh> uploaded = vg::pipelines::upload_mesh(
         _impl->app.device(), _impl->app.allocator(), gfx_mesh);
     if (uploaded) {
       _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
       _impl->mesh_slots[_impl->mesh_slot] = std::move(uploaded).value();
-      _impl->uploaded_version = fresh->second;
+      _impl->uploaded_version = fresh->version;
       _impl->have_mesh = true;
       _impl->mesh_upload_error.clear();
     } else {
