@@ -3,6 +3,17 @@
 
 import ARKit
 
+/// What ARKit's tracker is doing, and what gating on it has cost.
+///
+/// A value type so the read-out gets both fields from one lock acquisition,
+/// rather than two that could straddle an update.
+struct TrackingReport {
+  /// Human-readable state for the read-out, e.g. `limited (relocalizing)`.
+  var description = "starting"
+  /// Frames withheld from fusion because ARKit did not trust the pose.
+  var framesWithheld: UInt64 = 0
+}
+
 /// Owns the `ARSession` and feeds its frames to the capture bridge.
 ///
 /// Swift owns the session — configuration, capability checks, lifecycle,
@@ -13,6 +24,24 @@ import ARKit
 final class ARSessionController: NSObject, ARSessionDelegate {
   let capture = VolumetricCapture()
   private let session = ARSession()
+
+  /// Guards @ref trackingReport, which is written on `sessionQueue` (60 Hz) and
+  /// read on the main thread by the read-out.
+  ///
+  /// A lock rather than the `DispatchQueue.main.async` hop the callbacks below
+  /// use: those fire on session *events*, this fires on every frame, and 60
+  /// main-queue dispatches a second to update a status line is the tail wagging
+  /// the dog. Same shape as `VolumetricCapture.stats`, which shares the
+  /// bridge's lock for the same reason.
+  private let trackingLock = NSLock()
+  private var trackingReport = TrackingReport()
+
+  /// The tracker's current state and what gating on it has withheld.
+  var tracking: TrackingReport {
+    trackingLock.lock()
+    defer { trackingLock.unlock() }
+    return trackingReport
+  }
 
   /// The queue ARKit delivers frames on.
   ///
@@ -105,7 +134,54 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     // converted frame under its own lock and the render loop polls it, so
     // nothing here touches UI state — the callbacks below, which do, hop back
     // to main first.
+
+    // Gated on tracking state before anything reaches fusion. ARKit keeps
+    // delivering frames carrying a `camera.transform` it does not itself trust:
+    // `.notAvailable` at session start, before the world origin settles, and
+    // `.limited(.relocalizing)` — which `sessionInterruptionEnded` below
+    // deliberately induces by re-running the session, so it recurs on every
+    // background/foreground cycle.
+    //
+    // Fusing one is not a dropped frame, it is a permanent one. Each is
+    // allocated and integrated at the pose it claims, carving free space along
+    // every ray it believes, and `IntegrationMode::Classic` never clears stale
+    // geometry — so one relocalization burst writes a ghost surface into the
+    // volume that nothing later in the scan removes, however long the user
+    // keeps scanning. Withholding costs a few frames; not withholding costs the
+    // reconstruction.
+    let state = frame.camera.trackingState
+    let usable: Bool
+    if case .normal = state { usable = true } else { usable = false }
+
+    trackingLock.lock()
+    trackingReport.description = ARSessionController.describe(state)
+    if !usable { trackingReport.framesWithheld += 1 }
+    trackingLock.unlock()
+
+    guard usable else { return }
     capture.submitFrame(frame)
+  }
+
+  /// The tracking state as the read-out shows it. Spelled out rather than using
+  /// the enum's synthesized description, because "why is nothing fusing" is the
+  /// question this line exists to answer.
+  private static func describe(_ state: ARCamera.TrackingState) -> String {
+    switch state {
+    case .normal:
+      return "normal"
+    case .notAvailable:
+      return "not available"
+    case .limited(let reason):
+      switch reason {
+      case .initializing: return "limited (initializing)"
+      case .relocalizing: return "limited (relocalizing)"
+      case .excessiveMotion: return "limited (excessive motion)"
+      case .insufficientFeatures: return "limited (insufficient features)"
+      @unknown default: return "limited"
+      }
+    @unknown default:
+      return "unknown"
+    }
   }
 
   func session(_ session: ARSession, didFailWithError error: Error) {

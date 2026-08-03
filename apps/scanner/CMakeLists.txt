@@ -21,18 +21,36 @@ set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
-add_library(scanner_bridge STATIC Bridge/VolumetricRenderer.mm
-                                  Bridge/ARKitCapture.mm Bridge/SharedDevice.mm)
+add_library(
+  scanner_bridge STATIC
+  Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
+  Bridge/Fusion.mm Bridge/OrbitCamera.cpp)
 
+# ARC is an Objective-C feature, so OrbitCamera.cpp is deliberately absent from
+# this list: it is plain C++ with no object pointers to manage, and clang warns
+# on -fobjc-arc for a translation unit that is not Objective-C.
 set_source_files_properties(
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  Bridge/Fusion.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
 # VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella
 # deliberately includes no platform defines -- naming the platform is the
 # consumer's job, which is exactly this target.
 target_compile_definitions(scanner_bridge PRIVATE VK_USE_PLATFORM_METAL_EXT)
+
+# glm targets OpenGL's [-1, 1] clip depth; Vulkan's is [0, 1]. This switches
+# glm::perspective over, and it must be a *target* definition rather than a
+# #define in one file: glm is header-only, so the convention is fixed per
+# translation unit at instantiation, and a TU that missed it would silently
+# build a projection the depth buffer disagrees with.
+#
+# Not inherited from anywhere. gfx sets it PUBLIC on volumetric_kit::gfx_camera,
+# which this target does not link -- gfx_pipelines pulls in gfx_core +
+# gfx_assets, and gfx_app pulls in gfx_core + gfx_windowing. Without it the near
+# plane lands at 2fn/(f+n) instead of n: ~10 cm rather than the 5 cm kNearClip
+# promises, and the turntable's closest zoom sits inside the clip volume.
+target_compile_definitions(scanner_bridge PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
 # The triangle's SPIR-V is embedded as a constexpr byte array, matching how the
 # library tiers ship their kernels: no runtime file, nothing to resolve in the
@@ -50,15 +68,19 @@ target_include_directories(scanner_bridge
 # recon_sensor carries the capture contract and the camera-convention
 # conversions. Since the camera parameter blocks moved into core it links
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
-# to implement ICameraCapture -- fusion arrives with the next slice.
+# to implement ICameraCapture; recon_tsdf and recon_texture below are what the
+# fusion spine consumes, and recon_mesh/recon_volume arrive transitively.
 target_link_libraries(
-  scanner_bridge PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
-                        volumetric_kit::recon_sensor)
+  scanner_bridge
+  PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
+         volumetric_kit::recon_sensor volumetric_kit::recon_texture
+         volumetric_kit::recon_tsdf volumetric_kit::gfx_pipelines)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
   ${VI_APP_NAME} MACOSX_BUNDLE
-  Swift/AppDelegate.swift Swift/ARSessionController.swift Swift/MetalView.swift
+  Swift/AppDelegate.swift Swift/ARSessionController.swift
+  Swift/CameraGestureController.swift Swift/MetalView.swift
   Swift/ScannerViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)

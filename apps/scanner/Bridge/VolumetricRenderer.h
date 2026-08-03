@@ -17,6 +17,8 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#import "ARKitCapture.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// The `NSError` domain every failure below is reported in.
@@ -47,6 +49,30 @@ typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
 /// @ref VolumetricRendererErrorVulkan.
 FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 
+/// @brief How far the viewport is turned from the camera's own basis.
+///
+/// ARKit fixes `ARCamera.transform` to the **sensor**, not to the interface:
+/// its x-axis "always points along the long axis of the device, from the
+/// front-facing camera toward the Home button", y along the short axis, z out
+/// of the screen. Rotating the phone does not move that basis, so rendering it
+/// straight into a portrait drawable puts the scan on its side — which reads as
+/// a broken reconstruction rather than a misaligned render camera.
+///
+/// The values are **quarter turns**: the renderer rotates the device pose about
+/// the camera's own +Z by `90° × rawValue`. Landscape-left is the sensor's own
+/// basis (`UIDeviceOrientationLandscapeRight`, where ARKit documents +x as
+/// pointing viewport-right), so it is the zero.
+///
+/// Fusion is unaffected — the pose and the intrinsics are mutually consistent
+/// in the sensor frame either way — so this is a render-camera concern only.
+typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
+  /// The sensor's own basis; no correction.
+  VolumetricViewOrientationLandscapeLeft = 0,
+  VolumetricViewOrientationPortrait = 1,
+  VolumetricViewOrientationLandscapeRight = 2,
+  VolumetricViewOrientationPortraitUpsideDown = 3,
+};
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -66,6 +92,112 @@ NS_SWIFT_NAME(VolumetricRenderer)
     NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
+
+/// @brief Begin fusing from @p capture on a background thread.
+///
+/// Fusion runs off the render thread so a slow remesh does not stall
+/// presentation. They still *serialize on the GPU* — iOS gives one queue, so
+/// both libraries submit through one mutex — but the CPU halves overlap.
+///
+/// The **handoff** never blocks: the render loop takes the newest published
+/// mesh or draws the previous one, and never waits for a remesh in flight. The
+/// **upload** that follows it does — `gfx::pipelines::upload_mesh` is a
+/// synchronous submit-and-wait, so a fresh mesh still costs the render thread a
+/// queue round trip on the frame it arrives. Making that asynchronous needs a
+/// transfer path gfx does not expose yet; until then `remesh_every` is the knob
+/// that bounds how often it is paid.
+///
+/// @p capture is **retained** for as long as fusion runs — the fuse thread
+/// dereferences the `ICameraCapture` it owns, and a bare "must outlive the
+/// renderer" is not something the caller can honour when the two are siblings
+/// with no specified destruction order.
+///
+/// Call @ref stopFusion before tearing the renderer down, or on leaving the
+/// screen; a second call while fusion is already running does nothing.
+- (void)startFusionWithCapture:(VolumetricCapture*)capture;
+
+/// @brief Stop the fuse thread, join it, and release the capture.
+///
+/// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
+/// so a dropped renderer cannot leave the thread running — but call it
+/// explicitly when leaving the screen, because until it returns the thread is
+/// still submitting recon work on the shared queue.
+- (void)stopFusion;
+
+/// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
+/// stays reachable because when the mesh first renders wrong, being able to A/B
+/// against a known-good draw is worth more than the code it costs.
+@property(nonatomic) BOOL drawMesh;
+
+#pragma mark - Camera
+
+/// @name Camera control
+///
+/// The camera has two modes. It starts **following the device**: the view sits
+/// at the fused pose, which is what shows whether a scan in progress is
+/// covering what it is being pointed at. Any of the three gestures below takes
+/// it over into a turntable the user drives, seeded from wherever the follow
+/// camera was; @ref followDevice hands it back.
+///
+/// Deltas arrive as **fractions of the viewport height** rather than points or
+/// pixels. The view's size and scale factor are Swift's to know; what a drag
+/// *means* belongs to the camera. Normalizing here is what keeps a given finger
+/// travel producing the same rotation across devices, and keeps UIKit units out
+/// of the C++.
+///
+/// Vertical deltas are positive **downward**, as UIKit reports them.
+///
+/// @warning Main thread only, alongside `renderFrameWithDrawableSize:error:` —
+///          neither locks against the other.
+/// @{
+
+/// The Swift spellings are pinned with `NS_SWIFT_NAME` rather than left to the
+/// importer. `orbitByFractionX:y:` contains a preposition, so the
+/// omit-needless-words rules would relocate everything from `By` onward into
+/// the first argument label and import it as `orbit(byFractionX:y:)` — a name
+/// that reads worse and, more to the point, would change silently if the
+/// selector were ever reworded.
+
+/// @brief Swing the camera around its pivot. Dragging carries the scene with
+///        the finger, so the camera travels the opposite way.
+- (void)orbitByFractionX:(float)dx y:(float)dy NS_SWIFT_NAME(orbit(dx:dy:));
+
+/// @brief Slide the pivot across the view plane, scaled so the scene keeps pace
+///        with the finger at any zoom.
+- (void)panByFractionX:(float)dx y:(float)dy NS_SWIFT_NAME(pan(dx:dy:));
+
+/// @brief Pull the camera toward or away from the pivot.
+/// @param scale  Relative pinch scale; greater than 1 for fingers spreading,
+///               which moves the camera closer.
+- (void)zoomByScale:(float)scale NS_SWIFT_NAME(zoom(scale:));
+
+/// @brief Return the camera to the device pose.
+- (void)followDevice;
+
+/// Whether the camera is still tracking the device rather than the user.
+///
+/// Left without a `getter=isFollowingDevice`: Swift imports a boolean property
+/// under its *getter's* name, so the custom getter would rename this on the far
+/// side of the seam for no gain.
+@property(nonatomic, readonly) BOOL followingDevice;
+
+/// Distance from the turntable's pivot in metres. Only meaningful while
+/// @ref followingDevice is `NO`; reported so the read-out can show it.
+@property(nonatomic, readonly) float cameraDistance;
+
+/// How far the viewport is turned from the sensor basis ARKit poses are in.
+///
+/// Swift owns this: `UIInterfaceOrientation` is a UIKit value that only the
+/// view controller can read, and only on the main thread. Set it at bring-up
+/// and again on every rotation; leaving it stale rotates the scan rather than
+/// the camera. Affects @ref followingDevice mode, where the view *is* the
+/// device pose — the turntable derives its own basis and is already upright.
+@property(nonatomic) VolumetricViewOrientation viewOrientation;
+
+/// @}
+
+/// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
+@property(nonatomic, readonly, copy) NSString* fusionSummary;
 
 /// @brief Draw and present one frame at @p size.
 ///
