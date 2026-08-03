@@ -3,7 +3,9 @@
 
 #import "Fusion.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <string>
 
 namespace volumetric_kit::ios_app {
 namespace {
@@ -13,6 +15,14 @@ using Clock = std::chrono::steady_clock;
 float ms_since(Clock::time_point t0) {
   return std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
 }
+
+/// How many times one frame may grow the map and retry its allocation.
+///
+/// One doubling is not enough when the user pans onto a whole new room section,
+/// and recon's reference loops retry up to five times before treating overflow
+/// as fatal. Bounded rather than unbounded so a frame cannot spend the whole
+/// budget resizing.
+constexpr int kMaxGrowAttempts = 5;
 
 }  // namespace
 
@@ -78,6 +88,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     return;
   }
 
+  // Anything this frame got wrong, carried to the single publish below rather
+  // than written straight into stats_. The success path used to clear
+  // last_error unconditionally, which meant a frame fused with missing blocks
+  // left no trace anywhere -- the read-out showed a rising vertex count and an
+  // empty error line while a whole region of the scan quietly never filled.
+  std::string frame_error;
+
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
   vr::Result<std::uint32_t> overflow =
@@ -87,19 +104,50 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.last_error = "allocate: " + overflow.status().message();
     return;
   }
-  if (overflow.value() > 0) {
-    // The table filled. Grow and retry once: resize preserves block indices, so
-    // everything already fused keeps its tsdf/weight/color at the same offset.
-    const vr::Status grown = grid_->resize(config_.num_buckets * 2);
-    if (grown) {
-      config_.num_buckets *= 2;
-      (void)grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
-    } else {
+  // The table filled. Grow and retry *while* it keeps filling: resize preserves
+  // block indices, so everything already fused keeps its tsdf/weight/color at
+  // the same offset, and another doubling is cheap next to the frame it would
+  // otherwise fuse with holes.
+  int grow_attempts = 0;
+  while (overflow.value() > 0 && grow_attempts < kMaxGrowAttempts) {
+    if (config_.num_buckets >= config_.max_buckets) {
+      frame_error = "allocate: map at its " +
+                    std::to_string(config_.max_buckets) + "-bucket ceiling, " +
+                    std::to_string(overflow.value()) +
+                    " blocks dropped; far geometry will be missing";
+      break;
+    }
+    const std::int32_t grown_to =
+        std::min(config_.num_buckets * 2, config_.max_buckets);
+    const vr::Status grown = grid_->resize(grown_to);
+    if (!grown) {
       std::lock_guard<std::mutex> lock(mutex_);
       stats_.last_error = "resize: " + grown.message();
       return;
     }
+    config_.num_buckets = grown_to;
+    ++grow_attempts;
+    // Checked, not discarded. This is the same call as above and its return is
+    // the only thing that says whether the grown map actually absorbed the
+    // frame; dropping it fuses against a grid still missing those blocks and
+    // reports success.
+    overflow =
+        grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
+    if (!overflow) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stats_.last_error =
+          "allocate (after resize): " + overflow.status().message();
+      return;
+    }
   }
+  if (overflow.value() > 0 && frame_error.empty()) {
+    frame_error = "allocate: " + std::to_string(overflow.value()) +
+                  " blocks dropped after " + std::to_string(grow_attempts) +
+                  " grow(s); some geometry will be missing";
+  }
+  // Integrated anyway when blocks were dropped: what *did* allocate still
+  // fuses, and a partial frame beats none. The error above is what keeps it
+  // from reading as a clean one.
   const float allocate_ms = ms_since(t_alloc);
 
   // --- Fuse depth, and colour when the frame carries it --------------------
@@ -123,7 +171,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     last_pose_ = frame.depth_camera.cam_to_world;
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
-    stats_.last_error.clear();
+    // Assigned, not cleared: a frame that fused with dropped blocks says so.
+    stats_.last_error = frame_error;
   }
 
   if (stats_.frames_fused % config_.remesh_every == 0) {
@@ -143,9 +192,13 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   const float extract_ms = ms_since(t_extract);
 
   // Texture in place, on the device buffers marching cubes just wrote -- no
-  // host round trip between the two GPU tiers. The current frame *is* the
-  // atlas, so this is the live single-camera path (recon's 2026-07-07
-  // decision), and the renderer binds that same image.
+  // host round trip between the two GPU tiers. The current frame would be the
+  // atlas, i.e. the live single-camera path (recon's 2026-07-07 decision).
+  //
+  // Off by default, and the reason is in FusionConfig::texture: nothing carries
+  // frame.color across this seam yet, so the renderer binds a 1x1 white atlas
+  // and every uv0 this pass writes selects white. Kept wired up rather than
+  // deleted because the missing half is the atlas upload, not this call.
   float texture_ms = 0.0f;
   if (config_.texture) {
     const auto t_texture = Clock::now();
@@ -182,12 +235,23 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
 std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> Fusion::take_mesh(
     std::uint32_t known_version) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // The emptiness check does double duty: nothing has been meshed yet, or this
+  // version has already been taken and moved out below.
   if (mesh_version_ == known_version || mesh_.vertices.empty()) {
     return std::nullopt;
   }
-  // Copied, not moved: the fuse thread keeps publishing into mesh_, and the
-  // render thread may take several frames to finish with what it got.
-  return std::make_pair(mesh_, mesh_version_);
+  // Moved, not copied. At room scale mesh_ is ~53 MB and this runs under the
+  // very mutex the fuse thread publishes through, so copying stalled every
+  // remesh for the length of a 53 MB memcpy. The consumer is the render thread,
+  // which uploads what it takes before returning and never comes back for it --
+  // and a repeat call is refused by the version check above, not by mesh_ still
+  // holding the bytes.
+  return std::make_pair(std::move(mesh_), mesh_version_);
+}
+
+void Fusion::note_error(const std::string& message) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  stats_.last_error = message;
 }
 
 vr::Mat4f Fusion::last_pose() const {

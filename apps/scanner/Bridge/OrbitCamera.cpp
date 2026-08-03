@@ -82,6 +82,9 @@ void OrbitCamera::take_over() {
   // takeover. That is the constraint doing its job — an inspection camera that
   // inherited a 20° tilt would have no gesture to undo it — but it is a visible
   // snap, not a seamless handover.
+  //
+  // Heading carries over too, but only because of the fallback below; the
+  // obvious spelling of it does not. See there.
   const glm::vec3 dir = -forward;
   // Clamped like every other write to pitch_, so no path can leave the class
   // holding a pitch the rest of it assumes is impossible. A phone aimed
@@ -98,7 +101,35 @@ void OrbitCamera::take_over() {
   // it saves.
   pitch_ = std::clamp(std::asin(std::clamp(dir.y, -1.0f, 1.0f)), -kMaxPitch,
                       kMaxPitch);
-  yaw_ = std::atan2(dir.x, dir.z);
+
+  // Heading is the same pole problem, and it does *not* resolve the same way.
+  // `atan2(dir.x, dir.z)` reads the horizontal part of the view direction,
+  // whose length is cos(pitch) -- so in the posture named above, a phone aimed
+  // straight down at a tabletop, it is reading two numbers that are both ~0.
+  // The result is whatever a hand tremor dictates, or exactly 0 at
+  // `atan2(0, 0)`: a heading unrelated to where the phone was pointed. The
+  // first drag would not nudge the view, it would snap the whole scene to a new
+  // heading under the finger, differently each time from the same phone pose.
+  //
+  // The camera's own up vector is the complement: its horizontal length is
+  // sin(pitch), so it is longest exactly where the view direction's is
+  // shortest, and at the pole it is fully horizontal and still says where the
+  // phone was aimed. The two agree wherever both are defined -- for a turntable
+  // eye at (yaw, pitch), lookAt's up vector comes out with horizontal part
+  // -sin(pitch) * (sin yaw, cos yaw), so negating it recovers the same yaw --
+  // which is what makes picking the longer of the two continuous rather than a
+  // seam.
+  const glm::vec3 cam_up(device_pose_[1]);
+  glm::vec2 heading(dir.x, dir.z);
+  const glm::vec2 from_up(-cam_up.x, -cam_up.z);
+  if (glm::dot(from_up, from_up) > glm::dot(heading, heading)) {
+    heading = from_up;
+  }
+  // The two lengths are cos(pitch) and sin(pitch), so one of them is always at
+  // least 1/sqrt(2) and this guard is unreachable for any orthonormal pose. It
+  // is here because `device_pose_` arrives from outside the class.
+  yaw_ = glm::dot(heading, heading) > 0.0f ? std::atan2(heading.x, heading.y)
+                                           : 0.0f;
 }
 
 void OrbitCamera::orbit(float dx, float dy) {

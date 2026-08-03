@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -48,8 +50,27 @@ struct FusionConfig {
   float voxel_size = 0.02f;
   /// Truncation band; the conventional ~3 voxels.
   float trunc_dist = 0.06f;
-  /// Initial hash-table shape. Grows on overflow.
-  std::int32_t num_buckets = 4096;
+  /// Initial hash-table shape. Grows on overflow, up to @ref max_buckets.
+  ///
+  /// Sized in *memory* rather than in buckets, because that is what this costs:
+  /// the grid commits `num_buckets * 8 blocks * 512 voxels * 12 B` of
+  /// host-visible, permanently mapped, zero-filled device memory inside
+  /// @ref start -- 48 MiB per 1024 buckets -- before the first frame is drawn.
+  /// 1024 covers a tabletop scan outright and reaches room scale in two
+  /// doublings, which is the trade the "fills quickly, then grows" default was
+  /// meant to be. 4096 was 192 MiB resident before first light, which is the
+  /// opposite one.
+  std::int32_t num_buckets = 1024;
+  /// Ceiling on that growth, in buckets.
+  ///
+  /// 4096 is 192 MiB resident, and ~288 MiB transiently at the doubling that
+  /// reaches it: `VoxelBlockGrid::resize` builds the grown buffers alongside
+  /// the old ones and commits only once the map resize succeeds. Past that a
+  /// phone is into jetsam range, where the app *disappears* rather than
+  /// surfacing the OutOfMemory that recon is written to report. Refusing to
+  /// grow instead leaves a scan that is missing far geometry, still running,
+  /// and saying so in @ref FusionStats::last_error.
+  std::int32_t max_buckets = 4096;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
   /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
@@ -63,7 +84,22 @@ struct FusionConfig {
   /// at 1, because a reconstruction that updates every frame is the point.
   std::uint32_t remesh_every = 1;
   /// Project the current keyframe onto the mesh after each remesh.
-  bool texture = true;
+  ///
+  /// **Off, and load-bearing that it is off.** `ProjectiveTexturer` does not
+  /// annotate the triangles it wins -- it *overwrites* their vertices' `uv0`
+  /// with a real atlas coordinate, replacing recon's `(-1, -1)` sentinel. gfx's
+  /// hybrid shader reads a non-sentinel `uv0` as "sample the atlas, ignore the
+  /// vertex colour". Nothing carries `frame.color` across this seam yet, so the
+  /// renderer binds a 1x1 white atlas -- which means texturing would render
+  /// every surface the depth camera is *currently* looking at flat white and
+  /// throw away the colour the TSDF fused there, while geometry that had
+  /// fallen out of view kept its colour. The white patch would track the camera
+  /// around the scan.
+  ///
+  /// Turn this back on in the same change that publishes the keyframe image as
+  /// the atlas the renderer binds -- the two halves are one feature, and either
+  /// alone is worse than neither.
+  bool texture = false;
 };
 
 /// @brief What the last fuse/remesh cost and produced, for the read-out.
@@ -118,9 +154,19 @@ class Fusion {
   vr::Mat4f last_pose() const;
 
   /// @brief Take the mesh if it is newer than @p known_version.
-  /// @return The mesh and its version, or nothing when unchanged.
+  ///
+  /// The mesh is **moved** out, so a second call for the same version returns
+  /// nothing even though the version has not advanced. That is the intended
+  /// contract: the caller uploads what it takes before returning, and the next
+  /// remesh republishes.
+  ///
+  /// @return The mesh and its version, or nothing when unchanged or taken.
   std::optional<std::pair<vr::mesh::Mesh, std::uint32_t>> take_mesh(
       std::uint32_t known_version);
+
+  /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
+  ///        exception guard -- so it reaches the read-out like any other.
+  void note_error(const std::string& message);
 
   FusionStats stats() const;
 

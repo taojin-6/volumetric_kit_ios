@@ -66,6 +66,10 @@ final class ScannerViewController: UIViewController {
     // Bring up on first appearance, not in viewDidLoad: the layer has no valid
     // drawableSize until the view has been laid out in a window.
     startRendererIfNeeded()
+    // Before the first frame: ARKit poses are in the sensor's frame, which does
+    // not turn with the interface, so the renderer has to be told which way the
+    // viewport is facing or the scan renders on its side.
+    renderer?.viewOrientation = currentViewOrientation()
     arSession.start()
     // Fusion pulls from the capture bridge on its own thread; the render loop
     // only ever picks up whatever mesh it has published.
@@ -76,10 +80,44 @@ final class ScannerViewController: UIViewController {
   override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
     stopDisplayLink()
+    // Fusion first, and explicitly. It submits recon work on the same queue the
+    // drain below empties, so a fuse thread still running would enqueue behind
+    // the teardown -- and waitIdle does not stop it: it waits on the queues and
+    // never touches the thread. Until stopFusion returns, the thread is also
+    // still dereferencing the capture handle.
+    renderer?.stopFusion()
     arSession.pause()
-    // waitIdle stops fusion first -- it submits on the same queue, so joining
-    // after the drain would let it enqueue work behind the teardown.
     renderer?.waitIdle()
+  }
+
+  override func viewWillTransition(
+    to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator
+  ) {
+    super.viewWillTransition(to: size, with: coordinator)
+    // In the completion, not alongside it: `interfaceOrientation` still reports
+    // the old value until the transition finishes, so reading it early would
+    // pin the camera one quarter turn behind the screen.
+    coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+      guard let self else { return }
+      self.renderer?.viewOrientation = self.currentViewOrientation()
+    }
+  }
+
+  /// The viewport's turn relative to ARKit's sensor-fixed camera basis.
+  ///
+  /// From the window scene rather than `UIDevice.orientation`: the device can
+  /// be face-up or face-down, and what the render camera needs is where the
+  /// *interface* ended up, which is what the app's supported orientations
+  /// actually constrain.
+  private func currentViewOrientation() -> VolumetricViewOrientation {
+    switch view.window?.windowScene?.interfaceOrientation {
+    case .portrait: return .portrait
+    case .portraitUpsideDown: return .portraitUpsideDown
+    case .landscapeLeft: return .landscapeLeft
+    case .landscapeRight: return .landscapeRight
+    // No window yet, or `.unknown`. Portrait is how the app launches.
+    default: return .portrait
+    }
   }
 
   private func startRendererIfNeeded() {
@@ -130,10 +168,11 @@ final class ScannerViewController: UIViewController {
       stopDisplayLink()
       return
     }
-    // Poll once per rendered frame -- the same cadence the fuse loop will use,
-    // so the capture path is exercised exactly as it will be consumed. The
-    // returned frame is not used yet; fusion is the next slice.
-    _ = arSession.capture.pollLatest()
+    // No poll here. `ICameraCapture` is single-consumer ("Poll from one
+    // thread"), and its CapturedFrame is a non-owning view valid only until the
+    // next poll -- so the bring-up placeholder that polled once per rendered
+    // frame is now a second consumer racing the fuse thread for the same
+    // buffers, and every frame it won was a frame fusion never saw.
     updateStatus(renderer)
   }
 
@@ -175,6 +214,14 @@ final class ScannerViewController: UIViewController {
         // interruption hid capture for the rest of the run.
         text += "ARKit session failed: \(failure)\n\n"
       }
+      // Ahead of the counters, because it is the answer to "why is the frame
+      // count rising and nothing appearing": frames arriving while ARKit does
+      // not trust its own pose are withheld from fusion on purpose.
+      let t = arSession.tracking
+      let withheld =
+        t.framesWithheld > 0 ? "  (\(t.framesWithheld) withheld)" : ""
+      text += "tracking  \(t.description)\(withheld)\n\n"
+
       let s = arSession.capture.stats
       // Formatted up front rather than inside the literal: a `\`-continuation
       // inside a \(...) interpolation is not something the Swift parser accepts.

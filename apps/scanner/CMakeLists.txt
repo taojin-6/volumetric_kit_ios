@@ -39,6 +39,19 @@ set_source_files_properties(
 # consumer's job, which is exactly this target.
 target_compile_definitions(scanner_bridge PRIVATE VK_USE_PLATFORM_METAL_EXT)
 
+# glm targets OpenGL's [-1, 1] clip depth; Vulkan's is [0, 1]. This switches
+# glm::perspective over, and it must be a *target* definition rather than a
+# #define in one file: glm is header-only, so the convention is fixed per
+# translation unit at instantiation, and a TU that missed it would silently
+# build a projection the depth buffer disagrees with.
+#
+# Not inherited from anywhere. gfx sets it PUBLIC on volumetric_kit::gfx_camera,
+# which this target does not link -- gfx_pipelines pulls in gfx_core +
+# gfx_assets, and gfx_app pulls in gfx_core + gfx_windowing. Without it the near
+# plane lands at 2fn/(f+n) instead of n: ~10 cm rather than the 5 cm kNearClip
+# promises, and the turntable's closest zoom sits inside the clip volume.
+target_compile_definitions(scanner_bridge PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
+
 # The triangle's SPIR-V is embedded as a constexpr byte array, matching how the
 # library tiers ship their kernels: no runtime file, nothing to resolve in the
 # bundle. Reuses recon's embed module (gfx has an identical vg_embed_shaders).
@@ -55,7 +68,8 @@ target_include_directories(scanner_bridge
 # recon_sensor carries the capture contract and the camera-convention
 # conversions. Since the camera parameter blocks moved into core it links
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
-# to implement ICameraCapture -- fusion arrives with the next slice.
+# to implement ICameraCapture; recon_tsdf and recon_texture below are what the
+# fusion spine consumes, and recon_mesh/recon_volume arrive transitively.
 target_link_libraries(
   scanner_bridge
   PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core

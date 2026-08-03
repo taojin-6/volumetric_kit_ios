@@ -49,6 +49,30 @@ typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
 /// @ref VolumetricRendererErrorVulkan.
 FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 
+/// @brief How far the viewport is turned from the camera's own basis.
+///
+/// ARKit fixes `ARCamera.transform` to the **sensor**, not to the interface:
+/// its x-axis "always points along the long axis of the device, from the
+/// front-facing camera toward the Home button", y along the short axis, z out
+/// of the screen. Rotating the phone does not move that basis, so rendering it
+/// straight into a portrait drawable puts the scan on its side — which reads as
+/// a broken reconstruction rather than a misaligned render camera.
+///
+/// The values are **quarter turns**: the renderer rotates the device pose about
+/// the camera's own +Z by `90° × rawValue`. Landscape-left is the sensor's own
+/// basis (`UIDeviceOrientationLandscapeRight`, where ARKit documents +x as
+/// pointing viewport-right), so it is the zero.
+///
+/// Fusion is unaffected — the pose and the intrinsics are mutually consistent
+/// in the sensor frame either way — so this is a render-camera concern only.
+typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
+  /// The sensor's own basis; no correction.
+  VolumetricViewOrientationLandscapeLeft = 0,
+  VolumetricViewOrientationPortrait = 1,
+  VolumetricViewOrientationLandscapeRight = 2,
+  VolumetricViewOrientationPortraitUpsideDown = 3,
+};
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -73,14 +97,31 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///
 /// Fusion runs off the render thread so a slow remesh does not stall
 /// presentation. They still *serialize on the GPU* — iOS gives one queue, so
-/// both libraries submit through one mutex — but the CPU halves overlap, and
-/// the render loop never blocks waiting for a mesh: it draws the newest one
-/// published, or the previous one when nothing is newer.
+/// both libraries submit through one mutex — but the CPU halves overlap.
 ///
-/// @param capture  The ARKit source to poll. Must outlive the renderer.
+/// The **handoff** never blocks: the render loop takes the newest published
+/// mesh or draws the previous one, and never waits for a remesh in flight. The
+/// **upload** that follows it does — `gfx::pipelines::upload_mesh` is a
+/// synchronous submit-and-wait, so a fresh mesh still costs the render thread a
+/// queue round trip on the frame it arrives. Making that asynchronous needs a
+/// transfer path gfx does not expose yet; until then `remesh_every` is the knob
+/// that bounds how often it is paid.
+///
+/// @p capture is **retained** for as long as fusion runs — the fuse thread
+/// dereferences the `ICameraCapture` it owns, and a bare "must outlive the
+/// renderer" is not something the caller can honour when the two are siblings
+/// with no specified destruction order.
+///
+/// Call @ref stopFusion before tearing the renderer down, or on leaving the
+/// screen; a second call while fusion is already running does nothing.
 - (void)startFusionWithCapture:(VolumetricCapture*)capture;
 
-/// @brief Stop the fuse thread and join it.
+/// @brief Stop the fuse thread, join it, and release the capture.
+///
+/// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
+/// so a dropped renderer cannot leave the thread running — but call it
+/// explicitly when leaving the screen, because until it returns the thread is
+/// still submitting recon work on the shared queue.
 - (void)stopFusion;
 
 /// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
@@ -143,6 +184,15 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Distance from the turntable's pivot in metres. Only meaningful while
 /// @ref followingDevice is `NO`; reported so the read-out can show it.
 @property(nonatomic, readonly) float cameraDistance;
+
+/// How far the viewport is turned from the sensor basis ARKit poses are in.
+///
+/// Swift owns this: `UIInterfaceOrientation` is a UIKit value that only the
+/// view controller can read, and only on the main thread. Set it at bring-up
+/// and again on every rotation; leaving it stale rotates the scan rather than
+/// the camera. Affects @ref followingDevice mode, where the view *is* the
+/// device pose — the turntable derives its own basis and is already upright.
+@property(nonatomic) VolumetricViewOrientation viewOrientation;
 
 /// @}
 
