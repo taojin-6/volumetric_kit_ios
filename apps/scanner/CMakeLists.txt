@@ -21,12 +21,13 @@ set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
-add_library(scanner_bridge STATIC Bridge/VolumetricRenderer.mm
-                                  Bridge/ARKitCapture.mm Bridge/SharedDevice.mm)
+add_library(
+  scanner_bridge STATIC Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm
+                        Bridge/SharedDevice.mm Bridge/Fusion.mm)
 
 set_source_files_properties(
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  Bridge/Fusion.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
 # VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella
@@ -52,8 +53,10 @@ target_include_directories(scanner_bridge
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
 # to implement ICameraCapture -- fusion arrives with the next slice.
 target_link_libraries(
-  scanner_bridge PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
-                        volumetric_kit::recon_sensor)
+  scanner_bridge
+  PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
+         volumetric_kit::recon_sensor volumetric_kit::recon_texture
+         volumetric_kit::recon_tsdf volumetric_kit::gfx_pipelines)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
