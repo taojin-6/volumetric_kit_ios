@@ -17,9 +17,11 @@
 #include <vector>
 
 #include "volumetric_kit/recon/core/camera_params.hpp"
+#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
+#include "volumetric_kit/recon/sensor/color_conventions.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace sensor = volumetric_kit::recon::sensor;
@@ -77,6 +79,13 @@ struct FrameBuffers {
   std::vector<std::uint32_t> color;
   vr::DepthCameraParams depth_camera{};
   vr::ColorCameraParams color_camera{};
+  /// What the frame carries once staged: always canonical, because
+  /// `convert_color` brings a non-canonical source across before publishing.
+  vr::ColorEncoding color_encoding{};
+  /// What the buffer *declared*, kept alongside for the read-out. The two
+  /// differ exactly when a conversion pass ran.
+  vr::ColorEncoding color_declared{};
+  const char* color_matrix = "(none)";
   std::uint64_t timestamp_ns = 0;
   bool has_color = false;
   float confidence_kept = 0.0f;
@@ -161,8 +170,148 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
   return static_cast<float>(kept) / static_cast<float>(width * height);
 }
 
+/// What a CVPixelBuffer says about its own colour: the matrix needed to get
+/// R'G'B' out of its YCbCr planes, and what those R'G'B' values then *are*.
+///
+/// The two are independent, and conflating them is a silent error in its own
+/// right -- the matrix reconstructs chroma, the transfer and primaries describe
+/// the result. A frame can carry a BT.601 matrix and BT.709 primaries at once,
+/// and iOS ones routinely do.
+struct SourceColor {
+  const vImage_YpCbCrToARGBMatrix* matrix;
+  const char* matrix_name;
+  vr::ColorEncoding encoding;
+};
+
+const char* name(vr::ColorEncoding::Transfer t) {
+  switch (t) {
+    case vr::ColorEncoding::Transfer::Srgb:
+      return "sRGB";
+    case vr::ColorEncoding::Transfer::Bt709:
+      return "BT.709";
+    case vr::ColorEncoding::Transfer::Linear:
+      return "linear";
+    case vr::ColorEncoding::Transfer::Bt2020Pq:
+      return "BT.2020 PQ";
+  }
+  return "?";
+}
+
+const char* name(vr::ColorEncoding::Primaries p) {
+  switch (p) {
+    case vr::ColorEncoding::Primaries::Bt709:
+      return "BT.709";
+    case vr::ColorEncoding::Primaries::DisplayP3:
+      return "Display P3";
+    case vr::ColorEncoding::Primaries::Bt2020:
+      return "BT.2020";
+  }
+  return "?";
+}
+
+/// Read @p image's colour attachments rather than assuming them.
+///
+/// Assuming is what this replaces: the matrix was pinned to BT.601 and the
+/// encoding was never stated at all, so a device tagging its capture BT.709 had
+/// its chroma reconstructed through the wrong matrix, and a wide-gamut one had
+/// Display P3 values fused as though they were BT.709 -- an oversaturation with
+/// no error attached to it.
+///
+/// Falls back to the canonical declaration when an attachment is missing, which
+/// is what an untagged buffer most likely is, and what the previous code
+/// assumed unconditionally.
+SourceColor source_color(CVPixelBufferRef image) {
+  // The fallback is BT.709 where the old code assumed BT.601 unconditionally,
+  // which is a real change on this path -- so it is named "assumed" and shows
+  // up that way on screen. An ARKit buffer is tagged in practice, making this
+  // nearly dead code; a silently different guess in nearly dead code is exactly
+  // the kind of thing that surfaces once, years later, on one device.
+  SourceColor out{kvImage_YpCbCrToARGBMatrix_ITU_R_709_2, "BT.709 (assumed)",
+                  vr::ColorEncoding{}};
+
+  const auto matches = [](CFTypeRef value, CFStringRef expected) {
+    return value != nullptr && CFGetTypeID(value) == CFStringGetTypeID() &&
+           CFStringCompare(static_cast<CFStringRef>(value), expected, 0) ==
+               kCFCompareEqualTo;
+  };
+  // CFTypeRef, released on scope exit: CVBufferCopyAttachment returns +1.
+  const auto attachment = [image](CFStringRef key) {
+    return CVBufferCopyAttachment(image, key, nullptr);
+  };
+
+  if (CFTypeRef matrix = attachment(kCVImageBufferYCbCrMatrixKey)) {
+    if (matches(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
+      out.matrix = kvImage_YpCbCrToARGBMatrix_ITU_R_601_4;
+      out.matrix_name = "BT.601";
+    } else {
+      out.matrix_name = "BT.709";
+    }
+    CFRelease(matrix);
+  }
+
+  if (CFTypeRef primaries = attachment(kCVImageBufferColorPrimariesKey)) {
+    if (matches(primaries, kCVImageBufferColorPrimaries_P3_D65)) {
+      out.encoding.primaries = vr::ColorEncoding::Primaries::DisplayP3;
+    } else if (matches(primaries, kCVImageBufferColorPrimaries_ITU_R_2020)) {
+      out.encoding.primaries = vr::ColorEncoding::Primaries::Bt2020;
+    }
+    CFRelease(primaries);
+  }
+
+  if (CFTypeRef transfer = attachment(kCVImageBufferTransferFunctionKey)) {
+    // BT.709 and sRGB are both canonical, and recon accepts them as one: they
+    // differ by a couple of codes in the toe, a bounded and stated error.
+    // Only PQ is a different animal, and it is declared so `to_canonical` can
+    // refuse it rather than tone-map it into something quietly wrong.
+    if (matches(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) {
+      out.encoding.transfer = vr::ColorEncoding::Transfer::Bt2020Pq;
+    } else if (matches(transfer, kCVImageBufferTransferFunction_ITU_R_709_2)) {
+      out.encoding.transfer = vr::ColorEncoding::Transfer::Bt709;
+    }
+    CFRelease(transfer);
+  }
+  return out;
+}
+
+/// The vImage conversion for @p matrix, built once per matrix.
+///
+/// Both are built on first use rather than one being chosen at compile time,
+/// because the matrix now comes from the buffer: generating a conversion costs
+/// more than applying it, so it cannot be done per frame, and a session that
+/// switched formats must not silently keep the first one.
+///
+/// The range is full ("f") 420 bi-planar, which is what ARKit delivers; the
+/// video-range matrix against full-range data would clip highlights.
+const vImage_YpCbCrToARGB* conversion_for(
+    const vImage_YpCbCrToARGBMatrix* matrix) {
+  struct Conversions {
+    vImage_YpCbCrToARGB bt601{};
+    vImage_YpCbCrToARGB bt709{};
+    bool ok = false;
+  };
+  static const Conversions built = [] {
+    Conversions c;
+    vImage_YpCbCrPixelRange range{0, 128, 255, 255, 255, 1, 255, 0};
+    const bool a = vImageConvert_YpCbCrToARGB_GenerateConversion(
+                       kvImage_YpCbCrToARGBMatrix_ITU_R_601_4, &range, &c.bt601,
+                       kvImage420Yp8_CbCr8, kvImageARGB8888,
+                       kvImageNoFlags) == kvImageNoError;
+    const bool b = vImageConvert_YpCbCrToARGB_GenerateConversion(
+                       kvImage_YpCbCrToARGBMatrix_ITU_R_709_2, &range, &c.bt709,
+                       kvImage420Yp8_CbCr8, kvImageARGB8888,
+                       kvImageNoFlags) == kvImageNoError;
+    c.ok = a && b;
+    return c;
+  }();
+  if (!built.ok) {
+    return nullptr;
+  }
+  return matrix == kvImage_YpCbCrToARGBMatrix_ITU_R_601_4 ? &built.bt601
+                                                          : &built.bt709;
+}
+
 /// Convert ARKit's bi-planar full-range YCbCr `capturedImage` to the packed-RGB
-/// `uint32` the tsdf/mesh tiers use.
+/// `uint32` the tsdf/mesh tiers use, in the canonical colour encoding.
 ///
 /// vImage rather than a hand-rolled loop: this is 2.7 M pixels per frame at
 /// 1920x1440, so a scalar YCbCr->RGB would dominate the capture path.
@@ -179,8 +328,9 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
 ///                         rather than one it silently depends on.
 /// @return `true` if @p out holds a full frame of packed RGB.
 bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
-                   std::size_t expected_height,
-                   std::vector<std::uint32_t>& out) {
+                   std::size_t expected_height, std::vector<std::uint32_t>& out,
+                   vr::ColorEncoding& encoding, vr::ColorEncoding& declared,
+                   const char*& matrix_name) {
   if (CVPixelBufferGetPlaneCount(image) < 2) {
     return false;
   }
@@ -192,18 +342,11 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
     return false;
   }
 
-  // Built once: the matrix depends only on the pixel format, and deriving it
-  // per frame would cost more than the conversion. ARKit delivers full-range
-  // ("f") 420 bi-planar, so the video-range matrix would clip highlights.
-  static vImage_YpCbCrToARGB info;
-  static const bool ready = [] {
-    vImage_YpCbCrPixelRange range{0, 128, 255, 255, 255, 1, 255, 0};
-    return vImageConvert_YpCbCrToARGB_GenerateConversion(
-               kvImage_YpCbCrToARGBMatrix_ITU_R_601_4, &range, &info,
-               kvImage420Yp8_CbCr8, kvImageARGB8888,
-               kvImageNoFlags) == kvImageNoError;
-  }();
-  if (!ready) {
+  const SourceColor source = source_color(image);
+  declared = source.encoding;
+  matrix_name = source.matrix_name;
+  const vImage_YpCbCrToARGB* info = conversion_for(source.matrix);
+  if (info == nullptr) {
     return false;
   }
 
@@ -211,8 +354,8 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   vImage_Buffer argb{out.data(), height, width, width * 4};
 
   {
-    // Scoped: the permute below reads and writes only `out`, and ARKit wants
-    // its buffers back, so the read lock is dropped as soon as the read ends.
+    // Scoped: nothing after this reads the CVPixelBuffer, and ARKit wants its
+    // buffers back, so the read lock is dropped as soon as the read ends.
     const PixelBufferLock lock(image);
     if (!lock.locked()) {
       return false;
@@ -229,21 +372,45 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
                          CVPixelBufferGetWidthOfPlane(image, 1),
                          CVPixelBufferGetBytesPerRowOfPlane(image, 1)};
 
-    if (vImageConvert_420Yp8_CbCr8ToARGB8888(&luma, &chroma, &argb, &info,
-                                             nullptr, 255, kvImageNoFlags) !=
+    // vImage writes A,R,G,B in memory order; recon reads RGB from the low three
+    // bytes of a little-endian uint32, i.e. R,G,B,A. That is the permutation
+    // [1, 2, 3, 0] -- passed *here* rather than run afterwards as
+    // vImagePermuteChannels_ARGB8888, which is the same reordering for an extra
+    // full pass over 2.7 M pixels: 11 MB read and 11 MB written per frame, or
+    // ~1.3 GB/s at 60 Hz, to move bytes this call can place correctly for free.
+    const std::uint8_t permute[4] = {1, 2, 3, 0};
+    if (vImageConvert_420Yp8_CbCr8ToARGB8888(&luma, &chroma, &argb, info,
+                                             permute, 255, kvImageNoFlags) !=
         kvImageNoError) {
       return false;
     }
   }
 
-  // vImage wrote A,R,G,B in memory order; recon reads RGB from the low three
-  // bytes of a little-endian uint32, i.e. R,G,B,A in memory order. That is the
-  // channel permutation [1,2,3,0] -- done with vImage rather than a scalar loop
-  // because this is 2.7 M pixels and the hand-written version was a measurable
-  // slice of the per-frame cost on its own.
-  const std::uint8_t permute[4] = {1, 2, 3, 0};
-  return vImagePermuteChannels_ARGB8888(&argb, &argb, permute,
-                                        kvImageNoFlags) == kvImageNoError;
+  // The bytes are now full-range R'G'B' in whatever the buffer declared, which
+  // is the form the capture contract wants -- the YCbCr matrix and the range
+  // expansion are the driver's job, which is why ColorEncoding carries no
+  // `Range` member to describe them.
+  //
+  // Canonical is the overwhelmingly common case here (ARKit's own declaration),
+  // and `to_canonical` would walk it verbatim anyway; skipping the call keeps
+  // the fast path free of a function that would touch 11 MB to change nothing
+  // but the alpha byte vImage already wrote as 255.
+  encoding = source.encoding;
+  if (vr::is_canonical(encoding)) {
+    return true;
+  }
+  // Wide gamut, most likely: converting in place, since the source is our own
+  // buffer and to_canonical documents exact aliasing as supported. A frame we
+  // cannot bring across is dropped rather than declared canonical -- fusing P3
+  // values through the BT.709 basis is precisely the silent oversaturation the
+  // declaration exists to prevent.
+  const vr::Status brought =
+      sensor::to_canonical(out.data(), out.size(), encoding, out.data());
+  if (!brought) {
+    return false;
+  }
+  encoding = vr::ColorEncoding{};
+  return true;
 }
 
 /// The `ICameraCapture` recon consumes. Staging rotates three `FrameBuffers`:
@@ -276,6 +443,11 @@ class ARKitCapture final : public sensor::ICameraCapture {
     frame.color = front_.has_color ? front_.color.data() : nullptr;
     frame.depth_camera = front_.depth_camera;
     frame.color_camera = front_.color_camera;
+    // Always the canonical form: convert_color has already brought a
+    // non-canonical source across. Declared rather than left defaulted, because
+    // the default *is* a declaration -- so a source we failed to convert would
+    // be fused through the wrong curve rather than refused.
+    frame.color_encoding = front_.color_encoding;
     frame.timestamp_ns = front_.timestamp_ns;
     return some_frame(frame);
   }
@@ -312,6 +484,13 @@ class ARKitCapture final : public sensor::ICameraCapture {
     stats_.position_y = cam.cam_to_world[3].y;
     stats_.position_z = cam.cam_to_world[3].z;
     stats_.convert_ms = convert_ms;
+    stats_.color_matrix = back_.has_color ? back_.color_matrix : "(none)";
+    stats_.color_transfer =
+        back_.has_color ? name(back_.color_declared.transfer) : "(none)";
+    stats_.color_primaries =
+        back_.has_color ? name(back_.color_declared.primaries) : "(none)";
+    stats_.color_was_canonical =
+        !back_.has_color || vr::is_canonical(back_.color_declared);
   }
 
   /// Count a frame that carried depth but could not be converted.
@@ -437,8 +616,9 @@ class ARKitCapture final : public sensor::ICameraCapture {
   _scratch.timestamp_ns = static_cast<std::uint64_t>(frame.timestamp * 1e9);
   // A colour failure is not a frame failure: depth alone still fuses, and
   // `CapturedFrame` spells null colour as "no colour this frame".
-  _scratch.has_color = convert_color(frame.capturedImage, color.width,
-                                     color.height, _scratch.color);
+  _scratch.has_color = convert_color(
+      frame.capturedImage, color.width, color.height, _scratch.color,
+      _scratch.color_encoding, _scratch.color_declared, _scratch.color_matrix);
 
   const float convert_ms = std::chrono::duration<float, std::milli>(
                                std::chrono::steady_clock::now() - t0)

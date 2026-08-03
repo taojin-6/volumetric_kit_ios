@@ -228,6 +228,14 @@ final class ScannerViewController: UIViewController {
       let kept = String(format: "%.0f%%", s.confidence_kept * 100)
       let intrinsics = String(
         format: "fx %.1f  cx %.1f  cy %.1f", s.depth_fx, s.depth_cx, s.depth_cy)
+      // What the buffer declared, not what we assumed. The matrix is separate
+      // from the transfer and primaries -- it reconstructs chroma, they
+      // describe the result -- so all three are shown rather than collapsed.
+      let encoding = String(
+        format: "%@ matrix -> %@ / %@%@",
+        String(cString: s.color_matrix), String(cString: s.color_transfer),
+        String(cString: s.color_primaries),
+        s.color_was_canonical ? "" : "  (converted)")
       let position = String(
         format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
       let convert = String(format: "%.1f", s.convert_ms)
@@ -241,6 +249,7 @@ final class ScannerViewController: UIViewController {
           frames    \(counts)
           depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)
           colour    \(s.color_width) x \(s.color_height)
+          encoding  \(encoding)
           intrinsic \(intrinsics)
           position  \(position) m
           convert   \(convert) ms

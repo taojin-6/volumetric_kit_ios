@@ -47,6 +47,20 @@ typedef struct {
   float position_x, position_y, position_z;
   /// Milliseconds spent converting the last frame (depth + colour).
   float convert_ms;
+  /// What the last colour buffer declared, read from its CVPixelBuffer
+  /// attachments -- the YCbCr matrix used to reconstruct chroma, then the
+  /// transfer and primaries those R'G'B' values carry, then whether that
+  /// combination needed converting to recon's canonical form.
+  ///
+  /// Reported because the whole point of declaring an encoding is that it is
+  /// observed rather than assumed, and an assumption that stays off-screen is
+  /// indistinguishable from a correct reading. Static C strings, so Swift can
+  /// hold them without owning them.
+  const char* color_matrix;
+  const char* color_transfer;
+  const char* color_primaries;
+  /// `true` when the frame arrived canonical and needed no conversion pass.
+  bool color_was_canonical;
 } VolumetricCaptureStats;
 
 /// @brief Bridges `ARFrame`s into recon's capture contract.
