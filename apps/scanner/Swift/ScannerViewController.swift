@@ -22,6 +22,14 @@ final class ScannerViewController: UIViewController {
   private var fps = 0.0
   private var shouldLog = false
 
+  /// The part of the read-out that is frozen once the renderer is up: the GPU,
+  /// the negotiated API version, and how the one shared device was carved up.
+  /// Cached rather than re-read per tick -- each of those properties crosses the
+  /// bridge to rebuild a C++ string or re-issue
+  /// `vkGetPhysicalDeviceProperties`, and the display link asks 60 times a
+  /// second for a value that cannot change.
+  private var deviceSummary = ""
+
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
@@ -66,13 +74,21 @@ final class ScannerViewController: UIViewController {
     guard renderer == nil else { return }
     guard metalView.metalLayer.drawableSize.width > 0 else { return }
 
+    let brought: VolumetricRenderer
     do {
-      renderer = try VolumetricRenderer(layer: metalView.metalLayer)
+      brought = try VolumetricRenderer(layer: metalView.metalLayer)
     } catch {
       statusLabel.text = "Renderer bring-up failed:\n\(error.localizedDescription)"
       statusLabel.textColor = .systemRed
       return
     }
+    renderer = brought
+    deviceSummary = """
+      \(brought.deviceName)
+      Vulkan \(brought.apiVersion) via MoltenVK
+      device    \(brought.sharedDeviceSummary)
+      shared    \(brought.sharesOneDevice ? "yes - recon and gfx hold one VkDevice" : "NO - separate devices")
+      """
   }
 
   private func startDisplayLink() {
@@ -116,8 +132,7 @@ final class ScannerViewController: UIViewController {
     }
     let size = metalView.metalLayer.drawableSize
     var text = """
-      \(renderer.deviceName)
-      Vulkan \(renderer.apiVersion) via MoltenVK
+      \(deviceSummary)
       drawable  \(Int(size.width)) x \(Int(size.height)) px
       presented \(renderer.framesPresented)
       \(String(format: "%.0f", fps)) fps
