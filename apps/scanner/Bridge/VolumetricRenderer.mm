@@ -33,6 +33,7 @@
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/recon/sensor/camera_conventions.hpp"
 
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
@@ -415,7 +416,15 @@ struct RendererImpl {
 
     vg::pipelines::HybridMeshFrame frame_info{};
     frame_info.extent = extent;
-    frame_info.view_proj = proj * glm::inverse(_impl->camera_to_world);
+    // Back to the OpenGL camera convention before inverting. recon's pose is
+    // CV (+Z forward, +Y down) because that is what its projection wants, but
+    // glm::perspective maps -Z forward -- so feeding it the CV pose directly
+    // puts the entire scene *behind* the camera and renders nothing but
+    // backfaces. cv_from_gl_camera is an involution, so applying it again is
+    // the conversion back.
+    const vr::Mat4f gl_pose =
+        vr::sensor::cv_from_gl_camera(_impl->camera_to_world);
+    frame_info.view_proj = proj * glm::inverse(gl_pose);
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
     (void)_impl->mesh_pipeline->submit(f.cmd, frame_info);
