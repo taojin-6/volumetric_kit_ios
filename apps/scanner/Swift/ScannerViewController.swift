@@ -238,7 +238,11 @@ final class ScannerViewController: UIViewController {
         s.color_was_canonical ? "" : "  (converted)")
       let position = String(
         format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
-      let convert = String(format: "%.1f", s.convert_ms)
+      // Colour split out from the total: the combined figure cannot answer a
+      // question about either half, which is how a 35% win in the colour path
+      // once read as a small loss.
+      let convert = String(
+        format: "%.1f ms  (colour %.2f)", s.convert_ms, s.color_convert_ms)
       let counts =
         "\(s.frames_submitted) in / \(s.frames_polled) polled"
         + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
@@ -252,7 +256,7 @@ final class ScannerViewController: UIViewController {
           encoding  \(encoding)
           intrinsic \(intrinsics)
           position  \(position) m
-          convert   \(convert) ms
+          convert   \(convert)
         """
     }
     statusLabel.text = text

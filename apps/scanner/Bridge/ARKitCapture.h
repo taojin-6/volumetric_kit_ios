@@ -47,6 +47,13 @@ typedef struct {
   float position_x, position_y, position_z;
   /// Milliseconds spent converting the last frame (depth + colour).
   float convert_ms;
+  /// Milliseconds of that spent in the YCbCr->RGB conversion alone.
+  ///
+  /// Split out because the combined number cannot answer a question about
+  /// either half: comparing @ref convert_ms across two runs to judge a change
+  /// to the colour path measured the depth pass and the scene as well, and
+  /// reported a 35% win as a small loss.
+  float color_convert_ms;
   /// What the last colour buffer declared, read from its CVPixelBuffer
   /// attachments -- the YCbCr matrix used to reconstruct chroma, then the
   /// transfer and primaries those R'G'B' values carry, then whether that
