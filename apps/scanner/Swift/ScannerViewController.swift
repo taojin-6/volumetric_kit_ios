@@ -16,6 +16,7 @@ final class ScannerViewController: UIViewController {
   private let arSession = ARSessionController()
   private var displayLink: CADisplayLink?
   private let statusLabel = UILabel()
+  private var cameraGestures: CameraGestureController?
 
   private var lastFPSUpdate = CFAbsoluteTimeGetCurrent()
   private var framesSinceUpdate = 0
@@ -37,6 +38,12 @@ final class ScannerViewController: UIViewController {
     metalView = MetalView(frame: view.bounds)
     metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     view.addSubview(metalView)
+
+    // Attached here, not after bring-up: the recognizers belong to the view,
+    // which exists now, and they hold no camera until `renderer` is handed over
+    // below. Installing them late would mean touches during the first frames
+    // land on nothing.
+    cameraGestures = CameraGestureController(attachingTo: metalView)
 
     statusLabel.numberOfLines = 0
     statusLabel.textColor = .white
@@ -92,6 +99,7 @@ final class ScannerViewController: UIViewController {
       return
     }
     renderer = brought
+    cameraGestures?.renderer = brought
     deviceSummary = """
       \(brought.deviceName)
       Vulkan \(brought.apiVersion) via MoltenVK
@@ -140,10 +148,20 @@ final class ScannerViewController: UIViewController {
       shouldLog = true
     }
     let size = metalView.metalLayer.drawableSize
+    // Which camera is driving, and -- once the user is driving -- the way back.
+    // A manual camera pointed away from the scan and a scan that stopped
+    // producing geometry look identical on screen, so the mode is worth a line.
+    let camera =
+      renderer.followingDevice
+      ? "following device"
+      : String(
+        format: "manual  %.2f m from pivot  (double-tap to follow)",
+        renderer.cameraDistance)
     var text = """
       \(deviceSummary)
       drawable  \(Int(size.width)) x \(Int(size.height)) px
       presented \(renderer.framesPresented)
+      camera    \(camera)
       \(String(format: "%.0f", fps)) fps
 
       """

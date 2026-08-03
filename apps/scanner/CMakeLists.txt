@@ -22,9 +22,13 @@ set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
 add_library(
-  scanner_bridge STATIC Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm
-                        Bridge/SharedDevice.mm Bridge/Fusion.mm)
+  scanner_bridge STATIC
+  Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
+  Bridge/Fusion.mm Bridge/OrbitCamera.cpp)
 
+# ARC is an Objective-C feature, so OrbitCamera.cpp is deliberately absent from
+# this list: it is plain C++ with no object pointers to manage, and clang warns
+# on -fobjc-arc for a translation unit that is not Objective-C.
 set_source_files_properties(
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
   Bridge/Fusion.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
@@ -61,7 +65,8 @@ target_link_libraries(
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
   ${VI_APP_NAME} MACOSX_BUNDLE
-  Swift/AppDelegate.swift Swift/ARSessionController.swift Swift/MetalView.swift
+  Swift/AppDelegate.swift Swift/ARSessionController.swift
+  Swift/CameraGestureController.swift Swift/MetalView.swift
   Swift/ScannerViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)

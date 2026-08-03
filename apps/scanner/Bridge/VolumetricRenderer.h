@@ -88,6 +88,64 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// against a known-good draw is worth more than the code it costs.
 @property(nonatomic) BOOL drawMesh;
 
+#pragma mark - Camera
+
+/// @name Camera control
+///
+/// The camera has two modes. It starts **following the device**: the view sits
+/// at the fused pose, which is what shows whether a scan in progress is
+/// covering what it is being pointed at. Any of the three gestures below takes
+/// it over into a turntable the user drives, seeded from wherever the follow
+/// camera was; @ref followDevice hands it back.
+///
+/// Deltas arrive as **fractions of the viewport height** rather than points or
+/// pixels. The view's size and scale factor are Swift's to know; what a drag
+/// *means* belongs to the camera. Normalizing here is what keeps a given finger
+/// travel producing the same rotation across devices, and keeps UIKit units out
+/// of the C++.
+///
+/// Vertical deltas are positive **downward**, as UIKit reports them.
+///
+/// @warning Main thread only, alongside `renderFrameWithDrawableSize:error:` —
+///          neither locks against the other.
+/// @{
+
+/// The Swift spellings are pinned with `NS_SWIFT_NAME` rather than left to the
+/// importer. `orbitByFractionX:y:` contains a preposition, so the
+/// omit-needless-words rules would relocate everything from `By` onward into
+/// the first argument label and import it as `orbit(byFractionX:y:)` — a name
+/// that reads worse and, more to the point, would change silently if the
+/// selector were ever reworded.
+
+/// @brief Swing the camera around its pivot. Dragging carries the scene with
+///        the finger, so the camera travels the opposite way.
+- (void)orbitByFractionX:(float)dx y:(float)dy NS_SWIFT_NAME(orbit(dx:dy:));
+
+/// @brief Slide the pivot across the view plane, scaled so the scene keeps pace
+///        with the finger at any zoom.
+- (void)panByFractionX:(float)dx y:(float)dy NS_SWIFT_NAME(pan(dx:dy:));
+
+/// @brief Pull the camera toward or away from the pivot.
+/// @param scale  Relative pinch scale; greater than 1 for fingers spreading,
+///               which moves the camera closer.
+- (void)zoomByScale:(float)scale NS_SWIFT_NAME(zoom(scale:));
+
+/// @brief Return the camera to the device pose.
+- (void)followDevice;
+
+/// Whether the camera is still tracking the device rather than the user.
+///
+/// Left without a `getter=isFollowingDevice`: Swift imports a boolean property
+/// under its *getter's* name, so the custom getter would rename this on the far
+/// side of the seam for no gain.
+@property(nonatomic, readonly) BOOL followingDevice;
+
+/// Distance from the turntable's pivot in metres. Only meaningful while
+/// @ref followingDevice is `NO`; reported so the read-out can show it.
+@property(nonatomic, readonly) float cameraDistance;
+
+/// @}
+
 /// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 

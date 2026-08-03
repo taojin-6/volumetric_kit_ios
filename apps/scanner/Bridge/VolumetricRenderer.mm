@@ -8,6 +8,7 @@
 #import "VolumetricRenderer.h"
 
 #import "Fusion.hpp"
+#import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
 
 #include <atomic>
@@ -201,8 +202,10 @@ struct RendererImpl {
   std::uint32_t uploaded_version = 0;
   bool have_mesh = false;
   bool draw_mesh = true;
-  // The pose the newest mesh was fused at; the camera follows the scan.
+  // The pose the newest mesh was fused at; the camera follows the scan until
+  // the user's fingers take it over.
   vr::Mat4f camera_to_world{1.0f};
+  app::OrbitCamera camera;
 };
 
 @implementation VolumetricRenderer {
@@ -396,35 +399,38 @@ struct RendererImpl {
     }
   }
 
+  // The newest fused pose, taken every frame rather than only on remesh, so a
+  // following camera tracks smoothly between mesh updates. Kept up to date
+  // outside the draw branch as well, because it is also what a gesture seeds
+  // the turntable from -- and the user can reach for the screen before the
+  // first mesh ever arrives.
+  _impl->camera_to_world = _impl->fusion.last_pose();
+  // Back to the OpenGL camera convention. recon's pose is CV (+Z forward, +Y
+  // down) because that is what its projection wants, but glm::perspective maps
+  // -Z forward -- so feeding it the CV pose directly puts the entire scene
+  // *behind* the camera and renders nothing but backfaces. cv_from_gl_camera is
+  // an involution, so applying it again is the conversion back.
+  _impl->camera.set_device_pose(
+      vr::sensor::cv_from_gl_camera(_impl->camera_to_world));
+
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
   if (draw_mesh) {
-    // Follow the scan: view is the inverse of the camera-to-world pose fusion
-    // last used, so the render tracks where the device is looking.
     vg::pipelines::HybridMeshDraw draw{};
     draw.mesh = &_impl->mesh_slots[_impl->mesh_slot];
 
-    // Follow the device: the newest fused pose, taken every frame rather than
-    // only on remesh, so the view tracks smoothly even between mesh updates.
-    _impl->camera_to_world = _impl->fusion.last_pose();
-
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(std::max(extent.height, 1u));
-    glm::mat4 proj =
-        glm::perspective(glm::radians(60.0f), aspect, 0.05f, 20.0f);
+    // The same FOV the camera scales a pan by -- see kVerticalFov. A pan
+    // computed against a different one slides out from under the finger.
+    glm::mat4 proj = glm::perspective(app::kVerticalFov, aspect, 0.05f, 20.0f);
     // Vulkan's clip space has +Y down where GL's has it up, and glm targets GL.
     proj[1][1] *= -1.0f;
 
     vg::pipelines::HybridMeshFrame frame_info{};
     frame_info.extent = extent;
-    // Back to the OpenGL camera convention before inverting. recon's pose is
-    // CV (+Z forward, +Y down) because that is what its projection wants, but
-    // glm::perspective maps -Z forward -- so feeding it the CV pose directly
-    // puts the entire scene *behind* the camera and renders nothing but
-    // backfaces. cv_from_gl_camera is an involution, so applying it again is
-    // the conversion back.
-    const vr::Mat4f gl_pose =
-        vr::sensor::cv_from_gl_camera(_impl->camera_to_world);
-    frame_info.view_proj = proj * glm::inverse(gl_pose);
+    // Either the device pose or the turntable, depending on whether the user
+    // has taken the camera over.
+    frame_info.view_proj = proj * _impl->camera.view();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
     (void)_impl->mesh_pipeline->submit(f.cmd, frame_info);
@@ -502,6 +508,45 @@ struct RendererImpl {
   if (_impl->fuse_thread.joinable()) {
     _impl->fuse_thread.join();
   }
+}
+
+// Written out rather than left to auto-synthesis. A `@property` with no
+// accessors gets an ivar of its own, so `renderer.drawMesh = NO` would set a
+// field nothing reads and leave `_impl->draw_mesh` at its default -- silently
+// disabling the one A/B this app has for telling a dead render path from
+// misplaced geometry.
+- (BOOL)drawMesh {
+  return _impl->draw_mesh;
+}
+
+- (void)setDrawMesh:(BOOL)drawMesh {
+  _impl->draw_mesh = drawMesh;
+}
+
+#pragma mark - Camera
+
+- (void)orbitByFractionX:(float)dx y:(float)dy {
+  _impl->camera.orbit(dx, dy);
+}
+
+- (void)panByFractionX:(float)dx y:(float)dy {
+  _impl->camera.pan(dx, dy);
+}
+
+- (void)zoomByScale:(float)scale {
+  _impl->camera.zoom(scale);
+}
+
+- (void)followDevice {
+  _impl->camera.follow_device();
+}
+
+- (BOOL)followingDevice {
+  return _impl->camera.following();
+}
+
+- (float)cameraDistance {
+  return _impl->camera.distance();
 }
 
 - (NSString*)fusionSummary {
