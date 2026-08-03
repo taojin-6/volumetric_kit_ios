@@ -49,6 +49,21 @@ namespace volumetric_kit::ios_app {
 /// place that changes, and the gesture feel follows for free.
 inline constexpr float kVerticalFov = 1.0471976f;  // 60 degrees.
 
+/// Clip range for the render camera, in metres.
+///
+/// Shared with the projection for the same reason the FOV is: @ref
+/// OrbitCamera's zoom-out limit is derived from @ref kFarClip, so a far plane
+/// that moved independently would silently let the camera pull the pivot past
+/// the distance it can still see.
+///
+/// The far plane started at 20 m, sized for the tabletop scans this was first
+/// aimed at. A room-scale scan (~600k verts) outgrew it: the zoom-out limit it
+/// implied became the thing the user was pushing against rather than a bound
+/// they would never reach. Still a guess -- just one now measured against a
+/// real scan's extent rather than an imagined one.
+inline constexpr float kNearClip = 0.05f;
+inline constexpr float kFarClip = 50.0f;
+
 /// @brief A turntable camera with a device-following mode.
 ///
 /// Gesture deltas arrive in **fractions of the viewport height**, not points or

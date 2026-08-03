@@ -26,12 +26,17 @@ constexpr float kOrbitRadiansPerHeight = 3.1415927f;
 /// tabletop-sized scan fills the view, far enough not to start inside it.
 constexpr float kTakeoverPivotDistance = 1.5f;
 
-/// Distance limits, in metres. The ceiling is the load-bearing one: the
-/// projection's far plane is at 20 m, so an unbounded zoom-out would clip the
-/// scan away entirely and read as "the render broke". Ten metres leaves the
-/// same again behind the pivot for the scene to occupy.
+/// Distance limits, in metres. The ceiling is the load-bearing one: an
+/// unbounded zoom-out would put the pivot past the far plane, clipping the scan
+/// away entirely and reading as "the render broke".
+///
+/// Derived from the far plane rather than written next to it, so the two cannot
+/// drift: half of it, which leaves the same again behind the pivot for the
+/// scene to occupy. The first value here was a flat 10 m against a 20 m plane,
+/// and a room-scale scan sat pinned against it -- the clamp had become the
+/// limit the user was fighting rather than a backstop.
 constexpr float kMinDistance = 0.05f;
-constexpr float kMaxDistance = 10.0f;
+constexpr float kMaxDistance = kFarClip * 0.5f;
 
 /// Keep the eye off the poles. At exactly ±90° the pivot-to-eye direction is
 /// parallel to the world up vector, `glm::lookAt`'s cross product collapses,

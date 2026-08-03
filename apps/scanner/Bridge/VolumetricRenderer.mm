@@ -488,9 +488,12 @@ struct RendererImpl {
 
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(std::max(extent.height, 1u));
-    // The same FOV the camera scales a pan by -- see kVerticalFov. A pan
-    // computed against a different one slides out from under the finger.
-    glm::mat4 proj = glm::perspective(app::kVerticalFov, aspect, 0.05f, 20.0f);
+    // The same FOV the camera scales a pan by, and the same clip range its
+    // zoom-out limit is derived from -- see kVerticalFov and kFarClip. A pan
+    // computed against a different FOV slides out from under the finger, and a
+    // far plane nearer than the camera can pull the pivot clips the scan away.
+    glm::mat4 proj = glm::perspective(app::kVerticalFov, aspect, app::kNearClip,
+                                      app::kFarClip);
     // Vulkan's clip space has +Y down where GL's has it up, and glm targets GL.
     proj[1][1] *= -1.0f;
 
