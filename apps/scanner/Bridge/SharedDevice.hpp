@@ -126,8 +126,9 @@ class SharedDevice {
   /// Neither adopter can do this for us: gfx's `Device::wait_idle` covers only
   /// the queues *it* was assigned, and recon's `Device` exposes no wait at all
   /// — so under @ref QueuePlan::kTwoFamilies recon's queue is one nobody else
-  /// would ever drain. Safe to call with both adopters alive: it takes the same
-  /// mutex their submits do when the queue is shared.
+  /// would ever drain. Safe to call with both adopters alive **under every
+  /// queue plan**: it takes the same mutex each queue's submits do, so it
+  /// excludes a concurrent `vkQueueSubmit` rather than racing one.
   void wait_idle() noexcept;
 
   /// @brief Give up ownership of the surface to the caller.
@@ -154,13 +155,30 @@ class SharedDevice {
   std::string summary() const;
 
  private:
-  /// @return The mutex both libraries must hold to submit, or `nullptr` when
-  ///         each got a queue of its own. Derived from @ref queue_plan_ rather
-  ///         than tracked alongside it: a second field encoding the same fact
-  ///         is a second field to keep in agreement by hand.
-  std::mutex* submit_mutex() noexcept {
-    return queue_plan_ == QueuePlan::kSharedQueue ? &submit_mutex_ : nullptr;
+  /// @name The mutex guarding each handed-out queue
+  ///
+  /// One per queue, and always non-null. The earlier shape returned `nullptr`
+  /// whenever the two libraries got queues of their own, on the reasoning that
+  /// an unshared queue needs no lock — but Vulkan requires a `VkQueue` be
+  /// externally synchronized for **every** host-side operation on it, and
+  /// @ref wait_idle is a third thread touching both. With no mutex to take it
+  /// called `vkQueueWaitIdle` bare, racing recon's fuse thread mid-submit on
+  /// exactly the @ref QueuePlan::kTwoFamilies plan a phone actually gets.
+  ///
+  /// Per queue rather than one global: under the multi-queue plans gfx and
+  /// recon take different mutexes, so their submits still do not serialize
+  /// against each other — only against a drain, which is the point. Under
+  /// @ref QueuePlan::kSharedQueue both resolve to the same object, which is the
+  /// single mutex the shared queue always needed.
+  /// @{
+  std::mutex* graphics_submit_mutex() noexcept {
+    return &graphics_submit_mutex_;
   }
+  std::mutex* compute_submit_mutex() noexcept {
+    return queue_plan_ == QueuePlan::kSharedQueue ? &graphics_submit_mutex_
+                                                  : &compute_submit_mutex_;
+  }
+  /// @}
 
  public:
   /// @name The queue families the two libraries were handed
@@ -193,9 +211,13 @@ class SharedDevice {
   /// @ref build hands out the mutex rather than omitting it.
   QueuePlan queue_plan_ = QueuePlan::kSharedQueue;
 
-  /// Guards a queue both libraries submit to. Handed out (via
-  /// @ref submit_mutex) only under @ref QueuePlan::kSharedQueue.
-  std::mutex submit_mutex_;
+  /// Guards submits to gfx's queue, and to recon's as well whenever the two are
+  /// one queue. Always handed out — see @ref graphics_submit_mutex.
+  std::mutex graphics_submit_mutex_;
+  /// Guards submits to recon's queue under the multi-queue plans. Unused (and
+  /// never handed out) under @ref QueuePlan::kSharedQueue, where both adopters
+  /// take @ref graphics_submit_mutex_ instead.
+  std::mutex compute_submit_mutex_;
 
   /// Owns the bytes of the enabled extension names. gfx documents its
   /// requirement vectors as *borrowing* their `const char*`s from the

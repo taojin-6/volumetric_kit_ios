@@ -116,6 +116,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
   if (!overflow) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.errors;
     stats_.last_error = "allocate: " + overflow.status().message();
     return;
   }
@@ -137,6 +138,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     const vr::Status grown = grid_->resize(grown_to);
     if (!grown) {
       std::lock_guard<std::mutex> lock(mutex_);
+      ++stats_.errors;
       stats_.last_error = "resize: " + grown.message();
       return;
     }
@@ -150,6 +152,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
+      ++stats_.errors;
       stats_.last_error =
           "allocate (after resize): " + overflow.status().message();
       return;
@@ -167,14 +170,24 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   // --- Fuse depth, and colour when the frame carries it --------------------
   const auto t_integrate = Clock::now();
+  // The encoding is carried across, not left to default. `ColorFrame::encoding`
+  // defaults to *canonical*, so omitting it does not say "unspecified" -- it
+  // declares canonical on the frame's behalf, and a non-canonical frame would
+  // then be fused through the wrong transfer curve instead of refused. Passing
+  // it is what arms recon's rejection at the one seam that can arm it: this is
+  // the only place ARKit's declaration reaches the integrator. ARKitCapture
+  // normalises or refuses today, so this is latent rather than live -- and it
+  // stays latent only until someone adds a fast path there.
   vr::tsdf::ColorFrame color{};
   color.pixels = frame.color;
   color.cam = frame.color_camera;
+  color.encoding = frame.color_encoding;
   const vr::Status fused = integrator_->integrate(
       *grid_, frame.depth, frame.depth_camera, /*max_weight=*/5.0f,
       vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr);
   if (!fused) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.errors;
     stats_.last_error = "integrate: " + fused.message();
     return;
   }
@@ -187,6 +200,16 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
     // Assigned, not cleared: a frame that fused with dropped blocks says so.
+    //
+    // This assignment is also what makes `errors` load-bearing. It runs every
+    // fused frame and overwrites whatever the previous frame's *later* stages
+    // raised -- remesh's extract and texture failures, and anything the fuse
+    // thread's exception guard noted -- because those happen after this point
+    // in the frame and this is the next thing to touch `last_error`. The
+    // counter is the part that does not get overwritten.
+    if (!frame_error.empty()) {
+      ++stats_.errors;
+    }
     stats_.last_error = frame_error;
   }
 
@@ -202,6 +225,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
       marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
   if (!device_mesh) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.errors;
     stats_.last_error = "extract: " + device_mesh.status().message();
     return;
   }
@@ -222,6 +246,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
         device_mesh.value(), frame.depth, frame.depth_camera);
     if (!textured) {
       std::lock_guard<std::mutex> lock(mutex_);
+      ++stats_.errors;
       stats_.last_error = "texture: " + textured.message();
     }
     texture_ms = ms_since(t_texture);
@@ -285,6 +310,7 @@ void Fusion::release_through(std::uint64_t generation) {
 
 void Fusion::note_error(const std::string& message) {
   std::lock_guard<std::mutex> lock(mutex_);
+  ++stats_.errors;
   stats_.last_error = message;
 }
 

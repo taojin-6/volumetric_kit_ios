@@ -169,7 +169,19 @@ struct FusionStats {
   std::uint64_t arena_bytes = 0;
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
+  ///
+  /// Most-recent-wins, and that is the whole reason @ref errors exists beside
+  /// it: `fuse` republishes its own per-frame error every frame, so a failure
+  /// raised by a *later* stage -- extract, texture, or the fuse thread's
+  /// exception guard -- survives only until the next frame is published. At 60
+  /// Hz a persistent extract failure was therefore visible for under 16 ms at a
+  /// time and read as a clean scan with a frozen mesh.
   std::string last_error;
+  /// How many stage failures have been raised since `start`. Monotonic, so a
+  /// fault that @ref last_error cannot hold still onto is visible as a rising
+  /// count -- the same shape as the renderer's mesh-upload counter, and for the
+  /// same reason.
+  std::uint64_t errors = 0;
 };
 
 /// @brief Fuses captured frames into a volume and extracts a drawable mesh.

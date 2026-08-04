@@ -8,8 +8,11 @@ name: ci
 # PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
 #
 # The nightly matters more here than in the siblings: CMakeLists.txt tracks
-# volumetric_kit_recon at `main`, not a fixed tag, so this repo's build depends
-# on a moving target. On push/PR triggers alone an upstream change that breaks
+# volumetric_kit_recon *and* volumetric_kit_gfx at `main`, not fixed tags, so
+# this repo's build depends on two moving targets -- and build.yml's dep cache
+# key has to name both, or a run restores stale sources for whichever one it
+# left out and reports green against code that no longer compiles.
+# On push/PR triggers alone an upstream change that breaks
 # the iOS cross-compile stays invisible until someone happens to push here --
 # which is precisely the "sibling change that stops Xcode-generating" breakage
 # build.yml exists to catch. The nightly is what actually catches it.

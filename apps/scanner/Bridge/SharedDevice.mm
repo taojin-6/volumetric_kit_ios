@@ -89,23 +89,26 @@ void SharedDevice::wait_idle() noexcept {
   if (device_ == VK_NULL_HANDLE) {
     return;
   }
-  // Per queue rather than `vkDeviceWaitIdle`: on a shared queue the wait is a
-  // queue operation like any other and must hold the mutex every submit holds,
-  // which `vkDeviceWaitIdle` gives no way to scope.
-  auto drain = [this](VkQueue queue) {
+  // Per queue rather than `vkDeviceWaitIdle`: the wait is a queue operation
+  // like any other and must hold the mutex that queue's submits hold, which
+  // `vkDeviceWaitIdle` gives no way to scope.
+  //
+  // Unconditionally, on every plan. The mutex is no longer null when each
+  // library got a queue of its own, because "unshared" only means the two
+  // libraries do not contend -- it never meant this drain could touch the queue
+  // while its one owner was submitting. That is still two threads on one
+  // VkQueue, which Vulkan requires be externally synchronized and which the
+  // validation layer flags.
+  auto drain = [](VkQueue queue, std::mutex* guard) {
     if (queue == VK_NULL_HANDLE) {
       return;
     }
-    if (std::mutex* guard = submit_mutex(); guard != nullptr) {
-      const std::lock_guard<std::mutex> lock(*guard);
-      vkQueueWaitIdle(queue);
-      return;
-    }
+    const std::lock_guard<std::mutex> lock(*guard);
     vkQueueWaitIdle(queue);
   };
-  drain(graphics_queue_);
+  drain(graphics_queue_, graphics_submit_mutex());
   if (compute_queue_ != graphics_queue_) {
-    drain(compute_queue_);
+    drain(compute_queue_, compute_submit_mutex());
   }
 }
 
@@ -438,7 +441,7 @@ vr::AdoptedDevice SharedDevice::recon_payload() {
   adopted.device = device_;
   adopted.compute_family = compute_family_;
   adopted.compute_queue = compute_queue_;
-  adopted.submit_mutex = submit_mutex();
+  adopted.submit_mutex = compute_submit_mutex();
   adopted.enabled_device_extensions = enabled_extensions_.data();
   adopted.enabled_device_extension_count =
       static_cast<std::uint32_t>(enabled_extensions_.size());
@@ -462,7 +465,7 @@ vg::AdoptedDevice SharedDevice::gfx_payload() {
   adopted.has_present = true;
   adopted.present_family = graphics_family_;
   adopted.present_queue = graphics_queue_;
-  adopted.submit_mutex = submit_mutex();
+  adopted.submit_mutex = graphics_submit_mutex();
   adopted.enabled_device_extensions = enabled_extensions_.data();
   adopted.enabled_device_extension_count =
       static_cast<std::uint32_t>(enabled_extensions_.size());

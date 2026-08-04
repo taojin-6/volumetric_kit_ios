@@ -580,7 +580,13 @@ struct RendererImpl {
       _impl->mesh_slots[_impl->mesh_slot] = m;
       _impl->uploaded_version = fresh->version;
       _impl->have_mesh = true;
-      _impl->mesh_upload_error.clear();
+      // The message is deliberately NOT cleared here. `mesh_upload_failures` is
+      // a running total like every other counter on this read-out, and clearing
+      // only the message left the banner gated on a count that never resets:
+      // one transient failure followed by a recovery read "! upload x1: " --
+      // for the rest of the process, an alarm with no content. Count and reason
+      // stay together, so the line means "this happened N times, most recently
+      // for this reason" whether or not it is still happening.
     } else {
       // Released immediately: refusing to draw it must not also strand its slot
       // in recon's ring, or one bad mesh stops every later extract.
@@ -653,7 +659,15 @@ struct RendererImpl {
     _impl->frame_generations[retiring] = live_src.generation;
     ++_impl->frame_slot;
 
-    const float aspect = static_cast<float>(extent.width) /
+    // Both ends clamped, not just the denominator. A zero *width* drawable is
+    // just as reachable as a zero height -- an orientation change, an iPad
+    // Slide Over resize -- and it does not divide by zero, it yields aspect 0,
+    // which makes glm::perspective's first term 1/(0 * tanHalfFovy) = +inf and
+    // NaNs every clip-space x. The mesh then vanishes into a clear-coloured
+    // frame that still returns YES: indistinguishable on screen from "fusion
+    // produced nothing", which is the exact ambiguity the atlas comment above
+    // exists to design out. In Debug, glm asserts instead and CI aborts.
+    const float aspect = static_cast<float>(std::max(extent.width, 1u)) /
                          static_cast<float>(std::max(extent.height, 1u));
     // The same FOV the camera scales a pan by, and the same clip range its
     // zoom-out limit is derived from -- see kVerticalFov and kFarClip. A pan
@@ -850,7 +864,19 @@ struct RendererImpl {
     upload = "\n  ! upload x" + std::to_string(_impl->mesh_upload_failures) +
              ": " + _impl->mesh_upload_error;
   }
-  char buf[512];
+  // Shown as a count with the reason, not the reason alone. `last_error` is
+  // most-recent-wins and `fuse` republishes its own every fused frame, so a
+  // repeating extract or texture failure surfaced for under 16 ms at a time and
+  // the scan read as clean with a mesh that had simply stopped updating. The
+  // count is what holds still long enough to be read.
+  std::string errors;
+  if (s.errors > 0) {
+    errors = "\n  ! errors x" + std::to_string(s.errors) +
+             (s.last_error.empty() ? "" : ": " + s.last_error);
+  }
+  // Sized for two full library messages plus the fixed body: the error and the
+  // upload lines can now both be present and both carry a `Status::message()`.
+  char buf[1024];
   std::snprintf(buf, sizeof(buf),
                 "fused %llu / remesh %llu  v%u\n"
                 "  mesh      %u verts / %u tris\n"
@@ -859,7 +885,7 @@ struct RendererImpl {
                 "  extract   %.1f ms\n"
                 "  arena     %u tris planned / %u blocks -> %.1f MB (%.2f%% "
                 "full)\n"
-                "  texture   %.1f ms%s%s%s",
+                "  texture   %.1f ms%s%s",
                 static_cast<unsigned long long>(s.frames_fused),
                 static_cast<unsigned long long>(s.remeshes), s.mesh_version,
                 s.vertices, s.triangles, s.allocate_ms, s.integrate_ms,
@@ -869,8 +895,7 @@ struct RendererImpl {
                     ? 100.0 * static_cast<double>(s.triangles) /
                           static_cast<double>(s.triangle_capacity)
                     : 0.0,
-                s.texture_ms, s.last_error.empty() ? "" : "\n  ! ",
-                s.last_error.c_str(), upload.c_str());
+                s.texture_ms, errors.c_str(), upload.c_str());
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`
