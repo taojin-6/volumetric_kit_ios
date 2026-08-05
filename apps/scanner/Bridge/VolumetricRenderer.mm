@@ -626,7 +626,7 @@ struct RendererImpl {
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
   if (draw_mesh) {
     vg::pipelines::HybridMeshDraw draw{};
-    draw.mesh = &_impl->mesh_slots[_impl->mesh_slot];
+    draw.geometry = &_impl->mesh_slots[_impl->mesh_slot];
 
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(std::max(extent.height, 1u));
