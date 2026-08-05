@@ -7,20 +7,19 @@ name: ci
 # never silently leaves an old required context unreported and blocking every
 # PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
 #
-# The nightly matters more here than in the siblings: CMakeLists.txt tracks
-# volumetric_kit_recon at `main`, not a fixed tag, so this repo's build depends
-# on a moving target. On push/PR triggers alone an upstream change that breaks
-# the iOS cross-compile stays invisible until someone happens to push here --
-# which is precisely the "sibling change that stops Xcode-generating" breakage
-# build.yml exists to catch. The nightly is what actually catches it.
+# No scheduled trigger, deliberately. CMakeLists.txt tracks volumetric_kit_recon
+# and volumetric_kit_gfx at `main`, not a fixed tag, so an upstream change can
+# break the iOS cross-compile with no commit here -- and a nightly reported that
+# as a red `main` every morning, on days with no work queued against it, until
+# someone got to it. The breakage is still caught; it is caught on the next
+# push/PR, when there is a change in hand to fix it against. What a trigger
+# cannot do is remove the drift itself -- only pinning the siblings to a SHA
+# does that, at the cost of adopting upstream deliberately rather than
+# continuously.
 on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # 09:17 UTC. Off the hour deliberately -- scheduled runs cluster (and get
-    # delayed) on the hour.
-    - cron: '17 9 * * *'
   workflow_dispatch:
 
 # Least privilege: nothing here reads private data or writes back to the repo.
@@ -30,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  # Keyed on the event as well as the ref: a scheduled run and a push to main
+  # Keyed on the event as well as the ref: a manual dispatch and a push to main
   # both resolve to refs/heads/main, and without the event they would share a
   # group and cancel each other.
   group: ci-${{ github.event_name }}-${{ github.ref }}
