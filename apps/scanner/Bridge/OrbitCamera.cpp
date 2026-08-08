@@ -112,16 +112,25 @@ void OrbitCamera::take_over() {
   // heading under the finger, differently each time from the same phone pose.
   //
   // The camera's own up vector is the complement: its horizontal length is
-  // sin(pitch), so it is longest exactly where the view direction's is
+  // |sin(pitch)|, so it is longest exactly where the view direction's is
   // shortest, and at the pole it is fully horizontal and still says where the
   // phone was aimed. The two agree wherever both are defined -- for a turntable
   // eye at (yaw, pitch), lookAt's up vector comes out with horizontal part
-  // -sin(pitch) * (sin yaw, cos yaw), so negating it recovers the same yaw --
-  // which is what makes picking the longer of the two continuous rather than a
-  // seam.
+  // -sin(pitch) * (sin yaw, cos yaw) -- which is what makes picking the longer
+  // of the two continuous rather than a seam.
+  //
+  // Note the *signed* factor: negating alone recovers the yaw only while
+  // sin(pitch) is positive. `dir` is the pivot-to-eye direction, so pitch is
+  // negative exactly when the phone is aimed above the horizon -- and there the
+  // bare negation lands half a turn out. That is not a pole-only edge case: the
+  // fallback takes over at |pitch| > 45 degrees, so scanning a ceiling, a high
+  // shelf, or a held-up object and then dragging would snap the whole scene
+  // behind the camera. Multiplying by the sign of the pitch cancels the factor
+  // instead of assuming it away.
   const glm::vec3 cam_up(device_pose_[1]);
   glm::vec2 heading(dir.x, dir.z);
-  const glm::vec2 from_up(-cam_up.x, -cam_up.z);
+  const glm::vec2 from_up =
+      glm::vec2(-cam_up.x, -cam_up.z) * std::copysign(1.0f, pitch_);
   if (glm::dot(from_up, from_up) > glm::dot(heading, heading)) {
     heading = from_up;
   }

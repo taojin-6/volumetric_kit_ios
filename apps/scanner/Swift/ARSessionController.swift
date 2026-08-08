@@ -77,6 +77,23 @@ final class ARSessionController: NSObject, ARSessionDelegate {
   /// `start()` resets tracking or resumes.
   private var hasRun = false
 
+  /// Whether the owner currently wants this session running.
+  ///
+  /// `sessionInterruptionEnded` used to re-run the session unconditionally,
+  /// which put ARKit outside the view controller's state machine entirely: a
+  /// background/foreground cycle ran `start()` twice (once from `resume`, once
+  /// from the interruption callback, in an order ARKit does not specify), and an
+  /// interruption ending after `viewDidDisappear` or after a device loss revived
+  /// the camera behind the state machine's back — a live session with
+  /// `isCapturing` false, which `suspend()` then declines to wind down because
+  /// it guards on exactly that.
+  ///
+  /// So the callback consults this instead. `start()` and `pause()` are the
+  /// only things that move it, which keeps the owner the single decider of
+  /// whether capture should be running and leaves this class responsible only
+  /// for *how* to resume.
+  private var shouldBeRunning = false
+
   override init() {
     super.init()
     session.delegateQueue = sessionQueue
@@ -120,10 +137,12 @@ final class ARSessionController: NSObject, ARSessionDelegate {
       session.run(config, options: [.resetTracking, .removeExistingAnchors])
       hasRun = true
     }
+    shouldBeRunning = true
     sessionError = nil
   }
 
   func pause() {
+    shouldBeRunning = false
     session.pause()
   }
 
@@ -202,8 +221,16 @@ final class ARSessionController: NSObject, ARSessionDelegate {
     // to be re-run — and `start()` clears the message on its way through. Both
     // halves matter: without them one interruption left the session stopped and
     // its error text on screen for the rest of the run.
+    //
+    // Only when the owner still wants it running, though. An interruption can
+    // end long after `pause()` — the app is backgrounded, the view is off
+    // screen, the render loop has latched a device loss — and re-running here
+    // regardless started a camera nothing was consuming and left the view
+    // controller's `isCapturing` describing a session that no longer matched
+    // it. See `shouldBeRunning`.
     DispatchQueue.main.async { [weak self] in
-      self?.start()
+      guard let self, self.shouldBeRunning else { return }
+      self.start()
     }
   }
 }
