@@ -327,7 +327,7 @@ vr::Status SharedDevice::build(const void* metal_layer,
   enabled_timeline_semaphore_ =
       recon_req.timeline_semaphore || gfx_req.timeline_semaphore;
   enabled_scalar_block_layout_ = recon_req.scalar_block_layout;
-  const bool want_dynamic_rendering = gfx_req.dynamic_rendering;
+  enabled_dynamic_rendering_ = gfx_req.dynamic_rendering;
 
   // Queried through the same 1.2/1.3 aggregates the enable path uses below, so
   // the check and the request cannot drift apart. scalarBlockLayout in
@@ -353,7 +353,7 @@ vr::Status SharedDevice::build(const void* metal_layer,
                      "timelineSemaphore"},
         FeatureCheck{enabled_scalar_block_layout_,
                      supported12.scalarBlockLayout, "scalarBlockLayout"},
-        FeatureCheck{want_dynamic_rendering, supported13.dynamicRendering,
+        FeatureCheck{enabled_dynamic_rendering_, supported13.dynamicRendering,
                      "dynamicRendering"}}) {
     if (check.wanted && check.supported == VK_FALSE) {
       return vr::Status::unsupported(
@@ -372,7 +372,7 @@ vr::Status SharedDevice::build(const void* metal_layer,
   // --- 6. Device ------------------------------------------------------------
   VkPhysicalDeviceVulkan13Features f13{};
   f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-  f13.dynamicRendering = want_dynamic_rendering ? VK_TRUE : VK_FALSE;
+  f13.dynamicRendering = enabled_dynamic_rendering_ ? VK_TRUE : VK_FALSE;
   // gfx publishes any *further* extended-feature structs it would enable as an
   // opaque chain and documents enabling them as the embedder's job -- its
   // Device::adopt cannot introspect one. Splice it on the tail. The const_cast
@@ -466,6 +466,22 @@ vg::AdoptedDevice SharedDevice::gfx_payload() {
   adopted.enabled_device_extensions = enabled_extensions_.data();
   adopted.enabled_device_extension_count =
       static_cast<std::uint32_t>(enabled_extensions_.size());
+  adopted.enabled_features = enabled_features_;
+  // Read back from what this bootstrap enabled, never asserted -- as in
+  // recon_payload, and for the same reason. gfx's adopt verifies against this
+  // declaration because Vulkan cannot be asked what a *logical* device enabled:
+  // every 1.3 physical device reports dynamicRendering as supported whatever
+  // vkCreateDevice was passed, so support is not evidence of enablement.
+  // Omitting these is not a missing optimisation but a failed bring-up: they
+  // default to "not enabled", which is what makes an undeclaring embedder fail
+  // at adopt rather than at every vkCmdBeginRendering.
+  adopted.enabled_timeline_semaphore = enabled_timeline_semaphore_;
+  adopted.enabled_dynamic_rendering = enabled_dynamic_rendering_;
+  // Left false deliberately: the instance above enables no VK_EXT_debug_utils,
+  // and claiming otherwise would have gfx load a device table for an extension
+  // that is not there. Enable it on the instance first if a capture needs pass
+  // markers.
+  adopted.enabled_debug_utils = false;
   return adopted;
 }
 
