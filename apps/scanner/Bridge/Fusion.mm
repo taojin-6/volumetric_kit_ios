@@ -154,8 +154,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   // --- Is the occupancy reading still live? --------------------------------
   //
-  // Both guards below read `stats_.active_blocks`, and the only thing that
-  // writes it is a *successful* extract in remesh. So a persistent extract
+  // Both guards below read `stats_.extract.active_blocks`, and the only thing
+  // that writes it is a *successful* extract in remesh. So a persistent extract
   // failure -- a refit that runs out of memory, a capacity past
   // maxStorageBufferRange -- freezes the numerator while the real table goes on
   // filling, and the guards then wave through exactly the regime they exist to
@@ -199,11 +199,11 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // The reactive path below stays as a backstop for a frame that fills the
   // table faster than one doubling absorbs.
   constexpr float kGrowAtOccupancy = 0.7f;
-  if (!occupancy_stale && stats_.active_blocks > 0 &&
+  if (!occupancy_stale && stats_.extract.active_blocks > 0 &&
       config_.num_buckets < config_.max_buckets) {
     const float capacity = static_cast<float>(config_.num_buckets) *
                            static_cast<float>(kBlocksPerBucket);
-    if (static_cast<float>(stats_.active_blocks) >
+    if (static_cast<float>(stats_.extract.active_blocks) >
         capacity * kGrowAtOccupancy) {
       const std::int32_t grown_to =
           std::min(config_.num_buckets * 2, config_.max_buckets);
@@ -240,7 +240,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   const float table_capacity = static_cast<float>(config_.num_buckets) *
                                static_cast<float>(kBlocksPerBucket);
   const bool table_exhausted =
-      occupancy_stale || static_cast<float>(stats_.active_blocks) >
+      occupancy_stale || static_cast<float>(stats_.extract.active_blocks) >
                              table_capacity * kRefuseAllocateAtOccupancy;
 
   // --- Allocate the blocks this frame's depth touches ----------------------
@@ -261,13 +261,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       frame_error =
           "occupancy unknown: no extract has measured the block table for " +
           std::to_string(stats_.frames_fused - active_blocks_at_frame_) +
-          " fused frames (last read " + std::to_string(stats_.active_blocks) +
+          " fused frames (last read " +
+          std::to_string(stats_.extract.active_blocks) +
           " blocks); not allocating new blocks until it does. See the extract "
           "error above.";
     } else {
       frame_error =
-          "volume full: " + std::to_string(stats_.active_blocks) + " of " +
-          std::to_string(static_cast<std::int64_t>(table_capacity)) +
+          "volume full: " + std::to_string(stats_.extract.active_blocks) +
+          " of " + std::to_string(static_cast<std::int64_t>(table_capacity)) +
           " blocks at the " + std::to_string(config_.max_buckets) +
           "-bucket ceiling; not allocating new blocks (existing surface still "
           "fusing). Raise max_buckets or use a coarser voxel_size.";
@@ -382,13 +383,26 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     last_pose_ = frame.depth_camera.cam_to_world;
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
-    // Refreshed here rather than in remesh, where it used to sit: it is derived
-    // from `config_.num_buckets`, which *this* function grows, so publishing it
-    // only on a successful extract left the read-out dividing a fresh block
-    // count by a capacity from before the last doubling -- an occupancy figure
-    // that could read over 100%.
-    stats_.table_capacity =
-        static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
+    // How far behind this frame the published extract breakdown now is.
+    // Everything in `stats_.extract` -- the phases, the block count, the arena,
+    // `dispatches` -- is written only by a fully-successful remesh, so without
+    // this the read-out reprints an older extract's numbers as though they were
+    // this frame's, with nothing on screen saying otherwise.
+    //
+    // `table_capacity` deliberately does *not* refresh here. It is the
+    // denominator for `extract.active_blocks`, and it is stamped beside that
+    // numerator in remesh; refreshing it every frame is what made occupancy
+    // halve after a grow whose remesh then skipped. See its declaration.
+    stats_.frames_since_extract =
+        active_blocks_measured_ ? stats_.frames_fused - active_blocks_at_frame_
+                                : 0;
+    // Two cadences of slack rather than none: a remesh that skips because the
+    // renderer has not collected the last mesh is the ordinary steady state,
+    // and a marker that flickered on it would be noise rather than signal.
+    const std::uint64_t fresh_within =
+        2ull * std::max<std::uint32_t>(config_.remesh_every, 1u);
+    stats_.extract_stale =
+        active_blocks_measured_ && stats_.frames_since_extract > fresh_within;
     // Assigned, not cleared: a frame that fused with dropped blocks says so.
     //
     // This assignment is also what makes `errors` load-bearing. It runs every
@@ -515,15 +529,27 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.triangles = mesh_.triangle_count;
   stats_.mesh_version = mesh_version_;
   stats_.extract_ms = extract_ms;
-  stats_.triangle_capacity = extract_timings.triangle_capacity;
-  stats_.active_blocks = extract_timings.active_blocks;
-  stats_.arena_bytes = extract_timings.arena_bytes;
+  // recon's struct, whole -- not a field-by-field transcription. `extract_ms`
+  // above is this call measured from here; this is what it decomposes into.
+  // See FusionStats::extract for why the copy is one assignment.
+  stats_.extract = extract_timings;
+  // Stamped beside the block count it is the denominator for. Occupancy is
+  // `extract.active_blocks` over this, and a ratio whose two halves are
+  // published on different cadences is wrong in whichever direction they
+  // differ -- see FusionStats::table_capacity.
+  stats_.table_capacity =
+      static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
   // Stamped with the reading, because the reading is what `fuse`'s anti-hang
   // guards run on and a successful extract is the only thing that refreshes it.
   // Without the stamp there is no way to tell a live occupancy figure from one
   // frozen by an extract that has been failing for a minute.
   active_blocks_at_frame_ = stats_.frames_fused;
   active_blocks_measured_ = true;
+  // This extract *is* the current one, so the read-out's staleness marker
+  // clears here and nowhere else. `fuse` recomputes it every frame from
+  // active_blocks_at_frame_ above.
+  stats_.frames_since_extract = 0;
+  stats_.extract_stale = false;
   stats_.texture_ms = texture_ms;
 }
 
@@ -577,6 +603,20 @@ vr::Mat4f Fusion::last_pose() const {
 FusionStats Fusion::stats() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return stats_;
+}
+
+FusionTraceStats Fusion::trace_stats() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Field by field rather than returning stats_, because the point is to leave
+  // the string behind: copying FusionStats here would malloc inside this lock
+  // on nearly every frame of a healthy scan. See FusionTraceStats.
+  FusionTraceStats out;
+  out.triangles = stats_.triangles;
+  out.triangle_capacity = stats_.extract.triangle_capacity;
+  out.arena_bytes = stats_.extract.arena_bytes;
+  out.active_blocks = stats_.extract.active_blocks;
+  out.extract_ms = stats_.extract_ms;
+  return out;
 }
 
 }  // namespace volumetric_kit::ios_app
