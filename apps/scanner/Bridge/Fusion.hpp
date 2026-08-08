@@ -171,7 +171,6 @@ struct FusionConfig {
 struct FusionStats {
   std::uint64_t frames_fused = 0;
   std::uint64_t remeshes = 0;
-  std::uint32_t active_blocks = 0;
   std::uint32_t vertices = 0;
   std::uint32_t triangles = 0;
   std::uint32_t mesh_version = 0;
@@ -179,60 +178,67 @@ struct FusionStats {
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
-  /// What the last extract's arena was *planned* for, and what it cost.
+  /// @brief The last successful extract's own timings and counts, held whole.
   ///
-  /// Reported because the mesh size does not imply either: the arena is sized
-  /// from a per-block triangle estimate times the active-block count, so a plan
-  /// that drifts high allocates hundreds of megabytes to hold a few thousand
-  /// triangles -- and the read-out showed only the few thousand.
+  /// recon's struct by value rather than a hand-picked copy of its fields.
+  /// Eleven of its twelve were mirrored into scalars here, which meant every
+  /// field recon added or renamed wanted three lockstep edits in this app --
+  /// declaration, copy, read-out -- with no compile error when one was missed;
+  /// and because all seven spans are the same type, any permutation slip in the
+  /// copy block compiled clean and surfaced only as a suspicious device
+  /// read-out. That is the same class of gap this diff exists to close, one
+  /// struct over. recon's own `fuse_viewer` holds it whole for the same reason.
+  /// Costs nothing new: marching_cubes.hpp is already included above, and
+  /// @ref Published already exposes a `vr::mesh::DeviceMesh` publicly.
   ///
-  /// The two are *not* the same scale, and printing them side by side without
-  /// saying so overstated one slot by the slot count: `triangle_capacity` is
-  /// what the last extract planned for the one slot it wrote, while
-  /// `arena_bytes` is recon's sum across the whole ring (its `ExtractTimings`
-  /// documents it as the total). @ref mesh_slots is carried so the read-out can
-  /// name which is which.
-  std::uint32_t triangle_capacity = 0;
-  std::uint64_t arena_bytes = 0;
+  /// Where @ref extract_ms goes. The phases are worth the read-out space
+  /// because they have *nothing* in common as optimisation targets and the
+  /// total cannot tell them apart: `neighbour_lut_ms` is serial host work over
+  /// the whole active set (the 2x2x2 table the sparse kernel indexes instead of
+  /// probing the hash) and wants incremental extraction; `dispatch_ms` is the
+  /// meshing pass and wants fewer cells. On an M5 iPad Pro at ~107k blocks this
+  /// app measured extract at 132.7 ms, of which the lut was 102.2 and the
+  /// dispatch 25.9.
+  ///
+  /// @warning `dispatch_ms` is **not** GPU time. recon submits through
+  ///          `Device::submit_single_time`, which blocks on a fence, and
+  ///          `ExtractTimings` documents the span as covering host record
+  ///          *plus* device execution rather than either alone. Sizing a
+  ///          triangle-reduction win against it overstates the ceiling by
+  ///          however much of it is recording, submit and stall.
+  ///
+  /// @note `arena_bytes` is recon's sum across the whole ring, while
+  ///       `triangle_capacity` is what this extract planned for the one slot it
+  ///       wrote -- not the same scale. See @ref mesh_slots.
+  vr::mesh::ExtractTimings extract{};
   /// How many slots that arena is spread over -- `FusionConfig::mesh_slots`,
   /// echoed here so the read-out needs no second source for it.
   std::uint32_t mesh_slots = 0;
-  /// Block-table capacity (`num_buckets * 8`), so the read-out can show
-  /// occupancy against @ref active_blocks. This is the number that matters for
-  /// GPU hangs: the allocate kernel's overflow path scans the whole table, so
-  /// its cost per insert climbs with occupancy long before anything fails.
-  std::uint32_t table_capacity = 0;
-
-  /// @name Extract phase breakdown
-  /// Where @ref extract_ms actually goes, copied straight from
-  /// `mesh::ExtractTimings`. recon has published these all along; this class
-  /// simply was not asking -- the same gap that hid `triangle_capacity`.
+  /// Block-table capacity (`num_buckets * kBlocksPerBucket`) **as of the
+  /// extract that measured `extract.active_blocks`**, so the read-out's
+  /// occupancy divides two figures taken at one instant.
   ///
-  /// Worth the read-out space because the phases have *nothing* in common as
-  /// optimisation targets, and the total cannot distinguish them. At 111k
-  /// blocks extract reached ~650 ms, and that is consistent with three
-  /// unrelated causes: @ref neighbour_lut_ms is serial host work over the whole
-  /// active set (the 2x2x2 neighbour table the sparse kernel indexes instead of
-  /// probing the hash), @ref dispatch_ms is real GPU meshing, and @ref
-  /// dispatches == 2 means the capacity planner under-guessed and the entire
-  /// surface was meshed *twice*. The first wants incremental extraction, the
-  /// second wants fewer cells, the third is a planner bug and no architecture
-  /// at all.
-  /// @{
-  float compact_ms = 0.0f;  ///< Active-block compaction (dispatch + readback).
-  float neighbour_lut_ms = 0.0f;  ///< Host-built 2x2x2 neighbour table.
-  float input_upload_ms = 0.0f;   ///< Filling the block + neighbour buffers.
-  float arena_alloc_ms = 0.0f;  ///< Arena sizing / draw-command reset / refit.
-  float descriptor_ms = 0.0f;   ///< Descriptor writes.
-  float dispatch_ms = 0.0f;  ///< The marching-cubes dispatch(es) + fence wait.
-  float readback_ms =
-      0.0f;  ///< Draw-command read (no vertex copy on this path).
-  /// Dispatches the last extract ran: 1 in the steady state, 2 when the planned
-  /// capacity was under what the field emitted and the arena had to refit and
-  /// re-run. Persistent 2s mean the planner is not tracking the surface, which
-  /// @ref dispatch_ms alone cannot show because it sums both.
-  std::uint32_t dispatches = 0;
-  /// @}
+  /// Stamped beside the block count deliberately, and that placement is load
+  /// bearing. It briefly lived in `fuse`, refreshed every frame, on the theory
+  /// that a capacity from before the last doubling would make occupancy read
+  /// over 100%. But the numerator only ever moves on a successful extract, so
+  /// refreshing the denominator alone produced the inverse fault: the grow
+  /// doubles this the same frame, and a remesh that then skips or fails halves
+  /// the displayed occupancy exactly when the map is under most pressure. Both
+  /// halves of a ratio move together or neither does.
+  std::uint32_t table_capacity = 0;
+  /// @brief How far behind the current frame @ref extract is, and whether that
+  ///        is further than the remesh cadence explains.
+  ///
+  /// Everything in @ref extract is published only on remesh's fully-successful
+  /// path, below the early returns for "the renderer has not collected the last
+  /// mesh" and "the extract failed". Without this the read-out reprints a stale
+  /// breakdown as current, and the worst of it is `dispatches`, the one value
+  /// whose reading tells someone what to go and do: a 2 frozen by a failing
+  /// extract sends them to debug a planner that is fine, and a frozen 1 hides
+  /// one that is not.
+  std::uint64_t frames_since_extract = 0;
+  bool extract_stale = false;
 
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
@@ -258,6 +264,23 @@ struct FusionStats {
   /// read `! errors x1800` after thirty seconds of a clean scan, which buried
   /// the single extract failure this counter exists to surface.
   std::uint64_t errors = 0;
+};
+
+/// @brief The subset of @ref FusionStats the render thread's frame trace keeps.
+///
+/// All PODs, deliberately. @ref FusionStats carries a `std::string`, so copying
+/// one out under the publish mutex mallocs inside the critical section the fuse
+/// thread needs every frame -- and it is *not* a rare path: a healthy scan
+/// reports lost bucket-lock races on nearly every frame, whose notice runs well
+/// past libc++'s 22-character small-string buffer. The trace needs five scalars
+/// to fill a ring only a failure dump ever reads; it should not pay for the
+/// message as well, nor take the lock a second time in the same tick.
+struct FusionTraceStats {
+  std::uint32_t triangles = 0;
+  std::uint32_t triangle_capacity = 0;
+  std::uint64_t arena_bytes = 0;
+  std::uint32_t active_blocks = 0;
+  float extract_ms = 0.0f;
 };
 
 /// @brief Fuses captured frames into a volume and extracts a drawable mesh.
@@ -355,6 +378,12 @@ class Fusion {
   void note_error(const std::string& message);
 
   FusionStats stats() const;
+
+  /// @brief The frame trace's five scalars, without @ref FusionStats' string.
+  ///
+  /// See @ref FusionTraceStats: this exists so the per-frame consumer does not
+  /// malloc under the mutex the fuse thread takes every frame.
+  FusionTraceStats trace_stats() const;
 
   bool valid() const noexcept { return grid_.has_value(); }
 

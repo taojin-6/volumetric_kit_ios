@@ -49,7 +49,6 @@ final class ScannerViewController: UIViewController {
   private var lastFPSUpdate = CFAbsoluteTimeGetCurrent()
   private var framesSinceUpdate = 0
   private var fps = 0.0
-  private var shouldLog = false
 
   /// The part of the read-out that is frozen once the renderer is up: the GPU,
   /// the negotiated API version, and how the one shared device was carved up.
@@ -105,6 +104,20 @@ final class ScannerViewController: UIViewController {
         equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
       statusLabel.trailingAnchor.constraint(
         lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor,
+        constant: -12),
+      // Bounded, where it previously had no bottom at all. The overlay grew
+      // past the safe area on a landscape iPhone — verified only on an iPad,
+      // where it fits — and an unconstrained label simply ran off the screen,
+      // silently, taking whatever was last in the string with it. The failure
+      // banners now come first for that reason (see `fusionSummary`), so what
+      // this clips is the least load-bearing end.
+      //
+      // A scroll view would make the tail reachable instead of merely bounded,
+      // and was rejected on purpose: sized to the safe area it would sit over
+      // `metalView` and swallow the orbit/pan/zoom recognizers, trading a debug
+      // overlay's tail for the camera controls.
+      statusLabel.bottomAnchor.constraint(
+        lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor,
         constant: -12),
     ])
   }
@@ -364,15 +377,25 @@ final class ScannerViewController: UIViewController {
   }
 
   private func updateStatus(_ renderer: VolumetricRenderer) {
+    // Counted every tick; rebuilt at 2 Hz. The gate below already existed and
+    // was spent only on `print`, so the whole overlay — a mutex acquisition, a
+    // FusionStats copy, three string builds and a ~20-conversion snprintf
+    // across the bridge, then a CoreText re-layout of the result — was being
+    // redone 60 times a second on iPhone and up to 120 on a ProMotion iPad, for
+    // content a human reads at walking pace. `deviceSummary` was cached for
+    // exactly this reason; this is the same argument applied to the half that
+    // does change, just not that fast.
+    //
+    // An equality check on the built string would not have worked: the text
+    // embeds `framesPresented`, which moves every tick.
     framesSinceUpdate += 1
     let now = CFAbsoluteTimeGetCurrent()
     let elapsed = now - lastFPSUpdate
-    if elapsed >= 0.5 {
-      fps = Double(framesSinceUpdate) / elapsed
-      framesSinceUpdate = 0
-      lastFPSUpdate = now
-      shouldLog = true
-    }
+    guard elapsed >= 0.5 else { return }
+    fps = Double(framesSinceUpdate) / elapsed
+    framesSinceUpdate = 0
+    lastFPSUpdate = now
+
     let size = metalView.metalLayer.drawableSize
     // Which camera is driving, and -- once the user is driving -- the way back.
     // A manual camera pointed away from the scan and a scan that stopped
@@ -454,13 +477,14 @@ final class ScannerViewController: UIViewController {
         """
     }
     statusLabel.text = text
-    if shouldLog {
-      shouldLog = false
-      // Same text as the on-screen read-out, to stdout, so
-      // `devicectl device process launch --console` can verify capture from the
-      // build host instead of someone reading the screen.
-      print(text)
-    }
+    // Unconditional now: the 0.5 s gate at the top of this function is the same
+    // cadence `shouldLog` used to carry, so the flag was tracking a rate the
+    // whole body already runs at.
+    //
+    // Same text as the on-screen read-out, to stdout, so
+    // `devicectl device process launch --console` can verify capture from the
+    // build host instead of someone reading the screen.
+    print(text)
   }
 
   deinit {

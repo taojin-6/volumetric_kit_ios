@@ -908,7 +908,11 @@ struct RendererImpl {
     live.indirect = live_src.indirect;
     const vg::pipelines::HybridMeshDraw draw{live};
 
-    const app::FusionStats s = _impl->fusion.stats();
+    // The narrow accessor, not stats(): this runs every frame, and FusionStats
+    // carries a std::string whose copy would malloc inside the mutex the fuse
+    // thread takes on every one of its own frames. Five scalars is all the ring
+    // holds. See Fusion::trace_stats.
+    const app::FusionTraceStats s = _impl->fusion.trace_stats();
     trace.drew_mesh = true;
     trace.generation = live_src.generation;
     trace.mesh_slot = _impl->mesh_slot;
@@ -1141,31 +1145,109 @@ struct RendererImpl {
     errors = "\n  ! errors x" + std::to_string(s.errors) +
              (s.last_error.empty() ? "" : ": " + s.last_error);
   }
+  // The phase rows, built here as label/value pairs rather than as eight more
+  // positional varargs on the format below. That format already couples ~19
+  // conversions to their arguments by position, and a run of same-typed floats
+  // is the one shift -Wformat cannot see: it prints every later phase under the
+  // wrong label, silently, with nothing in the output to reveal it. Binding
+  // each label to its value at one site removes the class of mistake, and
+  // recon's own viewer builds these same seven the same way.
+  //
+  // Names picked not to collide with quantities already on this read-out:
+  // `inputs` rather than "upload" (there is an `! upload` banner), `sizing`
+  // rather than "arena" (there is an arena section below), `meshing` rather
+  // than "dispatch" (that word is a *count* on the extract line). The unit is
+  // declared once in the row label instead of seven times in the values.
+  //
+  // `other` is the residual, printed rather than left implicit: these phases do
+  // not sum to extract_ms and never did. recon's spans open after the slot
+  // claim and close before the O(active_blocks) teardown of the neighbour
+  // table, so the gap grows with the scan -- the one direction in which an
+  // unlabelled remainder would be misread as rounding.
+  struct PhaseCell {
+    const char* label;
+    double ms;
+  };
+  const PhaseCell phases[] = {
+      {"compact", s.extract.compact_ms},
+      {"lut", s.extract.neighbour_lut_ms},
+      {"inputs", s.extract.input_upload_ms},
+      {"sizing", s.extract.arena_alloc_ms},
+      {"desc", s.extract.descriptor_ms},
+      {"meshing", s.extract.dispatch_ms},
+      {"read", s.extract.readback_ms},
+      {"other",
+       std::max(0.0, static_cast<double>(s.extract_ms) - s.extract.total_ms())},
+  };
+  std::string phase_rows;
+  for (std::size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+    // Fixed widths, because this string is rebuilt continuously: without them a
+    // value gaining a digit shifts every label to its right, and columns that
+    // move cannot be read. Two decimals because three of these sat under
+    // 0.05 ms on the measured device and at one decimal were indistinguishable
+    // from "not measured" -- including `sizing`, the phase that prices a refit.
+    char cell[32];
+    std::snprintf(cell, sizeof(cell), "%-8s%6.2f", phases[i].label,
+                  phases[i].ms);
+    // The first cell continues the row label; every fourth after it opens a new
+    // row in the same 12-column gutter every other line on this read-out uses.
+    if (i == 0) {
+      phase_rows += ' ';
+    } else if (i % 4 == 0) {
+      phase_rows += "\n            ";
+    } else {
+      phase_rows += "  ";
+    }
+    phase_rows += cell;
+  }
+
+  // `pass` rather than `dispatch`: the number is how many times the surface was
+  // meshed, and `dispatch` is a duration below. Read it as cost, not as a
+  // verdict on the capacity planner -- the refit triggers against the slot's
+  // *retained* grow-only arena, not against the plan, so a plan that
+  // undershoots badly still reports one pass whenever an earlier peak left the
+  // arena large enough to absorb it.
+  std::string extract_note =
+      "  (" + std::to_string(s.extract.dispatches) + " pass)";
+  if (s.extract_stale) {
+    // Everything in `s.extract` comes from the last *successful* remesh, so say
+    // so when that is no longer this frame. Without it a breakdown frozen by a
+    // failing extract reads as current.
+    extract_note += "  [stale " + std::to_string(s.frames_since_extract) + "f]";
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
-  // upload lines can now both be present and both carry a `Status::message()`.
-  // 2048, not 1024: the two error lines each carry a library
-  // `Status::message()` and the volume-full notice alone is ~200 characters, so
-  // the phase line below pushed the worst case within truncation distance --
-  // which snprintf would take silently, cutting the read-out off mid-number.
+  // upload lines can both be present and both carry a `Status::message()`.
+  //
+  // Truncation, if it ever happened, could only cut the *tail*, and the tail is
+  // now the phase rows and the fixed body rather than the banners -- those
+  // moved to the top precisely so a clipped read-out keeps its failures.
+  // snprintf's return is discarded, so a cut would be silent either way; the
+  // buffer is sized generously rather than checked because it is stack memory
+  // and the realistic worst case measures well under half of it.
   char buf[2048];
   std::snprintf(
       buf, sizeof(buf),
-      "fused %llu / remesh %llu  v%u\n"
+      // Banners directly under the header, not at the end. They were last,
+      // which put the only two lines naming an actual failure at the bottom of
+      // an overlay that already runs past the safe area on a landscape iPhone
+      // -- so they were the first things clipped. Nothing below them is worth
+      // more screen than they are.
+      "fused %llu / remesh %llu  v%u%s%s\n"
       "  mesh      %u verts / %u tris\n"
       "  allocate  %.1f ms\n"
       "  integrate %.1f ms\n"
-      "  extract   %.1f ms  (%u dispatch)\n"
+      "  extract   %.1f ms%s\n"
       // recon's phase split, listed rather than grouped into host/GPU totals:
-      // several of these are genuinely both (`compact` is a dispatch plus its
-      // readback stall, `dispatch` covers host record *and* device execution
-      // per ExtractTimings' own doc), so any two-bucket summary here would be a
-      // guess presented as a measurement. The phases have unrelated fixes --
-      // `lut` is serial host work over the whole active set, `dispatch` is real
-      // meshing, and a persistent 2 above means the capacity planner
-      // under-guessed and the surface was meshed twice -- so the point is to
-      // see which one is large, not to total them.
-      "            compact %.1f  lut %.1f  upload %.1f  arena %.1f\n"
-      "            desc %.1f  dispatch %.1f  read %.1f\n"
+      // several are genuinely both (`compact` is a dispatch plus its readback
+      // stall, and `meshing` covers host record *and* device execution per
+      // ExtractTimings' own doc), so a two-bucket summary here would be a guess
+      // presented as a measurement. They also have unrelated fixes: the lut is
+      // serial host work over the whole active set, while meshing is the pass
+      // itself. So the point is to see which one is large. Built above, because
+      // eight more same-typed varargs in this list is a silent mislabel waiting
+      // to happen.
+      "  phases/ms%s\n"
       // The two arena numbers are on different scales, so each says which:
       // triangle_capacity is what the last extract planned for the one slot it
       // wrote, while arena_bytes is recon's sum across the whole ring. Printed
@@ -1174,21 +1256,24 @@ struct RendererImpl {
       "  arena     %u tris planned for this slot (%.2f%% full)\n"
       "            %.1f MB across %u slots / %u blocks\n"
       "  table     %u / %u blocks (%.1f%% occupied)\n"
-      "  texture   %.1f ms%s%s",
+      "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
-      static_cast<unsigned long long>(s.remeshes), s.mesh_version, s.vertices,
-      s.triangles, s.allocate_ms, s.integrate_ms, s.extract_ms, s.dispatches,
-      s.compact_ms, s.neighbour_lut_ms, s.input_upload_ms, s.arena_alloc_ms,
-      s.descriptor_ms, s.dispatch_ms, s.readback_ms, s.triangle_capacity,
-      s.triangle_capacity > 0 ? 100.0 * static_cast<double>(s.triangles) /
-                                    static_cast<double>(s.triangle_capacity)
-                              : 0.0,
-      static_cast<double>(s.arena_bytes) / (1024.0 * 1024.0), s.mesh_slots,
-      s.active_blocks, s.active_blocks, s.table_capacity,
-      s.table_capacity > 0 ? 100.0 * static_cast<double>(s.active_blocks) /
-                                 static_cast<double>(s.table_capacity)
-                           : 0.0,
-      s.texture_ms, errors.c_str(), upload.c_str());
+      static_cast<unsigned long long>(s.remeshes), s.mesh_version,
+      errors.c_str(), upload.c_str(), s.vertices, s.triangles, s.allocate_ms,
+      s.integrate_ms, s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
+      s.extract.triangle_capacity,
+      s.extract.triangle_capacity > 0
+          ? 100.0 * static_cast<double>(s.triangles) /
+                static_cast<double>(s.extract.triangle_capacity)
+          : 0.0,
+      static_cast<double>(s.extract.arena_bytes) / (1024.0 * 1024.0),
+      s.mesh_slots, s.extract.active_blocks, s.extract.active_blocks,
+      s.table_capacity,
+      s.table_capacity > 0
+          ? 100.0 * static_cast<double>(s.extract.active_blocks) /
+                static_cast<double>(s.table_capacity)
+          : 0.0,
+      s.texture_ms);
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`
