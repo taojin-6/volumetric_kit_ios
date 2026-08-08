@@ -202,6 +202,38 @@ struct FusionStats {
   /// GPU hangs: the allocate kernel's overflow path scans the whole table, so
   /// its cost per insert climbs with occupancy long before anything fails.
   std::uint32_t table_capacity = 0;
+
+  /// @name Extract phase breakdown
+  /// Where @ref extract_ms actually goes, copied straight from
+  /// `mesh::ExtractTimings`. recon has published these all along; this class
+  /// simply was not asking -- the same gap that hid `triangle_capacity`.
+  ///
+  /// Worth the read-out space because the phases have *nothing* in common as
+  /// optimisation targets, and the total cannot distinguish them. At 111k
+  /// blocks extract reached ~650 ms, and that is consistent with three
+  /// unrelated causes: @ref neighbour_lut_ms is serial host work over the whole
+  /// active set (the 2x2x2 neighbour table the sparse kernel indexes instead of
+  /// probing the hash), @ref dispatch_ms is real GPU meshing, and @ref
+  /// dispatches == 2 means the capacity planner under-guessed and the entire
+  /// surface was meshed *twice*. The first wants incremental extraction, the
+  /// second wants fewer cells, the third is a planner bug and no architecture
+  /// at all.
+  /// @{
+  float compact_ms = 0.0f;  ///< Active-block compaction (dispatch + readback).
+  float neighbour_lut_ms = 0.0f;  ///< Host-built 2x2x2 neighbour table.
+  float input_upload_ms = 0.0f;   ///< Filling the block + neighbour buffers.
+  float arena_alloc_ms = 0.0f;  ///< Arena sizing / draw-command reset / refit.
+  float descriptor_ms = 0.0f;   ///< Descriptor writes.
+  float dispatch_ms = 0.0f;  ///< The marching-cubes dispatch(es) + fence wait.
+  float readback_ms =
+      0.0f;  ///< Draw-command read (no vertex copy on this path).
+  /// Dispatches the last extract ran: 1 in the steady state, 2 when the planned
+  /// capacity was under what the field emitted and the arena had to refit and
+  /// re-run. Persistent 2s mean the planner is not tracking the surface, which
+  /// @ref dispatch_ms alone cannot show because it sums both.
+  std::uint32_t dispatches = 0;
+  /// @}
+
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
   ///

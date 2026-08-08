@@ -518,6 +518,19 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.triangle_capacity = extract_timings.triangle_capacity;
   stats_.active_blocks = extract_timings.active_blocks;
   stats_.arena_bytes = extract_timings.arena_bytes;
+  // recon's own phase split, not a re-derivation: `extract_ms` above is this
+  // call measured from here, and these are what it decomposes into. Narrowed to
+  // float to match every other timing on this struct; the double precision is
+  // meaningless against a figure the read-out prints to 0.1 ms.
+  stats_.compact_ms = static_cast<float>(extract_timings.compact_ms);
+  stats_.neighbour_lut_ms =
+      static_cast<float>(extract_timings.neighbour_lut_ms);
+  stats_.input_upload_ms = static_cast<float>(extract_timings.input_upload_ms);
+  stats_.arena_alloc_ms = static_cast<float>(extract_timings.arena_alloc_ms);
+  stats_.descriptor_ms = static_cast<float>(extract_timings.descriptor_ms);
+  stats_.dispatch_ms = static_cast<float>(extract_timings.dispatch_ms);
+  stats_.readback_ms = static_cast<float>(extract_timings.readback_ms);
+  stats_.dispatches = extract_timings.dispatches;
   // Stamped with the reading, because the reading is what `fuse`'s anti-hang
   // guards run on and a successful extract is the only thing that refreshes it.
   // Without the stamp there is no way to tell a live occupancy figure from one

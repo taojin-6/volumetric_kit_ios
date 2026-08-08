@@ -1143,14 +1143,29 @@ struct RendererImpl {
   }
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can now both be present and both carry a `Status::message()`.
-  char buf[1024];
+  // 2048, not 1024: the two error lines each carry a library
+  // `Status::message()` and the volume-full notice alone is ~200 characters, so
+  // the phase line below pushed the worst case within truncation distance --
+  // which snprintf would take silently, cutting the read-out off mid-number.
+  char buf[2048];
   std::snprintf(
       buf, sizeof(buf),
       "fused %llu / remesh %llu  v%u\n"
       "  mesh      %u verts / %u tris\n"
       "  allocate  %.1f ms\n"
       "  integrate %.1f ms\n"
-      "  extract   %.1f ms\n"
+      "  extract   %.1f ms  (%u dispatch)\n"
+      // recon's phase split, listed rather than grouped into host/GPU totals:
+      // several of these are genuinely both (`compact` is a dispatch plus its
+      // readback stall, `dispatch` covers host record *and* device execution
+      // per ExtractTimings' own doc), so any two-bucket summary here would be a
+      // guess presented as a measurement. The phases have unrelated fixes --
+      // `lut` is serial host work over the whole active set, `dispatch` is real
+      // meshing, and a persistent 2 above means the capacity planner
+      // under-guessed and the surface was meshed twice -- so the point is to
+      // see which one is large, not to total them.
+      "            compact %.1f  lut %.1f  upload %.1f  arena %.1f\n"
+      "            desc %.1f  dispatch %.1f  read %.1f\n"
       // The two arena numbers are on different scales, so each says which:
       // triangle_capacity is what the last extract planned for the one slot it
       // wrote, while arena_bytes is recon's sum across the whole ring. Printed
@@ -1162,8 +1177,9 @@ struct RendererImpl {
       "  texture   %.1f ms%s%s",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version, s.vertices,
-      s.triangles, s.allocate_ms, s.integrate_ms, s.extract_ms,
-      s.triangle_capacity,
+      s.triangles, s.allocate_ms, s.integrate_ms, s.extract_ms, s.dispatches,
+      s.compact_ms, s.neighbour_lut_ms, s.input_upload_ms, s.arena_alloc_ms,
+      s.descriptor_ms, s.dispatch_ms, s.readback_ms, s.triangle_capacity,
       s.triangle_capacity > 0 ? 100.0 * static_cast<double>(s.triangles) /
                                     static_cast<double>(s.triangle_capacity)
                               : 0.0,
