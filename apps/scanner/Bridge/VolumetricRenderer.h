@@ -116,12 +116,32 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// screen; a second call while fusion is already running does nothing.
 - (void)startFusionWithCapture:(VolumetricCapture*)capture;
 
+/// @brief Ask the fuse thread to stop, without waiting for it.
+///
+/// Clears the flag the loop tests between iterations and returns immediately.
+/// Idempotent, and safe on a renderer that never started.
+///
+/// Exists so a caller on the main thread can stop new work being submitted
+/// *now* and pay for the join somewhere else. @ref stopFusion has to wait out
+/// the whole iteration in progress — a resize, a grow loop, an allocate, an
+/// integrate and an extract, each ending in a `vkWaitForFences` with no
+/// timeout — which is hundreds of milliseconds routinely and seconds on a large
+/// scan. Backgrounding runs through a `UIApplication` notification handler on
+/// the main thread, and blocking it for that long is a watchdog kill.
+///
+/// This is not a substitute for @ref stopFusion: until that returns, the thread
+/// is still running and still dereferencing the capture handle.
+- (void)beginStopFusion;
+
 /// @brief Stop the fuse thread, join it, and release the capture.
 ///
 /// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
 /// so a dropped renderer cannot leave the thread running — but call it
 /// explicitly when leaving the screen, because until it returns the thread is
 /// still submitting recon work on the shared queue.
+///
+/// **Blocks** for as long as the iteration in progress takes; see
+/// @ref beginStopFusion for the non-blocking half and why the two are split.
 - (void)stopFusion;
 
 /// Draw the reconstructed mesh rather than the bring-up triangle. The triangle

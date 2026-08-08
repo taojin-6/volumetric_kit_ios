@@ -150,14 +150,20 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
   // below indexes `conf_row` as bytes, so a map that was not
   // `OneComponent8` would be read at the wrong stride and gate on values that
   // are not confidence levels at all.
-  const bool confidence_matches =
-      confidence_buffer != nullptr &&
+  // Two separate questions, and collapsing them into one is what made this fail
+  // open: whether ARKit handed over a confidence map at all, and whether it is
+  // one this loop can read. Gating is committed by the *first*; a map that is
+  // present but unreadable must refuse the frame, not fall through to an
+  // ungated copy.
+  const bool confidence_present = confidence_buffer != nullptr;
+  const bool confidence_readable =
+      confidence_present &&
       CVPixelBufferGetPixelFormatType(confidence_buffer) ==
           kCVPixelFormatType_OneComponent8 &&
       CVPixelBufferGetWidth(confidence_buffer) == width &&
       CVPixelBufferGetHeight(confidence_buffer) == height;
-  const PixelBufferLock confidence_lock(confidence_matches ? confidence_buffer
-                                                           : nullptr);
+  const PixelBufferLock confidence_lock(confidence_readable ? confidence_buffer
+                                                            : nullptr);
 
   const std::uint8_t* conf = nullptr;
   std::size_t conf_stride = 0;
@@ -171,8 +177,14 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
   // 100% because `kept` counts exactly the samples that were let through.
   // `CVPixelBufferGetBaseAddress` returns NULL for IOSurface-backed buffers
   // even after a successful lock, so the null check is not theoretical.
-  if (confidence_matches) {
-    if (!confidence_lock.locked()) {
+  //
+  // Gated on `confidence_present`, not on `confidence_readable`. The wrong one
+  // of those was the whole fail-open: a map of an unexpected size or pixel
+  // format skipped this block entirely, left `conf` null, and made `trusted`
+  // unconditionally true below -- so the refusal added here for an unreadable
+  // map never covered the case where the map itself did not match.
+  if (confidence_present) {
+    if (!confidence_readable || !confidence_lock.locked()) {
       return std::nullopt;
     }
     conf = static_cast<const std::uint8_t*>(

@@ -24,20 +24,57 @@ float ms_since(Clock::time_point t0) {
 /// budget resizing.
 constexpr int kMaxGrowAttempts = 5;
 
+/// Blocks per bucket, which is `VoxelGridParams::bucket_size` below.
+///
+/// Named once rather than written as an `8` wherever the block-table capacity
+/// is derived: the occupancy guards divide by this, and a bucket size changed
+/// at the grid params with the guards left restating the old one would silently
+/// mis-scale the very thresholds that keep the allocate kernel out of its
+/// pathological regime.
+constexpr std::int32_t kBlocksPerBucket = 8;
+
+/// The floor on `FusionConfig::mesh_slots`; see that field.
+constexpr std::uint32_t kMinMeshSlots = 2;
+
+/// How many remeshes' worth of fused frames an occupancy reading may go
+/// unrefreshed before it is treated as unusable rather than current.
+///
+/// Several rather than one: a remesh legitimately skips its extract when the
+/// renderer has not collected the last mesh (see @ref Fusion::remesh), so a
+/// one-remesh window would trip on the steady state.
+constexpr std::uint64_t kMaxStaleRemeshes = 4;
+
 }  // namespace
 
 vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
                          const FusionConfig& config) {
+  // Refused, not clamped, and refused here rather than trusted from the caller.
+  // At one slot recon reuses a single arena in place and `release_through`
+  // changes no behaviour -- so every DeviceMesh this class publishes would be
+  // valid only until the next extract, while the renderer draws it. The failure
+  // is a destroyed VkBuffer under a live draw, which raises no Status and no
+  // validation message on iOS; a start() that refuses is the only place it can
+  // still be said out loud. See FusionConfig::mesh_slots.
+  if (config.mesh_slots < kMinMeshSlots) {
+    return vr::Status::invalid_argument(
+        "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
+        ", which switches recon's slot-release contract off; Published::mesh "
+        "borrows the extractor's buffers, so it needs at least " +
+        std::to_string(kMinMeshSlots) +
+        " (and the consumer's frames in flight "
+        "plus one to actually pipeline).");
+  }
   config_ = config;
+  stats_.mesh_slots = config.mesh_slots;
 
   vr::volume::VoxelGridParams grid{};
   grid.voxel_size = config.voxel_size;
   grid.block_size = 8;
   grid.voxels_per_block = 512;  // 8^3
   grid.trunc_dist = config.trunc_dist;
-  grid.bucket_size = 8;
+  grid.bucket_size = kBlocksPerBucket;
   grid.num_buckets = config.num_buckets;
-  grid.num_blocks = config.num_buckets * 8;
+  grid.num_blocks = config.num_buckets * kBlocksPerBucket;
   grid.max_chain = 128;
 
   // tsdf + weight are what the integrator writes; color is what makes the
@@ -109,6 +146,36 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // left no trace anywhere -- the read-out showed a rising vertex count and an
   // empty error line while a whole region of the scan quietly never filled.
   std::string frame_error;
+  // Whether that error is a *stage failure* rather than a report of an expected
+  // outcome. Only the former reaches `stats_.errors` -- see that field: dropped
+  // blocks and a volume at its ceiling are the common case on a healthy scan,
+  // and counting them made the one genuine failure impossible to see.
+  bool frame_stage_failed = false;
+
+  // --- Is the occupancy reading still live? --------------------------------
+  //
+  // Both guards below read `stats_.active_blocks`, and the only thing that
+  // writes it is a *successful* extract in remesh. So a persistent extract
+  // failure -- a refit that runs out of memory, a capacity past
+  // maxStorageBufferRange -- freezes the numerator while the real table goes on
+  // filling, and the guards then wave through exactly the regime they exist to
+  // prevent. Worse, they do it silently: the read-out keeps printing the frozen
+  // count as though the protection were live.
+  //
+  // Measured in fused frames rather than trusted, because the reading has a
+  // legitimate lag: it refreshes every `remesh_every` frames, and a remesh
+  // skips its extract outright when the renderer has not collected the last
+  // mesh. A window several remeshes wide is therefore quiet in normal operation
+  // and trips promptly when extracts actually stop.
+  //
+  // Past it the table is treated as full, which is the safe direction: new
+  // allocation stops, everything already in the table keeps fusing, and the
+  // reason says the reading is stale rather than implying a healthy volume.
+  const std::uint64_t stale_after =
+      kMaxStaleRemeshes * std::max<std::uint32_t>(config_.remesh_every, 1u);
+  const bool occupancy_stale =
+      active_blocks_measured_ &&
+      stats_.frames_fused - active_blocks_at_frame_ > stale_after;
 
   // --- Grow *ahead* of density, before allocating into it -------------------
   //
@@ -132,9 +199,10 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // The reactive path below stays as a backstop for a frame that fills the
   // table faster than one doubling absorbs.
   constexpr float kGrowAtOccupancy = 0.7f;
-  if (stats_.active_blocks > 0 && config_.num_buckets < config_.max_buckets) {
-    const float capacity =
-        static_cast<float>(config_.num_buckets) * 8.0f;  // blocks per bucket
+  if (!occupancy_stale && stats_.active_blocks > 0 &&
+      config_.num_buckets < config_.max_buckets) {
+    const float capacity = static_cast<float>(config_.num_buckets) *
+                           static_cast<float>(kBlocksPerBucket);
     if (static_cast<float>(stats_.active_blocks) >
         capacity * kGrowAtOccupancy) {
       const std::int32_t grown_to =
@@ -147,6 +215,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         // allocate below still works -- more slowly. Reported rather than
         // returned so the frame still fuses.
         frame_error = "preemptive resize: " + grown.message();
+        frame_stage_failed = true;
       }
     }
   }
@@ -168,9 +237,11 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // just was not actually enforced anywhere, and the unenforced version was a
   // GPU hang.
   constexpr float kRefuseAllocateAtOccupancy = 0.85f;
-  const float table_capacity = static_cast<float>(config_.num_buckets) * 8.0f;
-  const bool table_exhausted = static_cast<float>(stats_.active_blocks) >
-                               table_capacity * kRefuseAllocateAtOccupancy;
+  const float table_capacity = static_cast<float>(config_.num_buckets) *
+                               static_cast<float>(kBlocksPerBucket);
+  const bool table_exhausted =
+      occupancy_stale || static_cast<float>(stats_.active_blocks) >
+                             table_capacity * kRefuseAllocateAtOccupancy;
 
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
@@ -180,12 +251,27 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
                       : grid_->map().allocate_from_depth(
                             frame.depth, frame.depth_camera, &failures);
   if (table_exhausted && frame_error.empty()) {
-    frame_error =
-        "volume full: " + std::to_string(stats_.active_blocks) + " of " +
-        std::to_string(static_cast<std::int64_t>(table_capacity)) +
-        " blocks at the " + std::to_string(config_.max_buckets) +
-        "-bucket ceiling; not allocating new blocks (existing surface still "
-        "fusing). Raise max_buckets or use a coarser voxel_size.";
+    // Two different situations, and the difference is the whole point of
+    // saying which: a full volume is the documented trade working, while a
+    // stale reading means the guard has no idea how full the table is and has
+    // stopped allocating *because* it cannot tell. Reporting the second as
+    // "volume full" would name a cause the user could act on when the real one
+    // is upstream, in whatever is failing every extract.
+    if (occupancy_stale) {
+      frame_error =
+          "occupancy unknown: no extract has measured the block table for " +
+          std::to_string(stats_.frames_fused - active_blocks_at_frame_) +
+          " fused frames (last read " + std::to_string(stats_.active_blocks) +
+          " blocks); not allocating new blocks until it does. See the extract "
+          "error above.";
+    } else {
+      frame_error =
+          "volume full: " + std::to_string(stats_.active_blocks) + " of " +
+          std::to_string(static_cast<std::int64_t>(table_capacity)) +
+          " blocks at the " + std::to_string(config_.max_buckets) +
+          "-bucket ceiling; not allocating new blocks (existing surface still "
+          "fusing). Raise max_buckets or use a coarser voxel_size.";
+    }
   }
   if (!overflow) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -296,6 +382,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     last_pose_ = frame.depth_camera.cam_to_world;
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
+    // Refreshed here rather than in remesh, where it used to sit: it is derived
+    // from `config_.num_buckets`, which *this* function grows, so publishing it
+    // only on a successful extract left the read-out dividing a fresh block
+    // count by a capacity from before the last doubling -- an occupancy figure
+    // that could read over 100%.
+    stats_.table_capacity =
+        static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
     // Assigned, not cleared: a frame that fused with dropped blocks says so.
     //
     // This assignment is also what makes `errors` load-bearing. It runs every
@@ -304,7 +397,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // thread's exception guard noted -- because those happen after this point
     // in the frame and this is the next thing to touch `last_error`. The
     // counter is the part that does not get overwritten.
-    if (!frame_error.empty()) {
+    //
+    // Gated on `frame_stage_failed`, not on the message being non-empty. Most
+    // of what lands in `frame_error` is a report of an expected outcome --
+    // blocks lost to bucket-lock contention, which happens on nearly every
+    // frame, and a volume at its ceiling, which republishes every frame it
+    // keeps fusing. Counting those ran the total to four figures within a
+    // minute of a clean scan and buried the failures the counter is for.
+    if (frame_stage_failed) {
       ++stats_.errors;
     }
     stats_.last_error = frame_error;
@@ -316,6 +416,56 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 }
 
 void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
+  // --- Hand the consumer's release to recon, on this thread -----------------
+  //
+  // `MarchingCubes::release_through` is not atomic, and its header makes
+  // serializing it against the extracting thread a caller obligation: calling
+  // it concurrently with an `extract_device` on the same object is a data race,
+  // and a stale read of the mark makes `claim_output_slot` refuse with "every
+  // output slot is still outstanding" -- which then freezes the occupancy guard
+  // in `fuse` and is self-sustaining. So `Fusion::release_through` only records
+  // the mark, and it is applied here, on the fuse thread. Nothing else in this
+  // class touches the extractor, so recon sees exactly one thread.
+  //
+  // *Before* the extract, not after. This release is what makes room for the
+  // extract below; running it afterwards kept the ring permanently one slot
+  // shallower than its depth suggests, and on a failing extract the early
+  // return skipped it altogether -- stranding the slot whose absence caused the
+  // failure, which is how the ring stalled for good.
+  std::uint64_t consumer_released = 0;
+  bool uncollected = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    consumer_released = consumer_released_;
+    uncollected = !published_taken_ && published_generation_ != 0;
+  }
+  if (consumer_released != 0) {
+    marching_cubes_->release_through(consumer_released);
+  }
+
+  // --- Do not publish over a mesh nobody collected --------------------------
+  //
+  // It still holds its slot, and freeing that slot is not something this side
+  // can do: `release_through` is a monotonic high-water mark, so releasing the
+  // uncollected generation retires every *older* one with it -- including the
+  // generations the renderer's in-flight frames are drawing out of. recon
+  // reclaims one, a grow frees its buffers outright (`vmaDestroyBuffer`, no
+  // fence wait), and the live `vkCmdDrawIndexedIndirect` reads a destroyed
+  // VkBuffer: VK_ERROR_DEVICE_LOST, which is the fault this seam was built to
+  // remove. recon does have a single-slot primitive for this and keeps it
+  // private (`free_slot_of`), precisely because the high-water mark is the
+  // consumer's to move and not the producer's.
+  //
+  // So the uncollected mesh is left where it is and this extract simply does
+  // not run. Its result would have been thrown away regardless, so the skip
+  // costs nothing and saves the dispatch -- and it is what lets the ring be the
+  // consumer's frames in flight plus one instead of plus two. The renderer
+  // collects on every frame it draws, so in the steady state this skips at most
+  // one remesh.
+  if (uncollected) {
+    return;
+  }
+
   const auto t_extract = Clock::now();
   vr::mesh::ExtractTimings extract_timings{};
   vr::Result<vr::mesh::DeviceMesh> device_mesh =
@@ -351,17 +501,11 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
 
   // No host copy. The renderer draws these very buffers -- interop seam B --
   // so the ~53 MB round trip per remesh that seam A cost is simply not here.
-  // What replaces it is the release contract below: the slot this mesh lives in
-  // is not extracted into again until the consumer says it has finished.
+  // What replaces it is the release contract handled at the top of this
+  // function: the slot this mesh lives in is not extracted into again until the
+  // consumer says it has finished with it.
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // A mesh published but never taken still holds a slot. Fusion outruns the
-  // render loop routinely -- it remeshes every fused frame -- so without this
-  // the ring drains to nothing within a second and every later extract fails
-  // with "every output slot is still outstanding".
-  if (!published_taken_ && published_generation_ != 0) {
-    marching_cubes_->release_through(published_generation_);
-  }
   mesh_ = device_mesh.value();
   published_generation_ = device_mesh.value().generation;
   published_taken_ = false;
@@ -374,7 +518,12 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.triangle_capacity = extract_timings.triangle_capacity;
   stats_.active_blocks = extract_timings.active_blocks;
   stats_.arena_bytes = extract_timings.arena_bytes;
-  stats_.table_capacity = static_cast<std::uint32_t>(config_.num_buckets) * 8u;
+  // Stamped with the reading, because the reading is what `fuse`'s anti-hang
+  // guards run on and a successful extract is the only thing that refreshes it.
+  // Without the stamp there is no way to tell a live occupancy figure from one
+  // frozen by an extract that has been failing for a minute.
+  active_blocks_at_frame_ = stats_.frames_fused;
+  active_blocks_measured_ = true;
   stats_.texture_ms = texture_ms;
 }
 
@@ -400,10 +549,18 @@ std::optional<Fusion::Published> Fusion::take_mesh(
 
 void Fusion::release_through(std::uint64_t generation) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!marching_cubes_) {
-    return;
-  }
-  marching_cubes_->release_through(generation);
+  // Recorded, not forwarded. recon's extractor is touched by the fuse thread
+  // and only the fuse thread; `remesh` applies this at the top of its next run.
+  // Forwarding from here would race `extract_device` -- recon's header names
+  // that a caller obligation rather than making the member atomic -- and the
+  // repair that would keep the call here, holding this mutex across the
+  // extract, blocks the caller for a whole extract. The caller is the render
+  // thread, which on this app is the main thread.
+  //
+  // Monotonic, matching the contract it stands in for: a generation already
+  // released stays released, and a value older than the newest reported is
+  // ignored rather than un-releasing anything.
+  consumer_released_ = std::max(consumer_released_, generation);
 }
 
 void Fusion::note_error(const std::string& message) {
