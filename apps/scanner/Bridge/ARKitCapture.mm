@@ -145,18 +145,53 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
   // documents one confidence value per depth value but does not guarantee the
   // sizes in the type, and a smaller map would be read past its end -- for the
   // sake of a check that costs two comparisons a frame.
-  const bool confidence_matches =
-      confidence_buffer != nullptr &&
+  //
+  // The format is checked for the same reason the depth buffer's is: the loop
+  // below indexes `conf_row` as bytes, so a map that was not
+  // `OneComponent8` would be read at the wrong stride and gate on values that
+  // are not confidence levels at all.
+  // Two separate questions, and collapsing them into one is what made this fail
+  // open: whether ARKit handed over a confidence map at all, and whether it is
+  // one this loop can read. Gating is committed by the *first*; a map that is
+  // present but unreadable must refuse the frame, not fall through to an
+  // ungated copy.
+  const bool confidence_present = confidence_buffer != nullptr;
+  const bool confidence_readable =
+      confidence_present &&
+      CVPixelBufferGetPixelFormatType(confidence_buffer) ==
+          kCVPixelFormatType_OneComponent8 &&
       CVPixelBufferGetWidth(confidence_buffer) == width &&
       CVPixelBufferGetHeight(confidence_buffer) == height;
-  const PixelBufferLock confidence_lock(confidence_matches ? confidence_buffer
-                                                           : nullptr);
+  const PixelBufferLock confidence_lock(confidence_readable ? confidence_buffer
+                                                            : nullptr);
 
   const std::uint8_t* conf = nullptr;
   std::size_t conf_stride = 0;
-  if (confidence_lock.locked()) {
+  // Committed to gating the moment the map matched, so a failure to actually
+  // read it refuses the frame rather than falling through to an ungated copy.
+  // Failing open here is the one failure mode nothing downstream can see:
+  // `conf_row` would be null, `trusted` unconditionally true, and every
+  // ARConfidenceLevelLow sample -- the ones this file's header calls
+  // "frequently metres wrong at depth discontinuities" -- would carve free
+  // space into the volume permanently, while `confidence_kept` still reported
+  // 100% because `kept` counts exactly the samples that were let through.
+  // `CVPixelBufferGetBaseAddress` returns NULL for IOSurface-backed buffers
+  // even after a successful lock, so the null check is not theoretical.
+  //
+  // Gated on `confidence_present`, not on `confidence_readable`. The wrong one
+  // of those was the whole fail-open: a map of an unexpected size or pixel
+  // format skipped this block entirely, left `conf` null, and made `trusted`
+  // unconditionally true below -- so the refusal added here for an unreadable
+  // map never covered the case where the map itself did not match.
+  if (confidence_present) {
+    if (!confidence_readable || !confidence_lock.locked()) {
+      return std::nullopt;
+    }
     conf = static_cast<const std::uint8_t*>(
         CVPixelBufferGetBaseAddress(confidence_buffer));
+    if (conf == nullptr) {
+      return std::nullopt;
+    }
     conf_stride = CVPixelBufferGetBytesPerRow(confidence_buffer);
   }
 
@@ -399,6 +434,28 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   out.color_refused = false;
 
   if (CVPixelBufferGetPlaneCount(image) < 2) {
+    return false;
+  }
+  // The conversion is generated for 8-bit *full-range* 420 bi-planar and
+  // nothing else (see `conversion_for`), so the buffer's format has to be
+  // checked rather than assumed from its plane count. Two reachable formats
+  // carry two planes and would otherwise sail straight through the gate above:
+  //
+  //   - `420YpCbCr8BiPlanarVideoRange` -- luma 16-235 expanded as 0-255,
+  //     crushing blacks and clipping highlights into the volume permanently.
+  //   - `420YpCbCr10BiPlanarFullRange` -- what ARKit delivers once
+  //     `videoHDRAllowed` is set, read as 8-bit and so simply scrambled.
+  //
+  // Neither errors; both fuse plausible garbage while the read-out reports a
+  // clean canonical frame. `copy_depth` checks its own buffer's format for
+  // exactly this reason, and says so in the same words.
+  //
+  // Refused rather than silently dropped, so an unexpected format shows up on
+  // the read-out as a named refusal instead of colour going quietly missing.
+  if (CVPixelBufferGetPixelFormatType(image) !=
+      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+    out.color_matrix = "unsupported pixel format";
+    out.color_refused = true;
     return false;
   }
   // Plane geometry does not need the base-address lock; only the pixels do.

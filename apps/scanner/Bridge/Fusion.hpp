@@ -82,23 +82,30 @@ struct FusionConfig {
   std::int32_t num_buckets = 1024;
   /// Ceiling on that growth, in buckets.
   ///
-  /// 4096 is 192 MiB resident, and ~288 MiB transiently at the doubling that
-  /// reaches it: `VoxelBlockGrid::resize` builds the grown buffers alongside
-  /// the old ones and commits only once the map resize succeeds. Past that a
-  /// phone is into jetsam range, where the app *disappears* rather than
-  /// surfacing the OutOfMemory that recon is written to report. Refusing to
-  /// grow instead leaves a scan that is missing far geometry, still running,
-  /// and saying so in @ref FusionStats::last_error.
+  /// `VoxelBlockGrid::resize` builds the grown buffers alongside the old ones
+  /// and commits only once the map resize succeeds, so each doubling costs
+  /// ~1.5x the new size transiently. 16384 buckets is ~768 MiB resident and
+  /// ~1.1 GiB at the doubling that reaches it -- an iPad-Pro number, not a
+  /// phone number. Lower it for phone builds.
   ///
-  /// **At 1 cm this ceiling covers ~4x less scene than it did at 2 cm** -- it
-  /// bounds blocks, and the finer voxel needs ~4x of them for the same
-  /// surface. So this reaches roughly a large tabletop rather than a room. It
-  /// is deliberately *not* raised to compensate: 16384 would be 768 MiB
-  /// resident and ~1.1 GiB at the doubling, and the jetsam argument above is
-  /// the reason the number is what it is. Raise it for a room-scale scan on a
-  /// device with the headroom (an iPad Pro, not a phone) -- and know that the
-  /// failure it prevents is graceful and reported, not a crash.
-  std::int32_t max_buckets = 4096;
+  /// **What this ceiling does is now enforced, which it previously was not.**
+  /// It was 4096, and reaching it meant the table simply kept filling: the
+  /// allocate kernel's overflow path scans every entry, so its cost per insert
+  /// climbs with occupancy, and at 31480 of 32768 blocks (96%) on an M5 iPad
+  /// Pro it hung the GPU outright rather than reporting anything. The stated
+  /// intent -- "a scan that is missing far geometry, still running, and saying
+  /// so" -- lived only in this comment. @ref Fusion::fuse now stops allocating
+  /// past 85% occupancy, which is what makes that true, and is why a *lower*
+  /// ceiling now costs coverage rather than stability.
+  ///
+  /// **At 1 cm this covers ~4x less scene than at 2 cm** -- it bounds blocks,
+  /// and the finer voxel needs ~4x of them for the same surface. 16384 reaches
+  /// roughly a small room at 1 cm; a 5 m walk filled it (111542 of 131072
+  /// blocks). Coarsening @ref voxel_size buys area ~4x faster than raising this
+  /// does, and costs no memory. Raising it further needs the
+  /// `extended-virtual-addressing` entitlement, which a personal signing team
+  /// cannot provision -- see apps/scanner/scanner.entitlements.
+  std::int32_t max_buckets = 16384;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
   /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
@@ -121,12 +128,43 @@ struct FusionConfig {
   /// would render every surface the depth camera is currently looking at flat
   /// white and discard the colour the TSDF fused there.
   ///
-  /// @ref Fusion::Published now carries the colour frame across the seam beside
-  /// the mesh whose `uv0` indexes it, which is the producing half. The
-  /// consuming half -- a ring of atlas images the renderer streams into and
-  /// binds per slot -- is not built yet, and *this flag is what gates the
-  /// feature on it*. Flip it in the change that lands the ring.
+  /// Neither half is built. @ref Fusion::Published carries the mesh and nothing
+  /// else -- the colour frame it would index crossed the seam under interop
+  /// seam A and does not any more -- and the consuming half, a ring of atlas
+  /// images the renderer streams into and binds per slot, was never written.
+  /// *This flag is what gates the feature on both of them.* Flip it in the
+  /// change that lands the ring, not before: on its own it renders every
+  /// surface the depth camera is looking at flat white.
   bool texture = false;
+
+  /// @brief How many extracted meshes may be outstanding at once.
+  ///
+  /// Passed through to `MarchingCubesConfig::slot_count`, and **two is the
+  /// floor**: @ref Fusion::start refuses anything lower rather than running
+  /// with it. One is recon's own default and means a single arena reused in
+  /// place, with `release_through` recording a number and changing no
+  /// behaviour -- but every @ref Published::mesh here is a *borrowed*
+  /// @ref vr::mesh::DeviceMesh, so at one slot the next extract overwrites the
+  /// buffers an in-flight draw is reading, and a grow frees them outright
+  /// (`vmaDestroyBuffer`, no fence wait). That is silent geometry corruption or
+  /// a GPU fault, raised as neither a Status nor a validation message, and it
+  /// is not a state worth leaving one defaulted field away.
+  ///
+  /// Two only *arms* the contract. A consumer drawing these buffers has to size
+  /// it to its own frames in flight plus one, which is what the renderer passes
+  /// (`RendererImpl::kMeshSlots`). Each slot costs a full vertex arena, so
+  /// higher is not free -- see recon's `slot_count`.
+  std::uint32_t mesh_slots = 2;
+
+  /// @brief The queue families that will touch the mesh buffers.
+  ///
+  /// Both of them, unconditionally -- recon reduces the pair to its distinct
+  /// entries and picks EXCLUSIVE where they turn out to be one family. Under
+  /// the two-family queue plan a phone actually gets, they differ, and a mesh
+  /// created EXCLUSIVE would be read by a family that does not own it: silently
+  /// undefined, not an error.
+  std::uint32_t queue_families[2] = {0, 0};
+  std::uint32_t queue_family_count = 0;
 };
 
 /// @brief What the last fuse/remesh cost and produced, for the read-out.
@@ -141,9 +179,53 @@ struct FusionStats {
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
+  /// What the last extract's arena was *planned* for, and what it cost.
+  ///
+  /// Reported because the mesh size does not imply either: the arena is sized
+  /// from a per-block triangle estimate times the active-block count, so a plan
+  /// that drifts high allocates hundreds of megabytes to hold a few thousand
+  /// triangles -- and the read-out showed only the few thousand.
+  ///
+  /// The two are *not* the same scale, and printing them side by side without
+  /// saying so overstated one slot by the slot count: `triangle_capacity` is
+  /// what the last extract planned for the one slot it wrote, while
+  /// `arena_bytes` is recon's sum across the whole ring (its `ExtractTimings`
+  /// documents it as the total). @ref mesh_slots is carried so the read-out can
+  /// name which is which.
+  std::uint32_t triangle_capacity = 0;
+  std::uint64_t arena_bytes = 0;
+  /// How many slots that arena is spread over -- `FusionConfig::mesh_slots`,
+  /// echoed here so the read-out needs no second source for it.
+  std::uint32_t mesh_slots = 0;
+  /// Block-table capacity (`num_buckets * 8`), so the read-out can show
+  /// occupancy against @ref active_blocks. This is the number that matters for
+  /// GPU hangs: the allocate kernel's overflow path scans the whole table, so
+  /// its cost per insert climbs with occupancy long before anything fails.
+  std::uint32_t table_capacity = 0;
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
+  ///
+  /// Most-recent-wins, and that is the whole reason @ref errors exists beside
+  /// it: `fuse` republishes its own per-frame error every frame, so a failure
+  /// raised by a *later* stage -- extract, texture, or the fuse thread's
+  /// exception guard -- survives only until the next frame is published. At 60
+  /// Hz a persistent extract failure was therefore visible for under 16 ms at a
+  /// time and read as a clean scan with a frozen mesh.
   std::string last_error;
+  /// How many stage failures have been raised since `start`. Monotonic, so a
+  /// fault that @ref last_error cannot hold still onto is visible as a rising
+  /// count -- the same shape as the renderer's mesh-upload counter, and for the
+  /// same reason.
+  ///
+  /// **Stage failures only**, which is narrower than "frames that reported
+  /// something in @ref last_error". Dropped blocks are the common case, not a
+  /// failure: adjacent LiDAR pixels dilate into the same block and the kernel's
+  /// bucket lock gives up after a bounded number of retries, so a healthy scan
+  /// reports lost races on nearly every frame, and a full volume republishes
+  /// its notice every frame it keeps fusing. Counting those made the banner
+  /// read `! errors x1800` after thirty seconds of a clean scan, which buried
+  /// the single extract failure this counter exists to surface.
+  std::uint64_t errors = 0;
 };
 
 /// @brief Fuses captured frames into a volume and extracts a drawable mesh.
@@ -197,18 +279,44 @@ class Fusion {
   /// textured triangle samples the wrong place. They are published, versioned,
   /// and taken as one.
   struct Published {
-    vr::mesh::Mesh mesh;
+    /// The extractor's own buffers, borrowed. Nothing is copied to the host at
+    /// all -- this is interop seam B, and the ~53 MB round trip per remesh that
+    /// seam A cost is exactly what it removes.
+    ///
+    /// Valid until its slot is reused, which cannot happen before the consumer
+    /// releases it: see @ref release_through.
+    vr::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
-    /// The colour frame that textured @ref mesh, canonical-encoded and packed
-    /// RGBA8. Empty when the frame carried no colour, or texturing is off.
-    std::vector<std::uint32_t> atlas;
-    std::uint32_t atlas_width = 0;
-    std::uint32_t atlas_height = 0;
-
-    bool has_atlas() const noexcept { return !atlas.empty(); }
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
+
+  /// @brief Report that every mesh up to @p generation has been drawn, so its
+  ///        slot may be extracted into again.
+  ///
+  /// The consumer half of the ring. Call it as the frames that drew a
+  /// @ref Published::mesh retire -- for the render loop, once the frame's fence
+  /// has signalled.
+  ///
+  /// Host-side, and that is the whole design rather than a simplification: a
+  /// semaphore the extract waited on would deadlock against a swapchain
+  /// rebuild, which drains the queue while holding the submit mutex (see the
+  /// warning at the top of this file). Reporting completion after the fact
+  /// cannot.
+  ///
+  /// Takes recon's @ref vr::mesh::DeviceMesh::generation, not @ref
+  /// Published::version -- the two number different things, and the ring is
+  /// recon's.
+  ///
+  /// **This records the mark; it does not hand it to recon.** The fuse thread
+  /// applies it at the top of its next remesh, which is what keeps recon's
+  /// extractor single-threaded. `MarchingCubes::release_through` is not atomic
+  /// and its header makes serializing it against the extracting thread a caller
+  /// obligation -- calling it from here would race `extract_device` on the fuse
+  /// thread, and the obvious repair (hold the publish mutex across the extract)
+  /// would block this thread, the *main* thread, for the length of a whole
+  /// extract. Deferring costs at most one remesh of latency and no lock at all.
+  void release_through(std::uint64_t generation);
 
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
@@ -232,14 +340,41 @@ class Fusion {
   std::uint64_t captured_ = 0;
 
   mutable std::mutex mutex_;
-  vr::mesh::Mesh mesh_;
-  /// Published beside mesh_ and taken with it -- see Published. Refilled on the
-  /// fuse thread and moved out by the consumer, so neither the copy in nor the
-  /// hand-off costs anything under the lock.
-  std::vector<std::uint32_t> atlas_;
-  std::uint32_t atlas_width_ = 0;
-  std::uint32_t atlas_height_ = 0;
+  // The published view of the extractor's buffers -- handles and counts, not
+  // bytes. Copying it is copying five words.
+  vr::mesh::DeviceMesh mesh_;
   std::uint32_t mesh_version_ = 0;
+  // recon's generation for the mesh currently published, and whether anyone has
+  // taken it. Fusion outruns the render loop routinely -- it remeshes every
+  // fused frame -- so a mesh can be superseded before the renderer ever asks
+  // for it, and that mesh still holds a slot.
+  //
+  // What `remesh` does about it is *not extract*. Publishing over it and
+  // releasing the old generation is the obvious move and it is unsound: recon's
+  // release_through is a monotonic high-water mark, so releasing the untaken
+  // generation also retires every older one -- including the generation the
+  // renderer's in-flight frames are still drawing out of. recon has a
+  // single-slot primitive for this (`free_slot_of`) and keeps it private,
+  // precisely because the high-water mark is the consumer's to move.
+  //
+  // Skipping costs nothing: the extract that would have been thrown away is
+  // simply not run, so the ring never needs the extra slot and the GPU never
+  // does the work. The renderer takes every frame it draws, so the skip lasts
+  // one frame in the steady state.
+  std::uint64_t published_generation_ = 0;
+  bool published_taken_ = true;
+  // The consumer's high-water mark, recorded by @ref release_through and handed
+  // to recon by the fuse thread at the top of the next remesh. See that method:
+  // this indirection is what keeps recon's extractor single-threaded.
+  std::uint64_t consumer_released_ = 0;
+  // `stats_.frames_fused` as of the last extract that actually measured
+  // occupancy. The anti-hang guards in @ref fuse read `stats_.active_blocks`,
+  // which only a successful extract refreshes, so this is what tells a live
+  // reading from one frozen by a persistent extract failure -- at which point
+  // the guards would otherwise be reading a number that stopped tracking
+  // reality and waving a filling table through.
+  std::uint64_t active_blocks_at_frame_ = 0;
+  bool active_blocks_measured_ = false;
   vr::Mat4f last_pose_{1.0f};
   FusionStats stats_{};
 };

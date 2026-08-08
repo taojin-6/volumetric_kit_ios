@@ -131,7 +131,23 @@ set_target_properties(
              XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"
              XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
              XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${VI_DEVELOPMENT_TEAM}"
-             XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development")
+             XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development"
+             # ~~~
+             # increased-memory-limit. A live 1 cm reconstruction holds
+             # gigabytes: the run that motivated this held 3 GB of mesh arena
+             # beside a 0.8 GB voxel grid and was SIGKILLed by jetsam, which
+             # reports nothing -- the process just disappears. See
+             # scanner.entitlements, which also records why
+             # extended-virtual-addressing is *not* here (a personal development
+             # team cannot provision it, and its presence fails the build rather
+             # than being dropped).
+             #
+             # Capability entitlements fail signing loudly when the App ID lacks
+             # them, which is the good outcome -- a silently dropped entitlement
+             # would look like a fix that quietly is not one.
+             # ~~~
+             XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
+             "${CMAKE_CURRENT_SOURCE_DIR}/scanner.entitlements")
 
 if(NOT VI_DEVELOPMENT_TEAM)
   message(

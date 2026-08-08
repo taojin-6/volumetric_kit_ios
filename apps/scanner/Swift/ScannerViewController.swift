@@ -18,6 +18,34 @@ final class ScannerViewController: UIViewController {
   private let statusLabel = UILabel()
   private var cameraGestures: CameraGestureController?
 
+  /// Whether the capture + fuse + draw loop is running, so a resume cannot
+  /// start a second ARSession or a second fuse thread and a suspend cannot
+  /// wind the same one down twice.
+  private var isCapturing = false
+  /// On screen and foregrounded are tracked separately because only one of them
+  /// has a view callback. `viewDidDisappear` does **not** fire on backgrounding,
+  /// which is exactly how a backgrounded scan kept fusing: the display link
+  /// suspends on its own, but the fuse thread is a plain `std::thread` that goes
+  /// on submitting recon work — Metal submits from a backgrounded process, which
+  /// iOS terminates the app for.
+  private var isOnScreen = false
+  private var isBackgrounded = false
+  /// Bring-up runs off the main thread now, so this is what stops a second
+  /// layout pass from starting a second one while the first is in flight.
+  private var bringUpInFlight = false
+  /// Set while `suspend()`'s drain is finishing on a background queue. `resume`
+  /// refuses to start a second loop on top of one still winding down.
+  private var teardownInFlight = false
+  /// Set once a frame has failed fatally. The loop is not restarted afterwards:
+  /// a `VK_ERROR_DEVICE_LOST` does not heal, and resuming onto the lost device
+  /// would only spin the fuse thread against it.
+  private var renderFailed = false
+
+  /// Everything that must hold before the loop may run.
+  private var isRunnable: Bool {
+    isOnScreen && !isBackgrounded && !renderFailed
+  }
+
   private var lastFPSUpdate = CFAbsoluteTimeGetCurrent()
   private var framesSinceUpdate = 0
   private var fps = 0.0
@@ -45,6 +73,26 @@ final class ScannerViewController: UIViewController {
     // land on nothing.
     cameraGestures = CameraGestureController(attachingTo: metalView)
 
+    // The retry path for bring-up. A first layout that reports a zero dimension
+    // leaves nothing to build a swapchain from, and `viewDidAppear` does not
+    // fire twice -- so without a subscriber here one bad first layout (iPad
+    // multitasking, a transition mid-appearance) meant a black screen and a red
+    // label for the rest of the process.
+    metalView.onDrawableSizeChange = { [weak self] _ in
+      self?.startRendererIfNeeded()
+    }
+
+    // Backgrounding is the trigger `viewDidDisappear` cannot provide; see
+    // `isOnScreen`. Registered here rather than at bring-up so the app can be
+    // backgrounded while the renderer is still coming up.
+    let center = NotificationCenter.default
+    center.addObserver(
+      self, selector: #selector(appDidEnterBackground),
+      name: UIApplication.didEnterBackgroundNotification, object: nil)
+    center.addObserver(
+      self, selector: #selector(appWillEnterForeground),
+      name: UIApplication.willEnterForegroundNotification, object: nil)
+
     statusLabel.numberOfLines = 0
     statusLabel.textColor = .white
     statusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -63,31 +111,111 @@ final class ScannerViewController: UIViewController {
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+    isOnScreen = true
     // Bring up on first appearance, not in viewDidLoad: the layer has no valid
-    // drawableSize until the view has been laid out in a window.
+    // drawableSize until the view has been laid out in a window. Bring-up is
+    // asynchronous, so the loop is started by whichever of the two finishes
+    // last -- `resume` here if the renderer is already up, or `adopt` if it
+    // lands later.
     startRendererIfNeeded()
-    // Before the first frame: ARKit poses are in the sensor's frame, which does
-    // not turn with the interface, so the renderer has to be told which way the
-    // viewport is facing or the scan renders on its side.
-    renderer?.viewOrientation = currentViewOrientation()
-    arSession.start()
-    // Fusion pulls from the capture bridge on its own thread; the render loop
-    // only ever picks up whatever mesh it has published.
-    renderer?.startFusion(with: arSession.capture)
-    startDisplayLink()
+    resume()
   }
 
   override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
+    isOnScreen = false
+    suspend()
+  }
+
+  @objc private func appDidEnterBackground() {
+    isBackgrounded = true
+    suspend()
+  }
+
+  @objc private func appWillEnterForeground() {
+    isBackgrounded = false
+    // The retry for a bring-up declined while backgrounded. Without it, an app
+    // launched straight into the background comes forward with no renderer and
+    // nothing left to trigger one: `viewDidAppear` does not fire twice, and the
+    // drawable size has not changed, so `onDrawableSizeChange` does not either.
+    startRendererIfNeeded()
+    resume()
+  }
+
+  /// Start capture, fusion and the draw loop, if everything is ready for them.
+  ///
+  /// Idempotent and precondition-checked rather than called only from places
+  /// that "know" it is safe: the three things that gate it -- appearance,
+  /// foreground, and an asynchronous bring-up -- complete in no fixed order.
+  private func resume() {
+    guard isRunnable, !isCapturing, !teardownInFlight, let renderer else {
+      return
+    }
+    isCapturing = true
+    // Before the first frame: ARKit poses are in the sensor's frame, which does
+    // not turn with the interface, so the renderer has to be told which way the
+    // viewport is facing or the scan renders on its side.
+    renderer.viewOrientation = currentViewOrientation()
+    arSession.start()
+    // Fusion pulls from the capture bridge on its own thread; the render loop
+    // only ever picks up whatever mesh it has published.
+    renderer.startFusion(with: arSession.capture)
+    startDisplayLink()
+  }
+
+  /// Wind the loop down, in the one order that is safe.
+  ///
+  /// Signalling is synchronous; waiting is not, and the split is the point.
+  /// `stopFusion` joins the fuse thread, whose `fusing` flag is tested only
+  /// *between* iterations — so the join waits out the whole current one, which
+  /// at worst is a preemptive resize, a bounded grow loop building grown
+  /// attribute arrays beside the old ones, a re-allocate, an integrate, and an
+  /// extract that may free and reallocate the mesh arena, every dispatch ending
+  /// in a `vkWaitForFences(..., UINT64_MAX)`. `waitIdle` then adds a
+  /// `vkQueueWaitIdle` on both queues — on the render-failure path, against a
+  /// GPU that has just hung.
+  ///
+  /// This runs from a `UIApplication` notification handler and from inside the
+  /// display-link callback, so doing all of that inline blocked the main thread
+  /// for hundreds of milliseconds routinely and seconds on a grow-heavy
+  /// iteration: the 0x8badf00d watchdog kill that moving bring-up off-main
+  /// exists to avoid, and likeliest in exactly the large-scan state where a
+  /// user reaches for the home gesture.
+  ///
+  /// Everything that stops new work *starting* still happens before this
+  /// returns — the display link, ARKit, and the fuse thread's flag — so nothing
+  /// is submitting by the time the app is backgrounded. Only the waiting moves.
+  private func suspend() {
+    guard isCapturing else { return }
+    isCapturing = false
     stopDisplayLink()
     // Fusion first, and explicitly. It submits recon work on the same queue the
     // drain below empties, so a fuse thread still running would enqueue behind
     // the teardown -- and waitIdle does not stop it: it waits on the queues and
     // never touches the thread. Until stopFusion returns, the thread is also
     // still dereferencing the capture handle.
-    renderer?.stopFusion()
+    //
+    // This half only clears the flag the loop tests between iterations, which
+    // is what makes it safe to call on the main thread. The join that turns it
+    // into a guarantee is below.
+    renderer?.beginStopFusion()
     arSession.pause()
-    renderer?.waitIdle()
+    guard let renderer else { return }
+    teardownInFlight = true
+    // `renderer` is captured strongly, deliberately: the drain must not race a
+    // release of the object whose queues it is draining.
+    DispatchQueue.global(qos: .userInitiated).async {
+      renderer.stopFusion()
+      renderer.waitIdle()
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.teardownInFlight = false
+        // Reconciled rather than assumed: the app may have been foregrounded,
+        // or the view re-appeared, while the drain was running. `resume` is
+        // precondition-checked, so this is a no-op whenever it should not run.
+        self.resume()
+      }
+    }
   }
 
   override func viewWillTransition(
@@ -121,21 +249,67 @@ final class ScannerViewController: UIViewController {
   }
 
   private func startRendererIfNeeded() {
-    guard renderer == nil else { return }
-    guard metalView.metalLayer.drawableSize.width > 0 else { return }
+    guard renderer == nil, !bringUpInFlight else { return }
+    // Never while backgrounded. Bring-up is `vkCreateSwapchainKHR`, a blocking
+    // one-shot `upload_texture` (a real `vkQueueSubmit` plus a fence wait) and
+    // `Fusion::start`'s 48 MB commit -- Metal submits from a backgrounded
+    // process, which iOS terminates the app for, and that is the whole reason
+    // the state machine below exists. `suspend()` cannot cover this: it guards
+    // on `isCapturing`, which bring-up has not set, and once the closure is
+    // running there is nothing to cancel and no signal to block on. So the fix
+    // is to not begin; `appWillEnterForeground` is the retry.
+    //
+    // A bring-up already in flight when the app backgrounds still runs to
+    // completion -- it cannot be interrupted -- but it no longer starts the
+    // loop afterwards, because `adopt` reconciles through `resume`.
+    guard !isBackgrounded else { return }
+    // BOTH dimensions. Height is the one that actually goes to zero -- MetalView
+    // refuses to write a drawableSize with a zero in it, so a (W, 0) first
+    // layout leaves the layer at (W * scale, 0), which passed a width-only guard
+    // and then failed inside vkCreateSwapchainKHR.
+    let size = metalView.metalLayer.drawableSize
+    guard size.width > 0, size.height > 0 else { return }
 
-    let brought: VolumetricRenderer
-    do {
-      brought = try VolumetricRenderer(layer: metalView.metalLayer)
-    } catch {
-      let message = "Renderer bring-up failed:\n\(error.localizedDescription)"
-      statusLabel.text = message
-      statusLabel.textColor = .systemRed
-      // To stdout as well: this path never reaches updateStatus, so without it
-      // a bring-up failure is visible only on the screen.
-      print(message)
-      return
+    bringUpInFlight = true
+    let layer = metalView.metalLayer
+    // The layer itself crosses to another thread, where MoltenVK reads and sets
+    // properties on it for the length of the swapchain build -- so the main
+    // thread stops touching it until bring-up hands it back. Snapshotting
+    // `drawableSize` above is not enough on its own; the object is what
+    // crosses. See MetalView.defersLayerUpdates.
+    metalView.defersLayerUpdates = true
+    // Off the main thread, because this is not a constructor-shaped amount of
+    // work: vkCreateInstance/Device, the pipeline creates, a blocking
+    // upload_texture, and Fusion::start building the grid, integrator, marching
+    // cubes and texturer -- a dozen or so SPIR-V -> MSL compiles against a cold
+    // MoltenVK shader cache, plus a 48 MB zero-filled host-visible commit. On
+    // first launch after install that is seconds, and seconds of blocked main
+    // thread through launch is a 0x8badf00d watchdog kill. The smoke app moves
+    // the same class of work off-main for the same reason.
+    DispatchQueue.global(qos: .userInitiated).async {
+      let outcome = Result { try VolumetricRenderer(layer: layer) }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.bringUpInFlight = false
+        self.metalView.defersLayerUpdates = false
+        switch outcome {
+        case .success(let brought):
+          self.adopt(brought)
+        case .failure(let error):
+          let message =
+            "Renderer bring-up failed:\n\(error.localizedDescription)"
+          self.statusLabel.text = message
+          self.statusLabel.textColor = .systemRed
+          // To stdout as well: this path never reaches updateStatus, so without
+          // it a bring-up failure is visible only on the screen.
+          print(message)
+        }
+      }
     }
+  }
+
+  /// Take ownership of a renderer that finished bring-up, on the main thread.
+  private func adopt(_ brought: VolumetricRenderer) {
     renderer = brought
     cameraGestures?.renderer = brought
     deviceSummary = """
@@ -144,11 +318,17 @@ final class ScannerViewController: UIViewController {
       device    \(brought.sharedDeviceSummary)
       shared    \(brought.sharesOneDevice ? "yes - recon and gfx hold one VkDevice" : "NO - separate devices")
       """
+    // The view may have appeared, or been backgrounded, or both, while bring-up
+    // was in flight. `resume` is what reconciles that rather than assuming.
+    resume()
   }
 
   private func startDisplayLink() {
     guard displayLink == nil else { return }
-    let link = CADisplayLink(target: self, selector: #selector(tick))
+    // Through the proxy, never `target: self` -- see DisplayLinkProxy.
+    let link = CADisplayLink(
+      target: DisplayLinkProxy(owner: self),
+      selector: #selector(DisplayLinkProxy.tick))
     link.add(to: .main, forMode: .common)
     displayLink = link
   }
@@ -158,14 +338,21 @@ final class ScannerViewController: UIViewController {
     displayLink = nil
   }
 
-  @objc private func tick() {
+  fileprivate func tick() {
     guard let renderer else { return }
     do {
       try renderer.renderFrame(withDrawableSize: metalView.metalLayer.drawableSize)
     } catch {
       statusLabel.text = "Render failed:\n\(error.localizedDescription)"
       statusLabel.textColor = .systemRed
-      stopDisplayLink()
+      // The whole loop, not just the draw. Stopping the display link alone left
+      // `RendererImpl::fusing` true, so on a VK_ERROR_DEVICE_LOST the fuse
+      // thread went on polling ARKit at 60 Hz and issuing allocate/integrate/
+      // extract on the lost device -- each failing, each rewriting a last_error
+      // nothing was reading any more -- spinning a core and holding the camera
+      // and the volume until the user backgrounded the app.
+      renderFailed = true
+      suspend()
       return
     }
     // No poll here. `ICameraCapture` is single-consumer ("Poll from one
@@ -274,5 +461,47 @@ final class ScannerViewController: UIViewController {
       // build host instead of someone reading the screen.
       print(text)
     }
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+    // The run loop retains the link and the link retains its target, so a
+    // controller released while capturing left it firing forever: 60 wake-ups a
+    // second into a proxy whose owner is nil, with the renderer, the VkDevice,
+    // the swapchain and the TSDF volume all still held behind it.
+    // `stopDisplayLink` is otherwise reached only through `suspend`, which a
+    // release does not go through -- and this method became reachable at all
+    // only once DisplayLinkProxy broke the retain cycle that used to make it
+    // unreachable, so the leak arrived with the fix for the other one.
+    displayLink?.invalidate()
+    displayLink = nil
+  }
+}
+
+/// A weak trampoline between the display link and the controller.
+///
+/// `CADisplayLink` retains its target until `invalidate()`, and the controller
+/// retains the link — so `target: self` is a retain cycle broken only by the one
+/// code path that happens to call `stopDisplayLink()`. Any other release (a
+/// root-view-controller swap, a scene teardown, a memory-pressure dismissal)
+/// leaked the controller and everything under it: the VkDevice, the swapchain,
+/// tens of megabytes of TSDF volume, and a fuse thread still polling a released
+/// capture — because `deinit`, and so `-stopFusion` and `-dealloc`, would never
+/// run. `VolumetricRenderer.h` documents `-dealloc` as the safety net that means
+/// "a dropped renderer cannot leave the thread running"; the cycle is what made
+/// that net unreachable.
+///
+/// The link retains the proxy and the proxy holds the controller weakly, so the
+/// chain terminates: controller -> link -> proxy -> (weak) controller.
+private final class DisplayLinkProxy: NSObject {
+  private weak var owner: ScannerViewController?
+
+  init(owner: ScannerViewController) {
+    self.owner = owner
+    super.init()
+  }
+
+  @objc func tick() {
+    owner?.tick()
   }
 }

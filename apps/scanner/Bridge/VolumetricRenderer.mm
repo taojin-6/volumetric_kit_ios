@@ -11,10 +11,17 @@
 #import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
 
+#include <os/log.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+// FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
+// fusionSummary uses std::snprintf. It compiled only because some gfx or recon
+// header happens to pull <cstdio> in transitively today.
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -47,6 +54,42 @@
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
 namespace app = volumetric_kit::ios_app;
+
+// --- The recon/gfx vertex layout, pinned across repos ------------------------
+// This TU is the only place `recon::mesh::Vertex` and `gfx::assets::Vertex` are
+// both visible, which makes it the only place they can be compared. Each repo
+// pins its own struct against its own literals -- recon in mesh.hpp, gfx in
+// hybrid_mesh_pipeline.cpp -- and neither pins against the other, so a
+// self-consistent change on either side satisfies its own asserts and lands.
+//
+// These assertions used to be justified by a host `memcpy` and were removed
+// with it. That is exactly backwards: under interop seam B nothing is copied,
+// gfx builds its vertex input description from *its* offsets and
+// vkCmdDrawIndexedIndirect reads *recon's* buffer through them. A repacked or
+// reordered vertex is then read at the wrong offsets with no size mismatch to
+// catch it -- garbage positions and normals, no compile error, no Status, no
+// validation message. The siblings track `main` unpinned, so a broken pairing
+// arrives on an ordinary upstream commit; this is what turns it into a build
+// failure naming the field that moved.
+namespace {
+using RVertex = vr::mesh::Vertex;
+using GVertex = vg::assets::Vertex;
+static_assert(sizeof(RVertex) == sizeof(GVertex),
+              "recon and gfx vertex layouts have diverged: size");
+static_assert(offsetof(RVertex, position) == offsetof(GVertex, position),
+              "recon and gfx vertex layouts have diverged: position");
+static_assert(offsetof(RVertex, normal) == offsetof(GVertex, normal),
+              "recon and gfx vertex layouts have diverged: normal");
+static_assert(offsetof(RVertex, tangent) == offsetof(GVertex, tangent),
+              "recon and gfx vertex layouts have diverged: tangent");
+static_assert(offsetof(RVertex, uv0) == offsetof(GVertex, uv0),
+              "recon and gfx vertex layouts have diverged: uv0");
+static_assert(offsetof(RVertex, color) == offsetof(GVertex, color),
+              "recon and gfx vertex layouts have diverged: color");
+static_assert(std::is_standard_layout<RVertex>::value &&
+                  std::is_standard_layout<GVertex>::value,
+              "offsetof above requires standard-layout vertex types");
+}  // namespace
 
 NSErrorDomain const VolumetricRendererErrorDomain =
     @"io.taojin.volumetrickit.renderer";
@@ -161,6 +204,75 @@ std::string api_version_string(std::uint32_t v) {
          std::to_string(VK_API_VERSION_PATCH(v));
 }
 
+// --- Frame trace -------------------------------------------------------------
+// A device loss is reported by the *next* vkWaitForFences, so by the time the
+// error surfaces the frame that faulted is already gone and nothing on the
+// stack says what it did. This keeps the last few frames' worth of the state
+// that could plausibly cause a GPU fault and dumps it when the loss is
+// detected.
+//
+// A ring rather than per-frame logging: at 60 Hz an os_log per frame is both
+// noise and a perturbation, and only the frames immediately before the fault
+// matter. Written from the render thread and read from the render thread, so no
+// locking.
+struct FrameTrace {
+  struct Entry {
+    std::uint64_t frame = 0;
+    std::uint64_t generation = 0;  // recon generation this frame drew
+    std::size_t mesh_slot = 0;
+    std::uint64_t released_through = 0;  // what we told recon it may reuse
+    std::uint32_t triangles = 0;
+    std::uint32_t triangle_capacity = 0;
+    std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry
+    std::uint32_t active_blocks = 0;
+    float extract_ms = 0.0f;
+    bool drew_mesh = false;
+  };
+
+  static constexpr std::size_t kCapacity = 24;
+  Entry entries[kCapacity];
+  std::uint64_t next = 0;
+
+  Entry& begin_frame_entry() {
+    Entry& e = entries[next % kCapacity];
+    e = Entry{};
+    e.frame = next;
+    ++next;
+    return e;
+  }
+
+  // Oldest-first, so the last line is the frame closest to the fault.
+  //
+  // Both channels on purpose: os_log is what survives a run with no debugger
+  // attached (readable afterwards via `log collect`), and stderr is what
+  // reaches `devicectl process launch --console` live. os_log alone goes
+  // nowhere near the console, which is the mistake worth not repeating.
+  void dump(const char* why) const {
+    const std::uint64_t count = std::min<std::uint64_t>(next, kCapacity);
+    os_log_error(OS_LOG_DEFAULT,
+                 "vk-trace: %{public}s -- last %llu frames:", why,
+                 static_cast<unsigned long long>(count));
+    std::fprintf(stderr, "vk-trace: %s -- last %llu frames:\n", why,
+                 static_cast<unsigned long long>(count));
+    for (std::uint64_t i = 0; i < count; ++i) {
+      const Entry& e = entries[(next - count + i) % kCapacity];
+      char line[256];
+      std::snprintf(
+          line, sizeof(line),
+          "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
+          "arena=%llu blocks=%u extract=%.1fms",
+          static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
+          static_cast<unsigned long long>(e.generation), e.mesh_slot,
+          static_cast<unsigned long long>(e.released_through), e.triangles,
+          e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
+          e.active_blocks, static_cast<double>(e.extract_ms));
+      os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);
+      std::fprintf(stderr, "vk-trace: %s\n", line);
+    }
+    std::fflush(stderr);
+  }
+};
+
 }  // namespace
 
 // Everything C++ lives here so the header stays Objective-C only and Swift
@@ -261,9 +373,52 @@ struct RendererImpl {
   // happens to default frames_in_flight to 2 -- a value in another repo that
   // this file neither set nor read. It sets it now (see -initWithLayer:), so
   // the two cannot drift.
+  // +1, which is both what recon's `slot_count` prescribes ("the consumer's
+  // frames in flight plus one") and what the ring now needs. The extra slot was
+  // buying headroom around two ordering faults on the producing side, since
+  // fixed in Fusion::remesh: the consumer's release was applied *after* the
+  // extract it exists to make room for, so the ring always ran a slot shallower
+  // than its depth, and a mesh nobody had collected was published over rather
+  // than left alone, which put a third generation outstanding at once.
+  //
+  // With both gone the outstanding set is exactly the generations named in
+  // frame_generations plus the one being extracted. Each slot is a full vertex
+  // arena that never shrinks, so the padding was not free -- against the arena
+  // sizes this app reaches, it was a few hundred megabytes resident to cover an
+  // ordering choice.
   static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
-  vg::pipelines::GpuMesh mesh_slots[kMeshSlots];
+  // The meshes in flight -- borrowed views of recon's buffers, not storage.
+  // Copying one is copying a few handles.
+  vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
+  // The generation each in-flight frame drew. Read as a *set*: what may be
+  // released is everything older than the oldest entry, not the entry belonging
+  // to the frame that just retired -- one generation is normally drawn by
+  // several consecutive frames, so the retired frame's generation is often
+  // still being read by a newer one. begin_frame's fence wait is the only
+  // completion signal gfx gives (no fence is exposed, and no semaphore may
+  // cross the seam), and it says a frame finished, not that a generation did.
+  std::uint64_t frame_generations[kFramesInFlight] = {};
+  std::size_t frame_slot = 0;
   std::size_t mesh_slot = 0;
+  // The newest generation take_mesh has handed over, drawn or not. What the
+  // release logic falls back to when *no* frame is holding a generation: the
+  // per-frame minimum says nothing then, and without this the generations taken
+  // while drawing was off were never released at all -- `drawMesh = NO`
+  // exhausted recon's ring within kMeshSlots extracts and turning drawing back
+  // on could not recover, because the renderer only released what it drew and
+  // could no longer obtain anything to draw.
+  std::uint64_t newest_taken_generation = 0;
+  // Latched when a published mesh cannot be bound as geometry. That is a
+  // configuration fault, not a transient: the usage bits come from two
+  // constants in Fusion::start and the sharing mode from the queue plan, so a
+  // mesh that is unusable once is unusable every time. Latching stops the
+  // renderer collecting meshes it cannot draw -- which at 60 Hz was a storm of
+  // failure counts, and which would otherwise walk recon's ring to exhaustion
+  // one uncollectable generation at a time.
+  bool mesh_unusable = false;
+  // Diagnostic only: what the last few frames drew, dumped when a device loss
+  // (or any begin_frame failure) is detected. See FrameTrace.
+  FrameTrace trace;
 
   ~RendererImpl() {
     // Before anything else, and before any member is destroyed: the fuse thread
@@ -497,8 +652,23 @@ struct RendererImpl {
       0, _impl->atlas_texture.view(), _impl->atlas_sampler->handle(),
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+  app::FusionConfig fusion_config;
+  // One slot per frame in flight, plus one. The renderer draws the extractor's
+  // buffers in place now, so an extract must never land on geometry a pending
+  // frame is still reading -- and the ring is what makes that impossible rather
+  // than merely unlikely.
+  fusion_config.mesh_slots = RendererImpl::kMeshSlots;
+  // Both families, always. Under the two-families plan a phone actually gets,
+  // recon writes these buffers on one and gfx reads them on the other, and an
+  // EXCLUSIVE buffer read by a family that does not own it is undefined with no
+  // error. recon collapses the pair to EXCLUSIVE wherever they are the same
+  // family, so this needs no branch on the plan.
+  fusion_config.queue_families[0] = _impl->shared.compute_family();
+  fusion_config.queue_families[1] = _impl->shared.graphics_family();
+  fusion_config.queue_family_count = 2;
+
   const vr::Status fusion_started = _impl->fusion.start(
-      *_impl->recon_device, *_impl->recon_allocator, app::FusionConfig{});
+      *_impl->recon_device, *_impl->recon_allocator, fusion_config);
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
     // OutOfMemory that must reach Swift as one.
@@ -516,6 +686,9 @@ struct RendererImpl {
   vg::Result<std::optional<vg::windowing::Frame>> frame =
       _impl->app.begin_frame(extent);
   if (!frame) {
+    // The fault happened in an *earlier* frame; this is only where it is
+    // noticed. Dump what those frames were doing before the error propagates.
+    _impl->trace.dump(frame.status().message().c_str());
     set_error(error, frame.status(), "begin_frame");
     return NO;
   }
@@ -526,62 +699,101 @@ struct RendererImpl {
   }
   const vg::windowing::Frame& f = *frame.value();
 
+  // Claimed here, not at the top of the tick: the window should hold the last
+  // kCapacity frames that actually *drew*, not the last kCapacity calls. A
+  // rotation, a Slide Over resize or a return from background yields no
+  // drawable for far longer than the ring is deep, so claiming per tick flushed
+  // the whole window with blank entries -- and a device loss noticed just after
+  // one dumped 24 empty lines and none of the frames that could have caused it.
+  FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
+
   // Take the newest mesh, if fusion published one since the last upload. Never
   // wait for it: the render loop draws the previous mesh rather than stalling,
   // which is what keeps presentation smooth while a remesh is in flight.
   //
-  // Done *before* the render scope opens. The upload below is gfx's blocking
-  // one-shot overload -- begin, record, submit, vkWaitForFences(UINT64_MAX) --
-  // and sandwiching a synchronous queue round trip between target->begin and
-  // target->end held a command buffer open across it for no reason. This does
-  // not make the upload non-blocking; see the note on -startFusionWithCapture:.
-  if (std::optional<app::Fusion::Published> fresh =
-          _impl->fusion.take_mesh(_impl->uploaded_version)) {
-    vg::assets::Mesh gfx_mesh;
-    // A bulk copy, not a field-by-field rebuild: recon's mesh::Vertex *is*
-    // gfx::assets::Vertex since the 2026-08-02 layout decision. Size alone does
-    // not say so -- a reorder within the 64 bytes would pass it and misread
-    // every vertex -- so the field offsets are pinned too, matching the
-    // assertions recon's own to_gfx_mesh carries.
-    using RVertex = vr::mesh::Vertex;
-    using GVertex = vg::assets::Vertex;
-    static_assert(sizeof(RVertex) == sizeof(GVertex),
-                  "recon and gfx vertex layouts have diverged: size");
-    static_assert(offsetof(RVertex, position) == offsetof(GVertex, position),
-                  "recon and gfx vertex layouts have diverged: position");
-    static_assert(offsetof(RVertex, normal) == offsetof(GVertex, normal),
-                  "recon and gfx vertex layouts have diverged: normal");
-    static_assert(offsetof(RVertex, tangent) == offsetof(GVertex, tangent),
-                  "recon and gfx vertex layouts have diverged: tangent");
-    static_assert(offsetof(RVertex, uv0) == offsetof(GVertex, uv0),
-                  "recon and gfx vertex layouts have diverged: uv0");
-    static_assert(offsetof(RVertex, color) == offsetof(GVertex, color),
-                  "recon and gfx vertex layouts have diverged: color");
-    static_assert(std::is_trivially_copyable<RVertex>::value &&
-                      std::is_trivially_copyable<GVertex>::value,
-                  "vertex bulk copy requires trivially copyable layouts");
-    gfx_mesh.vertices.resize(fresh->mesh.vertices.size());
-    std::memcpy(gfx_mesh.vertices.data(), fresh->mesh.vertices.data(),
-                fresh->mesh.vertices.size() * sizeof(GVertex));
-    // Moved: the indices are the one half of the mesh that needs no conversion,
-    // and at room scale the copy this replaces was ~3 MB per frame.
-    gfx_mesh.indices = std::move(fresh->mesh.indices);
+  // Take the newest mesh, if fusion published one since the last. Nothing is
+  // uploaded and nothing is copied: interop seam B hands over the extractor's
+  // own VkBuffers, which the draw below reads in place. What used to be here
+  // was a ~53 MB download plus a blocking one-shot upload, every remesh, for
+  // geometry that never left the device.
+  std::optional<app::Fusion::Published> fresh;
+  if (!_impl->mesh_unusable) {
+    fresh = _impl->fusion.take_mesh(_impl->uploaded_version);
+  }
+  if (fresh) {
+    const vr::mesh::DeviceMesh& m = fresh->mesh;
+    // Every generation take_mesh hands over becomes this renderer's to release,
+    // drawn or not -- recorded before the test below so the release logic can
+    // still retire one it refuses to draw.
+    _impl->newest_taken_generation = m.generation;
+    // Advanced whichever way the test goes. It used to move only on the
+    // accepting branch, so a mesh that could not be bound was re-taken on every
+    // following tick: a 60 Hz storm of release calls and failure counts that
+    // never terminated, which made the "! upload xN" banner a tick counter
+    // rather than a count of anything.
+    _impl->uploaded_version = fresh->version;
 
-    vg::Result<vg::pipelines::GpuMesh> uploaded = vg::pipelines::upload_mesh(
-        _impl->app.device(), _impl->app.allocator(), gfx_mesh);
-    if (uploaded) {
+    // Verified, not assumed. recon reports the usage *and the sharing mode* its
+    // buffers were actually created with precisely because Vulkan cannot be
+    // asked, and binding one that lacks a usage bit is a validation-layer-only
+    // diagnostic -- undefined behaviour in the shipping configuration, which is
+    // this one.
+    //
+    // The sharing mode is the term that can actually vary here, and the one
+    // with the most at stake: reading an EXCLUSIVE buffer from a family that
+    // does not own it is undefined outright, where a missing usage bit is at
+    // least a diagnostic -- and on Apple, where Metal has no queue-ownership
+    // concept, it is undefined in the way that appears to work. Checked only
+    // when the families actually differ, which is what the queue plan decides
+    // at bring-up and what -initWithLayer: passes to Fusion::start; recon
+    // collapses the pair to EXCLUSIVE wherever they are the same family, and
+    // that is correct rather than a failure.
+    const bool cross_family =
+        _impl->shared.graphics_family() != _impl->shared.compute_family();
+    const bool sharing_ok =
+        !cross_family || m.sharing_mode == VK_SHARING_MODE_CONCURRENT;
+    const bool bindable =
+        m.valid() && sharing_ok &&
+        (m.vertex_usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) != 0 &&
+        (m.index_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0 &&
+        (m.indirect_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+    if (bindable) {
+      // A slot per frame in flight, holding the *generation* rather than the
+      // geometry: the buffers are recon's, and this only has to remember which
+      // one to release once this frame's fence has signalled.
       _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
-      _impl->mesh_slots[_impl->mesh_slot] = std::move(uploaded).value();
-      _impl->uploaded_version = fresh->version;
+      _impl->mesh_slots[_impl->mesh_slot] = m;
       _impl->have_mesh = true;
-      _impl->mesh_upload_error.clear();
+      // The message is deliberately NOT cleared here. `mesh_upload_failures` is
+      // a running total like every other counter on this read-out, and clearing
+      // only the message left the banner gated on a count that never resets:
+      // one transient failure followed by a recovery read "! upload x1: " --
+      // for the rest of the process, an alarm with no content. Count and reason
+      // stay together, so the line means "this happened N times, most recently
+      // for this reason" whether or not it is still happening.
     } else {
-      // Recorded, not dropped. This is the one stage between "fusion says it
-      // produced geometry" and "the geometry is on screen", so a silent failure
-      // here shows a rising vertex count next to a frozen mesh -- or next to
-      // the bring-up triangle -- with nothing anywhere naming the upload.
+      // Deliberately *not* released here. release_through is a monotonic
+      // high-water mark, so handing it this generation would retire every older
+      // one with it -- including the generation this very frame goes on to
+      // draw, since have_mesh and mesh_slot still name it. recon would then be
+      // free to claim that slot, and a grow frees its buffers outright, under a
+      // live draw. The ordinary in-flight logic below retires it instead, which
+      // by construction never releases past something still being read.
+      //
+      // Latched, because this cannot heal: the usage bits come from two
+      // constants in Fusion::start and the sharing mode from the queue plan, so
+      // a mesh that is unusable once is unusable every time. Collecting the
+      // ones that follow would only walk recon's ring to exhaustion, one
+      // undrawable generation at a time, and bury the reason under a count.
+      _impl->mesh_unusable = true;
       ++_impl->mesh_upload_failures;
-      _impl->mesh_upload_error = uploaded.status().message();
+      _impl->mesh_upload_error =
+          sharing_ok
+              ? "mesh is not bindable as geometry (usage bits or handles "
+                "missing)"
+              : "mesh buffers are VK_SHARING_MODE_EXCLUSIVE but recon and gfx "
+                "are on different queue families; binding them would be "
+                "undefined";
     }
   }
 
@@ -624,11 +836,97 @@ struct RendererImpl {
   _impl->camera.set_device_pose(device_pose);
 
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
-  if (draw_mesh) {
-    vg::pipelines::HybridMeshDraw draw{};
-    draw.geometry = &_impl->mesh_slots[_impl->mesh_slot];
 
-    const float aspect = static_cast<float>(extent.width) /
+  // --- Retire the generations no frame in flight is reading any more --------
+  //
+  // Outside the draw branch, and that placement is the correction rather than a
+  // tidy-up: every release the consumer owes recon used to sit inside
+  // `if (draw_mesh)`, so setting the public `drawMesh` property to NO stopped
+  // all of them permanently. The renderer went on collecting meshes --
+  // take_mesh runs regardless, and marking one taken is exactly what stops
+  // fusion reusing its slot -- released nothing, and after kMeshSlots extracts
+  // recon refused every one that followed. Turning drawing back on could not
+  // recover it either: the renderer only ever released what it drew, and by
+  // then it could no longer obtain anything to draw.
+  //
+  // Park the generation this frame draws -- zero when it draws none -- then
+  // release everything strictly older than the oldest generation any frame
+  // still in flight is reading.
+  //
+  // Releasing "what the frame that just retired drew" is what this used to
+  // do, and it is wrong whenever one generation spans more than one frame --
+  // which is the normal case, not a corner: mesh_slot advances only when
+  // take_mesh yields a *new* mesh, so at 60 Hz with a remesh every few fused
+  // frames the same generation is drawn many frames running. Two frames in
+  // flight then both hold it, begin_frame has waited on only the older one's
+  // fence, and releasing on that fence hands recon a slot the newer frame is
+  // still reading. recon is then free to pick it -- and a grow *frees* its
+  // buffers outright, so the in-flight draw reads a destroyed VkBuffer. That
+  // is a GPU fault surfacing as VK_ERROR_DEVICE_LOST out of the next
+  // vkWaitForFences, and it needs the arena to actually grow, which is why it
+  // only shows up once the scan gets large.
+  //
+  // The min is over the whole array because every entry names a frame still
+  // in flight once the current one is recorded; anything older than all of
+  // them is finished everywhere. release_through is a monotonic high-water
+  // mark, so a repeated or lower value is harmless.
+  const std::size_t recording =
+      _impl->frame_slot % RendererImpl::kFramesInFlight;
+  _impl->frame_generations[recording] =
+      draw_mesh ? _impl->mesh_slots[_impl->mesh_slot].generation : 0;
+  ++_impl->frame_slot;
+
+  std::uint64_t oldest_in_flight = 0;
+  for (const std::uint64_t g : _impl->frame_generations) {
+    if (g != 0 && (oldest_in_flight == 0 || g < oldest_in_flight)) {
+      oldest_in_flight = g;
+    }
+  }
+  // Generations are pre-incremented from 0, so 1 is the first real one and
+  // there is nothing below it to release. An all-zero array means no frame in
+  // flight holds a generation at all -- drawing is off, or nothing has been
+  // drawn yet -- and then everything collected so far is finished by
+  // definition. That fallback is the only thing that drains the ring while
+  // drawMesh is NO, and the only thing that lets it refill when it goes back
+  // on.
+  const std::uint64_t released_through = oldest_in_flight > 0
+                                             ? oldest_in_flight - 1
+                                             : _impl->newest_taken_generation;
+  if (released_through > 0) {
+    _impl->fusion.release_through(released_through);
+  }
+  trace.released_through = released_through;
+
+  if (draw_mesh) {
+    // recon's buffers, named rather than copied. LiveMesh owns nothing and
+    // reads the index count GPU-side out of the indirect command, so the count
+    // never crosses the CPU either.
+    const vr::mesh::DeviceMesh& live_src = _impl->mesh_slots[_impl->mesh_slot];
+    vg::pipelines::LiveMesh live;
+    live.vertices = live_src.vertices;
+    live.indices = live_src.indices;
+    live.indirect = live_src.indirect;
+    const vg::pipelines::HybridMeshDraw draw{live};
+
+    const app::FusionStats s = _impl->fusion.stats();
+    trace.drew_mesh = true;
+    trace.generation = live_src.generation;
+    trace.mesh_slot = _impl->mesh_slot;
+    trace.triangles = s.triangles;
+    trace.triangle_capacity = s.triangle_capacity;
+    trace.arena_bytes = s.arena_bytes;
+    trace.active_blocks = s.active_blocks;
+    trace.extract_ms = s.extract_ms;
+
+    // Both ends clamped, not just the denominator. A zero *width* drawable is
+    // just as reachable as a zero height -- an orientation change, an iPad
+    // Slide Over resize -- and it does not divide by zero, it yields aspect 0,
+    // which makes glm::perspective's first term 1/(0 * tanHalfFovy) = +inf and
+    // NaNs every clip-space x. The mesh then vanishes into a clear-coloured
+    // frame that still returns YES: indistinguishable on screen from "fusion
+    // produced nothing", which is the exact ambiguity the atlas comment above
+    // exists to design out. In Debug, glm asserts instead and CI aborts.
+    const float aspect = static_cast<float>(std::max(extent.width, 1u)) /
                          static_cast<float>(std::max(extent.height, 1u));
     // The same FOV the camera scales a pan by, and the same clip range its
     // zoom-out limit is derived from -- see kVerticalFov and kFarClip. A pan
@@ -759,6 +1057,14 @@ struct RendererImpl {
   });
 }
 
+- (void)beginStopFusion {
+  if (_impl) {
+    // The flag only. `capture` stays valid and the thread stays joinable --
+    // -stopFusion is still what makes either of those untrue.
+    _impl->fusing.store(false);
+  }
+}
+
 - (void)stopFusion {
   if (_impl) {
     _impl->stop_fusing();
@@ -825,20 +1131,48 @@ struct RendererImpl {
     upload = "\n  ! upload x" + std::to_string(_impl->mesh_upload_failures) +
              ": " + _impl->mesh_upload_error;
   }
-  char buf[512];
-  std::snprintf(buf, sizeof(buf),
-                "fused %llu / remesh %llu  v%u\n"
-                "  mesh      %u verts / %u tris\n"
-                "  allocate  %.1f ms\n"
-                "  integrate %.1f ms\n"
-                "  extract   %.1f ms\n"
-                "  texture   %.1f ms%s%s%s",
-                static_cast<unsigned long long>(s.frames_fused),
-                static_cast<unsigned long long>(s.remeshes), s.mesh_version,
-                s.vertices, s.triangles, s.allocate_ms, s.integrate_ms,
-                s.extract_ms, s.texture_ms,
-                s.last_error.empty() ? "" : "\n  ! ", s.last_error.c_str(),
-                upload.c_str());
+  // Shown as a count with the reason, not the reason alone. `last_error` is
+  // most-recent-wins and `fuse` republishes its own every fused frame, so a
+  // repeating extract or texture failure surfaced for under 16 ms at a time and
+  // the scan read as clean with a mesh that had simply stopped updating. The
+  // count is what holds still long enough to be read.
+  std::string errors;
+  if (s.errors > 0) {
+    errors = "\n  ! errors x" + std::to_string(s.errors) +
+             (s.last_error.empty() ? "" : ": " + s.last_error);
+  }
+  // Sized for two full library messages plus the fixed body: the error and the
+  // upload lines can now both be present and both carry a `Status::message()`.
+  char buf[1024];
+  std::snprintf(
+      buf, sizeof(buf),
+      "fused %llu / remesh %llu  v%u\n"
+      "  mesh      %u verts / %u tris\n"
+      "  allocate  %.1f ms\n"
+      "  integrate %.1f ms\n"
+      "  extract   %.1f ms\n"
+      // The two arena numbers are on different scales, so each says which:
+      // triangle_capacity is what the last extract planned for the one slot it
+      // wrote, while arena_bytes is recon's sum across the whole ring. Printed
+      // as one quantity they read as a single arena and overstated it by the
+      // slot count.
+      "  arena     %u tris planned for this slot (%.2f%% full)\n"
+      "            %.1f MB across %u slots / %u blocks\n"
+      "  table     %u / %u blocks (%.1f%% occupied)\n"
+      "  texture   %.1f ms%s%s",
+      static_cast<unsigned long long>(s.frames_fused),
+      static_cast<unsigned long long>(s.remeshes), s.mesh_version, s.vertices,
+      s.triangles, s.allocate_ms, s.integrate_ms, s.extract_ms,
+      s.triangle_capacity,
+      s.triangle_capacity > 0 ? 100.0 * static_cast<double>(s.triangles) /
+                                    static_cast<double>(s.triangle_capacity)
+                              : 0.0,
+      static_cast<double>(s.arena_bytes) / (1024.0 * 1024.0), s.mesh_slots,
+      s.active_blocks, s.active_blocks, s.table_capacity,
+      s.table_capacity > 0 ? 100.0 * static_cast<double>(s.active_blocks) /
+                                 static_cast<double>(s.table_capacity)
+                           : 0.0,
+      s.texture_ms, errors.c_str(), upload.c_str());
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`

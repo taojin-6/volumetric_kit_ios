@@ -18,6 +18,32 @@ final class MetalView: UIView {
   /// Called after `drawableSize` changes, so the renderer can rebuild.
   var onDrawableSizeChange: ((CGSize) -> Void)?
 
+  /// Holds every read of and write to the backing `CAMetalLayer` while someone
+  /// else owns it.
+  ///
+  /// Renderer bring-up runs off the main thread and hands *this* layer to
+  /// `vkCreateMetalSurfaceEXT`, after which MoltenVK reads and sets `device`,
+  /// `pixelFormat`, `framebufferOnly` and `maximumDrawableCount` on it as it
+  /// builds the swapchain. A `CALayer` is not thread-safe, and bring-up takes
+  /// seconds against a cold shader cache — so any rotation, keyboard, Slide Over
+  /// resize or safe-area relayout in that window is an unsynchronized access to
+  /// the same object from inside a main-thread `CATransaction` commit.
+  /// Snapshotting the *value* of `drawableSize` before dispatching, which is
+  /// what the controller does, does not help: the layer object itself is what
+  /// crosses.
+  ///
+  /// Layout still runs while this is set; only the layer touch is deferred, and
+  /// it is re-derived from `bounds` and applied once on the way back down.
+  var defersLayerUpdates = false {
+    didSet {
+      guard oldValue, !defersLayerUpdates else { return }
+      applyPendingScale()
+      updateDrawableSize()
+    }
+  }
+  /// A `contentsScale` that arrived while updates were deferred.
+  private var pendingScale: CGFloat?
+
   override func layoutSubviews() {
     super.layoutSubviews()
     updateDrawableSize()
@@ -28,9 +54,16 @@ final class MetalView: UIView {
     // contentScaleFactor is only meaningful once the view has a screen.
     if let scale = window?.screen.nativeScale {
       contentScaleFactor = scale
-      metalLayer.contentsScale = scale
+      pendingScale = scale
+      applyPendingScale()
     }
     updateDrawableSize()
+  }
+
+  private func applyPendingScale() {
+    guard !defersLayerUpdates, let scale = pendingScale else { return }
+    metalLayer.contentsScale = scale
+    pendingScale = nil
   }
 
   private func updateDrawableSize() {
@@ -42,6 +75,10 @@ final class MetalView: UIView {
       width: bounds.width * scale,
       height: bounds.height * scale)
     guard pixels.width > 0, pixels.height > 0 else { return }
+    // Before the layer is touched at all — the comparison below reads
+    // `drawableSize`, which is as much a data race as writing it. See
+    // `defersLayerUpdates`.
+    guard !defersLayerUpdates else { return }
     guard metalLayer.drawableSize != pixels else { return }
     metalLayer.drawableSize = pixels
     onDrawableSizeChange?(pixels)
