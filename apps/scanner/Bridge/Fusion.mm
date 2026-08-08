@@ -110,11 +110,83 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // empty error line while a whole region of the scan quietly never filled.
   std::string frame_error;
 
+  // --- Grow *ahead* of density, before allocating into it -------------------
+  //
+  // Reactive growth is not enough, and the reason is in the kernel: when a
+  // coord's own bucket and chain are full, allocate_in_overflow falls back to
+  // scanning every table entry, taking a contended atomicCompSwap per slot to
+  // test it. So the cost of one insert climbs with occupancy, and past ~90%
+  // nearly every new coord takes that path -- num_buckets * bucket_size atomics
+  // each, thousands of invocations per depth frame.
+  //
+  // Measured on an M5 iPad Pro at 1 cm voxels: at 7809 of 8192 blocks the
+  // allocate dispatch went 1.2 ms -> 3.1 ms -> 4.2 ms over ~65 frames, dropped
+  // the capture to 45 fps, and then hung the GPU outright --
+  // kIOGPUCommandBufferCallbackErrorHang on recon's queue, which took gfx's
+  // queue down with it as kIOGPUCommandBufferCallbackErrorInnocentVictim and
+  // surfaced as VK_ERROR_DEVICE_LOST from the next vkWaitForFences.
+  //
+  // Waiting for a *failure* to grow means waiting until the table is already in
+  // that regime: the failure is only reported after the scan that cannot be
+  // afforded. So grow on occupancy instead, well before the fallback dominates.
+  // The reactive path below stays as a backstop for a frame that fills the
+  // table faster than one doubling absorbs.
+  constexpr float kGrowAtOccupancy = 0.7f;
+  if (stats_.active_blocks > 0 && config_.num_buckets < config_.max_buckets) {
+    const float capacity =
+        static_cast<float>(config_.num_buckets) * 8.0f;  // blocks per bucket
+    if (static_cast<float>(stats_.active_blocks) >
+        capacity * kGrowAtOccupancy) {
+      const std::int32_t grown_to =
+          std::min(config_.num_buckets * 2, config_.max_buckets);
+      const vr::Status grown = grid_->resize(grown_to);
+      if (grown) {
+        config_.num_buckets = grown_to;
+      } else {
+        // Not fatal: the table is merely denser than preferred, and the
+        // allocate below still works -- more slowly. Reported rather than
+        // returned so the frame still fuses.
+        frame_error = "preemptive resize: " + grown.message();
+      }
+    }
+  }
+
+  // --- Refuse to allocate into a table with no room left --------------------
+  //
+  // The growth above only helps while there is somewhere to grow. At the
+  // max_buckets ceiling occupancy climbs unchecked, and the overflow scan is
+  // O(num_buckets * bucket_size) per insert -- so a *larger* ceiling makes the
+  // pathological case worse, not better, and no ceiling is high enough to be a
+  // fix on its own. Measured: 31480 of 32768 blocks (96%) at the old
+  // 4096-bucket ceiling hung the GPU.
+  //
+  // So past the point where the fallback dominates, stop feeding it. Skipping
+  // allocation costs *new* geometry only: integrate still fuses every block
+  // already in the table, so the existing surface keeps refining and the app
+  // keeps running. That is the trade max_buckets was always documented to make
+  // ("a scan that is missing far geometry, still running, and saying so") -- it
+  // just was not actually enforced anywhere, and the unenforced version was a
+  // GPU hang.
+  constexpr float kRefuseAllocateAtOccupancy = 0.85f;
+  const float table_capacity = static_cast<float>(config_.num_buckets) * 8.0f;
+  const bool table_exhausted = static_cast<float>(stats_.active_blocks) >
+                               table_capacity * kRefuseAllocateAtOccupancy;
+
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
   vr::volume::AllocFailures failures;
-  vr::Result<std::uint32_t> overflow = grid_->map().allocate_from_depth(
-      frame.depth, frame.depth_camera, &failures);
+  vr::Result<std::uint32_t> overflow =
+      table_exhausted ? vr::Result<std::uint32_t>(0u)
+                      : grid_->map().allocate_from_depth(
+                            frame.depth, frame.depth_camera, &failures);
+  if (table_exhausted && frame_error.empty()) {
+    frame_error =
+        "volume full: " + std::to_string(stats_.active_blocks) + " of " +
+        std::to_string(static_cast<std::int64_t>(table_capacity)) +
+        " blocks at the " + std::to_string(config_.max_buckets) +
+        "-bucket ceiling; not allocating new blocks (existing surface still "
+        "fusing). Raise max_buckets or use a coarser voxel_size.";
+  }
   if (!overflow) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -302,6 +374,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   stats_.triangle_capacity = extract_timings.triangle_capacity;
   stats_.active_blocks = extract_timings.active_blocks;
   stats_.arena_bytes = extract_timings.arena_bytes;
+  stats_.table_capacity = static_cast<std::uint32_t>(config_.num_buckets) * 8u;
   stats_.texture_ms = texture_ms;
 }
 

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A live 1 cm reconstruction is a genuinely large-memory app, and the default
+  per-app jetsam limit is what killed it: at 3.2 M triangles the mesh arenas held
+  3089 MB (resident_arena_bytes, summed over the mesh_slots ring) beside an
+  805 MB voxel grid, and the OS sent SIGKILL -- no OutOfMemory to report, the
+  process simply disappears.
+
+  increased-memory-limit raises that jetsam ceiling on devices that have the RAM
+  (this iPad Pro reports 10922 MB).
+
+  extended-virtual-addressing would normally sit beside it -- the arena ring can
+  exceed the 4 GB a 32-bit address space covers -- but it is deliberately absent:
+  a **personal** (free) development team cannot provision it. Xcode fails the
+  build outright with "Personal development teams ... do not support the Extended
+  Virtual Addressing capability", so adding it back costs the whole build, not
+  just the capability. It needs a paid Apple Developer Program membership with
+  the capability enabled on the App ID. increased-memory-limit alone does
+  provision on a personal team, and is verifiable in the signed binary with
+  `codesign -d --entitlements -`.
+
+  Not a licence to be careless: this moves the wall, it does not remove it.
+  voxel_size, FusionConfig::max_buckets and mesh_slots are still what decide
+  whether a scan fits, and the occupancy guard in Fusion::fuse is still what
+  keeps the *GPU* out of trouble independently of any of this.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

@@ -11,6 +11,9 @@
 #import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
 
+#include <os/log.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -161,6 +164,75 @@ std::string api_version_string(std::uint32_t v) {
          std::to_string(VK_API_VERSION_PATCH(v));
 }
 
+// --- Frame trace -------------------------------------------------------------
+// A device loss is reported by the *next* vkWaitForFences, so by the time the
+// error surfaces the frame that faulted is already gone and nothing on the
+// stack says what it did. This keeps the last few frames' worth of the state
+// that could plausibly cause a GPU fault and dumps it when the loss is
+// detected.
+//
+// A ring rather than per-frame logging: at 60 Hz an os_log per frame is both
+// noise and a perturbation, and only the frames immediately before the fault
+// matter. Written from the render thread and read from the render thread, so no
+// locking.
+struct FrameTrace {
+  struct Entry {
+    std::uint64_t frame = 0;
+    std::uint64_t generation = 0;  // recon generation this frame drew
+    std::size_t mesh_slot = 0;
+    std::uint64_t released_through = 0;  // what we told recon it may reuse
+    std::uint32_t triangles = 0;
+    std::uint32_t triangle_capacity = 0;
+    std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry
+    std::uint32_t active_blocks = 0;
+    float extract_ms = 0.0f;
+    bool drew_mesh = false;
+  };
+
+  static constexpr std::size_t kCapacity = 24;
+  Entry entries[kCapacity];
+  std::uint64_t next = 0;
+
+  Entry& begin_frame_entry() {
+    Entry& e = entries[next % kCapacity];
+    e = Entry{};
+    e.frame = next;
+    ++next;
+    return e;
+  }
+
+  // Oldest-first, so the last line is the frame closest to the fault.
+  //
+  // Both channels on purpose: os_log is what survives a run with no debugger
+  // attached (readable afterwards via `log collect`), and stderr is what
+  // reaches `devicectl process launch --console` live. os_log alone goes
+  // nowhere near the console, which is the mistake worth not repeating.
+  void dump(const char* why) const {
+    const std::uint64_t count = std::min<std::uint64_t>(next, kCapacity);
+    os_log_error(OS_LOG_DEFAULT,
+                 "vk-trace: %{public}s -- last %llu frames:", why,
+                 static_cast<unsigned long long>(count));
+    std::fprintf(stderr, "vk-trace: %s -- last %llu frames:\n", why,
+                 static_cast<unsigned long long>(count));
+    for (std::uint64_t i = 0; i < count; ++i) {
+      const Entry& e = entries[(next - count + i) % kCapacity];
+      char line[256];
+      std::snprintf(
+          line, sizeof(line),
+          "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
+          "arena=%llu blocks=%u extract=%.1fms",
+          static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
+          static_cast<unsigned long long>(e.generation), e.mesh_slot,
+          static_cast<unsigned long long>(e.released_through), e.triangles,
+          e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
+          e.active_blocks, static_cast<double>(e.extract_ms));
+      os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);
+      std::fprintf(stderr, "vk-trace: %s\n", line);
+    }
+    std::fflush(stderr);
+  }
+};
+
 }  // namespace
 
 // Everything C++ lives here so the header stays Objective-C only and Swift
@@ -261,19 +333,29 @@ struct RendererImpl {
   // happens to default frames_in_flight to 2 -- a value in another repo that
   // this file neither set nor read. It sets it now (see -initWithLayer:), so
   // the two cannot drift.
-  static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
+  // +2, not +1. Two frames in flight can pin two *distinct* generations, and a
+  // third may already be published and waiting for the next take_mesh, so +1
+  // leaves recon's picker with nothing to claim and extract refuses with "every
+  // output slot is still outstanding". That is reachable here because fusion
+  // meshes every frame (remesh_every = 1). +1 was only ever enough while the
+  // release below fired a frame early, which is precisely the bug it had.
+  static constexpr std::size_t kMeshSlots = kFramesInFlight + 2;
   // The meshes in flight -- borrowed views of recon's buffers, not storage.
   // Copying one is copying a few handles.
   vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
-  // The generation each in-flight frame drew, so it can be released once that
-  // frame's fence has signalled. begin_frame is what waits on it: by the time
-  // it returns for frame N, frame N - kFramesInFlight has completed, so the
-  // generation parked in that slot is finished with. That wait is the only
-  // completion signal gfx gives, and it is enough -- no fence is exposed, and
-  // no semaphore may cross the seam.
+  // The generation each in-flight frame drew. Read as a *set*: what may be
+  // released is everything older than the oldest entry, not the entry belonging
+  // to the frame that just retired -- one generation is normally drawn by
+  // several consecutive frames, so the retired frame's generation is often
+  // still being read by a newer one. begin_frame's fence wait is the only
+  // completion signal gfx gives (no fence is exposed, and no semaphore may
+  // cross the seam), and it says a frame finished, not that a generation did.
   std::uint64_t frame_generations[kFramesInFlight] = {};
   std::size_t frame_slot = 0;
   std::size_t mesh_slot = 0;
+  // Diagnostic only: what the last few frames drew, dumped when a device loss
+  // (or any begin_frame failure) is detected. See FrameTrace.
+  FrameTrace trace;
 
   ~RendererImpl() {
     // Before anything else, and before any member is destroyed: the fuse thread
@@ -538,9 +620,14 @@ struct RendererImpl {
   const VkExtent2D extent{static_cast<std::uint32_t>(size.width),
                           static_cast<std::uint32_t>(size.height)};
 
+  FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
+
   vg::Result<std::optional<vg::windowing::Frame>> frame =
       _impl->app.begin_frame(extent);
   if (!frame) {
+    // The fault happened in an *earlier* frame; this is only where it is
+    // noticed. Dump what those frames were doing before the error propagates.
+    _impl->trace.dump(frame.status().message().c_str());
     set_error(error, frame.status(), "begin_frame");
     return NO;
   }
@@ -647,17 +734,53 @@ struct RendererImpl {
     live.indirect = live_src.indirect;
     const vg::pipelines::HybridMeshDraw draw{live};
 
-    // Park the generation this frame draws, and release the one the frame that
-    // just retired drew. begin_frame already waited on that frame's fence, so
-    // its slot is genuinely free -- and releasing here rather than at teardown
-    // is what keeps recon's ring turning.
-    const std::size_t retiring =
+    // Park the generation this frame draws, then release everything strictly
+    // older than the oldest generation any frame still in flight is reading.
+    //
+    // Releasing "what the frame that just retired drew" is what this used to
+    // do, and it is wrong whenever one generation spans more than one frame --
+    // which is the normal case, not a corner: mesh_slot advances only when
+    // take_mesh yields a *new* mesh, so at 60 Hz with a remesh every few fused
+    // frames the same generation is drawn many frames running. Two frames in
+    // flight then both hold it, begin_frame has waited on only the older one's
+    // fence, and releasing on that fence hands recon a slot the newer frame is
+    // still reading. recon is then free to pick it -- and a grow *frees* its
+    // buffers outright, so the in-flight draw reads a destroyed VkBuffer. That
+    // is a GPU fault surfacing as VK_ERROR_DEVICE_LOST out of the next
+    // vkWaitForFences, and it needs the arena to actually grow, which is why it
+    // only shows up once the scan gets large.
+    //
+    // The min is over the whole array because every entry names a frame still
+    // in flight once the current one is recorded; anything older than all of
+    // them is finished everywhere. release_through is a monotonic high-water
+    // mark, so a repeated or lower value is harmless.
+    const std::size_t recording =
         _impl->frame_slot % RendererImpl::kFramesInFlight;
-    if (_impl->frame_generations[retiring] != 0) {
-      _impl->fusion.release_through(_impl->frame_generations[retiring]);
-    }
-    _impl->frame_generations[retiring] = live_src.generation;
+    _impl->frame_generations[recording] = live_src.generation;
     ++_impl->frame_slot;
+
+    std::uint64_t oldest_in_flight = 0;
+    for (const std::uint64_t g : _impl->frame_generations) {
+      if (g != 0 && (oldest_in_flight == 0 || g < oldest_in_flight)) {
+        oldest_in_flight = g;
+      }
+    }
+    // Generations are pre-incremented from 0, so 1 is the first real one and
+    // there is nothing below it to release.
+    if (oldest_in_flight > 1) {
+      _impl->fusion.release_through(oldest_in_flight - 1);
+    }
+
+    const app::FusionStats s = _impl->fusion.stats();
+    trace.drew_mesh = true;
+    trace.generation = live_src.generation;
+    trace.mesh_slot = _impl->mesh_slot;
+    trace.released_through = oldest_in_flight > 1 ? oldest_in_flight - 1 : 0;
+    trace.triangles = s.triangles;
+    trace.triangle_capacity = s.triangle_capacity;
+    trace.arena_bytes = s.arena_bytes;
+    trace.active_blocks = s.active_blocks;
+    trace.extract_ms = s.extract_ms;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is
     // just as reachable as a zero height -- an orientation change, an iPad
@@ -877,25 +1000,30 @@ struct RendererImpl {
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can now both be present and both carry a `Status::message()`.
   char buf[1024];
-  std::snprintf(buf, sizeof(buf),
-                "fused %llu / remesh %llu  v%u\n"
-                "  mesh      %u verts / %u tris\n"
-                "  allocate  %.1f ms\n"
-                "  integrate %.1f ms\n"
-                "  extract   %.1f ms\n"
-                "  arena     %u tris planned / %u blocks -> %.1f MB (%.2f%% "
-                "full)\n"
-                "  texture   %.1f ms%s%s",
-                static_cast<unsigned long long>(s.frames_fused),
-                static_cast<unsigned long long>(s.remeshes), s.mesh_version,
-                s.vertices, s.triangles, s.allocate_ms, s.integrate_ms,
-                s.extract_ms, s.triangle_capacity, s.active_blocks,
-                static_cast<double>(s.arena_bytes) / (1024.0 * 1024.0),
-                s.triangle_capacity > 0
-                    ? 100.0 * static_cast<double>(s.triangles) /
-                          static_cast<double>(s.triangle_capacity)
-                    : 0.0,
-                s.texture_ms, errors.c_str(), upload.c_str());
+  std::snprintf(
+      buf, sizeof(buf),
+      "fused %llu / remesh %llu  v%u\n"
+      "  mesh      %u verts / %u tris\n"
+      "  allocate  %.1f ms\n"
+      "  integrate %.1f ms\n"
+      "  extract   %.1f ms\n"
+      "  arena     %u tris planned / %u blocks -> %.1f MB (%.2f%% "
+      "full)\n"
+      "  table     %u / %u blocks (%.1f%% occupied)\n"
+      "  texture   %.1f ms%s%s",
+      static_cast<unsigned long long>(s.frames_fused),
+      static_cast<unsigned long long>(s.remeshes), s.mesh_version, s.vertices,
+      s.triangles, s.allocate_ms, s.integrate_ms, s.extract_ms,
+      s.triangle_capacity, s.active_blocks,
+      static_cast<double>(s.arena_bytes) / (1024.0 * 1024.0),
+      s.triangle_capacity > 0 ? 100.0 * static_cast<double>(s.triangles) /
+                                    static_cast<double>(s.triangle_capacity)
+                              : 0.0,
+      s.active_blocks, s.table_capacity,
+      s.table_capacity > 0 ? 100.0 * static_cast<double>(s.active_blocks) /
+                                 static_cast<double>(s.table_capacity)
+                           : 0.0,
+      s.texture_ms, errors.c_str(), upload.c_str());
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`

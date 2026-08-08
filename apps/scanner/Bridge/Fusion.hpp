@@ -82,23 +82,30 @@ struct FusionConfig {
   std::int32_t num_buckets = 1024;
   /// Ceiling on that growth, in buckets.
   ///
-  /// 4096 is 192 MiB resident, and ~288 MiB transiently at the doubling that
-  /// reaches it: `VoxelBlockGrid::resize` builds the grown buffers alongside
-  /// the old ones and commits only once the map resize succeeds. Past that a
-  /// phone is into jetsam range, where the app *disappears* rather than
-  /// surfacing the OutOfMemory that recon is written to report. Refusing to
-  /// grow instead leaves a scan that is missing far geometry, still running,
-  /// and saying so in @ref FusionStats::last_error.
+  /// `VoxelBlockGrid::resize` builds the grown buffers alongside the old ones
+  /// and commits only once the map resize succeeds, so each doubling costs
+  /// ~1.5x the new size transiently. 16384 buckets is ~768 MiB resident and
+  /// ~1.1 GiB at the doubling that reaches it -- an iPad-Pro number, not a
+  /// phone number. Lower it for phone builds.
   ///
-  /// **At 1 cm this ceiling covers ~4x less scene than it did at 2 cm** -- it
-  /// bounds blocks, and the finer voxel needs ~4x of them for the same
-  /// surface. So this reaches roughly a large tabletop rather than a room. It
-  /// is deliberately *not* raised to compensate: 16384 would be 768 MiB
-  /// resident and ~1.1 GiB at the doubling, and the jetsam argument above is
-  /// the reason the number is what it is. Raise it for a room-scale scan on a
-  /// device with the headroom (an iPad Pro, not a phone) -- and know that the
-  /// failure it prevents is graceful and reported, not a crash.
-  std::int32_t max_buckets = 4096;
+  /// **What this ceiling does is now enforced, which it previously was not.**
+  /// It was 4096, and reaching it meant the table simply kept filling: the
+  /// allocate kernel's overflow path scans every entry, so its cost per insert
+  /// climbs with occupancy, and at 31480 of 32768 blocks (96%) on an M5 iPad
+  /// Pro it hung the GPU outright rather than reporting anything. The stated
+  /// intent -- "a scan that is missing far geometry, still running, and saying
+  /// so" -- lived only in this comment. @ref Fusion::fuse now stops allocating
+  /// past 85% occupancy, which is what makes that true, and is why a *lower*
+  /// ceiling now costs coverage rather than stability.
+  ///
+  /// **At 1 cm this covers ~4x less scene than at 2 cm** -- it bounds blocks,
+  /// and the finer voxel needs ~4x of them for the same surface. 16384 reaches
+  /// roughly a small room at 1 cm; a 5 m walk filled it (111542 of 131072
+  /// blocks). Coarsening @ref voxel_size buys area ~4x faster than raising this
+  /// does, and costs no memory. Raising it further needs the
+  /// `extended-virtual-addressing` entitlement, which a personal signing team
+  /// cannot provision -- see apps/scanner/scanner.entitlements.
+  std::int32_t max_buckets = 16384;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
   /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
@@ -167,6 +174,11 @@ struct FusionStats {
   /// triangles -- and the read-out showed only the few thousand.
   std::uint32_t triangle_capacity = 0;
   std::uint64_t arena_bytes = 0;
+  /// Block-table capacity (`num_buckets * 8`), so the read-out can show
+  /// occupancy against @ref active_blocks. This is the number that matters for
+  /// GPU hangs: the allocate kernel's overflow path scans the whole table, so
+  /// its cost per insert climbs with occupancy long before anything fails.
+  std::uint32_t table_capacity = 0;
   /// Set when a stage failed; the loop keeps running so one bad frame does not
   /// end the scan, but the reason stays visible.
   ///
