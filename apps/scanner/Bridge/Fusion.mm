@@ -112,8 +112,9 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
-  vr::Result<std::uint32_t> overflow =
-      grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
+  vr::volume::AllocFailures failures;
+  vr::Result<std::uint32_t> overflow = grid_->map().allocate_from_depth(
+      frame.depth, frame.depth_camera, &failures);
   if (!overflow) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -124,8 +125,19 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // block indices, so everything already fused keeps its tsdf/weight/color at
   // the same offset, and another doubling is cheap next to the frame it would
   // otherwise fuse with holes.
+  //
+  // Gated on capacity_limited(), not on the count alone. Depth is the most
+  // contended entry point in the map -- adjacent LiDAR pixels dilate into the
+  // same block, and the kernel's bucket spin-lock gives up after a bounded
+  // number of retries -- so a residue of pure lock failures is the expected
+  // outcome on a table with room to spare. Growing on that is the worst trade
+  // this app can make: resize builds the grown attribute arrays beside the old
+  // ones, so a doubling toward the 4096-bucket ceiling peaks around 288 MiB
+  // transient for pressure that does not exist, and on a phone that is the
+  // jetsam range max_buckets is chosen to stay out of.
   int grow_attempts = 0;
-  while (overflow.value() > 0 && grow_attempts < kMaxGrowAttempts) {
+  while (overflow.value() > 0 && failures.capacity_limited() &&
+         grow_attempts < kMaxGrowAttempts) {
     if (config_.num_buckets >= config_.max_buckets) {
       frame_error = "allocate: map at its " +
                     std::to_string(config_.max_buckets) + "-bucket ceiling, " +
@@ -148,8 +160,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // the only thing that says whether the grown map actually absorbed the
     // frame; dropping it fuses against a grid still missing those blocks and
     // reports success.
-    overflow =
-        grid_->map().allocate_from_depth(frame.depth, frame.depth_camera);
+    overflow = grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
+                                                &failures);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -159,9 +171,22 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     }
   }
   if (overflow.value() > 0 && frame_error.empty()) {
-    frame_error = "allocate: " + std::to_string(overflow.value()) +
-                  " blocks dropped after " + std::to_string(grow_attempts) +
-                  " grow(s); some geometry will be missing";
+    // Named by reason, because the two call for opposite responses from whoever
+    // reads the overlay: a capacity limit means the scan has outgrown the map,
+    // while contention means this frame lost a race and the next one will not
+    // (the blocks that did land are present now, so fewer threads collide).
+    if (failures.capacity_limited()) {
+      frame_error = "allocate: " + std::to_string(overflow.value()) +
+                    " blocks dropped after " + std::to_string(grow_attempts) +
+                    " grow(s) (" + std::to_string(failures.chain) + " chain, " +
+                    std::to_string(failures.heap) + " heap, " +
+                    std::to_string(failures.table) +
+                    " table); some geometry will be missing";
+    } else {
+      frame_error = "allocate: " + std::to_string(overflow.value()) +
+                    " allocations lost bucket-lock races (no capacity limit); "
+                    "not grown -- the next frame re-dilates the same blocks";
+    }
   }
   // Integrated anyway when blocks were dropped: what *did* allocate still
   // fuses, and a partial frame beats none. The error above is what keeps it

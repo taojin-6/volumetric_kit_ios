@@ -236,6 +236,11 @@ class SharedDevice {
   VkPhysicalDeviceFeatures enabled_features_{};
   bool enabled_timeline_semaphore_ = false;
   bool enabled_scalar_block_layout_ = false;
+  /// gfx's alone (recon renders nothing). A member rather than a `build` local
+  /// so @ref gfx_payload can declare it from the same value `build` wrote into
+  /// `VkPhysicalDeviceVulkan13Features`, leaving no way for the request and the
+  /// declaration to disagree.
+  bool enabled_dynamic_rendering_ = false;
 
   std::uint32_t api_version_ = 0;
   std::string device_name_;

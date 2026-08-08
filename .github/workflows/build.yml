@@ -50,29 +50,31 @@ jobs:
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
         run: tools/fetch_moltenvk.sh
 
-      # BOTH siblings are declared with GIT_TAG main -- moving refs, not pins. So
-      # CMakeLists.txt is byte-identical when either advances, and hashing it
-      # alone would hold the cache key steady at exactly the moment the cached
-      # sources went stale. Resolve both tips and fold them into the key.
+      # recon and gfx are both declared with GIT_TAG main -- moving refs, not
+      # pins. So CMakeLists.txt is byte-identical when either advances, and
+      # hashing it alone would hold the cache key steady at exactly the moment
+      # the cached sources went stale. Resolve both tips and fold them into the
+      # key.
       #
-      # Resolving only recon is not a smaller version of this policy, it defeats
-      # it: gfx moved (06d1db0 replaced HybridMeshDraw::mesh with a `geometry`
-      # variant), recon did not, the key held, _deps restored pre-06d1db0 gfx
-      # sources, and CI compiled a member that no longer exists -- green against
-      # code that does not build from clean. Every ref the key does not name is
-      # a ref that can go stale silently.
+      # Both, not just recon: a key covering one sibling still goes stale when
+      # the other moves, and an exact hit on a stale key is worse than a miss --
+      # FetchContent will not re-clone over a populated _deps, so the build
+      # compiles the pre-drift sources and reports green. That is not
+      # hypothetical; gfx's HybridMeshDraw rename (#8) would have sailed through
+      # on a gfx-only day and was caught only because recon happened to move the
+      # same day and force a clean miss.
       #
       # Deps that really are pinned (glm at 1.0.3) stay covered by the hash.
       - name: Resolve moving sibling refs
         id: pins
         run: |
           set -euo pipefail
-          for dep in recon gfx; do
-            url="https://github.com/taojin-6/volumetric_kit_${dep}.git"
+          for repo in recon gfx; do
+            url="https://github.com/taojin-6/volumetric_kit_${repo}.git"
             sha=$(git ls-remote "${url}" main | cut -f1)
             test -n "${sha}"
-            echo "${dep}=${sha}" >>"${GITHUB_OUTPUT}"
-            echo "volumetric_kit_${dep} main is at ${sha}"
+            echo "${repo}=${sha}" >>"${GITHUB_OUTPUT}"
+            echo "volumetric_kit_${repo} main is at ${sha}"
           done
 
       - name: Cache FetchContent dependencies
@@ -85,9 +87,9 @@ jobs:
           # No restore-keys, deliberately. A partial hit would restore the
           # source tree from before the ref moved, and FetchContent does not
           # reliably re-clone over an already-populated _deps -- so the build
-          # could compile stale recon and report green, which is worse than no
-          # cache at all. A clean miss re-fetches; that is the run we most need
-          # to be honest.
+          # could compile stale sibling sources and report green, which is worse
+          # than no cache at all. A clean miss re-fetches; that is the run we
+          # most need to be honest.
 
       - name: Configure
         run: |
