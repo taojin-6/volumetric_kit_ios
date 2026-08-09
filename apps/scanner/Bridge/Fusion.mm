@@ -105,6 +105,23 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
         // only it knows which, which is why this tier takes them.
         mc_config.extra_vertex_usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
         mc_config.extra_index_usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        // In-block vertex sharing: one vertex where the cells meeting on an
+        // edge would each have emitted their own, instead of three private ones
+        // per triangle. Selects recon's second sparse kernel at create().
+        //
+        // Safe HERE specifically because FusionConfig::texture is off.
+        // ProjectiveTexturer decides visibility per *triangle* and writes uv0
+        // per *vertex*, which is well-defined only while a vertex belongs to
+        // one triangle -- and recon's texturer refuses a shared mesh outright
+        // rather than letting the write order decide. Flipping `texture` back
+        // on means turning this off, until the per-primitive camera id lands.
+        //
+        // Roughly a 3x vertex reduction for the same surface; the exact figure
+        // is a property of the scan, so trust this device's own read-out
+        // (`arena_bytes` against the triangle count) over any number quoted
+        // from a desktop fixture. Memory is why it is on here: an iPad is where
+        // the arena ceiling is real.
+        mc_config.share_vertices = true;
         mc_config.slot_count = config.mesh_slots;
         // Held by value there, so copied rather than pointed at -- the config
         // outlives this lambda's temporaries.
