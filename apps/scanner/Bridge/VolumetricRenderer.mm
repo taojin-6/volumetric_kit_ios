@@ -1170,7 +1170,6 @@ struct RendererImpl {
   };
   const PhaseCell phases[] = {
       {"compact", s.extract.compact_ms},
-      {"lut", s.extract.neighbour_lut_ms},
       {"inputs", s.extract.input_upload_ms},
       {"sizing", s.extract.arena_alloc_ms},
       {"desc", s.extract.descriptor_ms},
