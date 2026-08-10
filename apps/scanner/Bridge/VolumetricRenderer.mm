@@ -52,6 +52,12 @@
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
+// vr::StageRow, named directly by -initWithRow: and by the read-out's row loop.
+// Reached transitively through Fusion.hpp today, which is the pattern the
+// <cstdio> note above records going wrong: pruning that header's includes, or
+// recon relocating the type, breaks this file with an unknown-type error in a
+// translation unit nobody edited.
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
 
 namespace vg = volumetric_kit::gfx;
@@ -535,6 +541,36 @@ struct RendererImpl {
   RendererImpl(const RendererImpl&) = delete;
   RendererImpl& operator=(const RendererImpl&) = delete;
 };
+
+// The stage-row value type. At file scope, not inside the renderer's
+// @implementation -- Objective-C has no nested implementations.
+@interface VolumetricStageRow ()
+- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row;
+@end
+
+@implementation VolumetricStageRow
+- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row {
+  if ((self = [super init])) {
+    // Copied, unlike the C++ row which borrows: an NSString outliving the
+    // literal costs nothing here, and it frees the Swift side from the
+    // lifetime rule StageRow carries.
+    //
+    // Through to_ns_string like every other string this file hands Swift, not
+    // through a bare stringWithUTF8String:. `name` is inside
+    // NS_ASSUME_NONNULL_BEGIN, so Swift imports it as a non-optional String
+    // that traps on the nil that call returns for invalid UTF-8 -- and the
+    // labels are library literals this file does not choose, which is the same
+    // reason deviceName goes through it. Today they are ASCII; FusionStats'
+    // own warning about a row named from somewhere else is the case this
+    // covers.
+    _name = to_ns_string(row.name != nullptr ? row.name : "");
+    _cpuMs = row.cpu_ms;
+    _gpuMs = row.gpu_ms;
+    _hasGpu = row.has_gpu ? YES : NO;
+  }
+  return self;
+}
+@end
 
 @implementation VolumetricRenderer {
   std::unique_ptr<RendererImpl> _impl;
@@ -1257,6 +1293,20 @@ struct RendererImpl {
   return _impl->camera.distance();
 }
 
+- (NSArray<VolumetricStageRow*>*)stageRows {
+  const app::FusionStats s = _impl->fusion.stats();
+  NSMutableArray<VolumetricStageRow*>* rows =
+      [NSMutableArray arrayWithCapacity:s.stage_count];
+  for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+    [rows addObject:[[VolumetricStageRow alloc] initWithRow:s.stages[i]]];
+  }
+  // Immutable, because the property says `copy` and a caller reading that
+  // attribute is entitled to a value that cannot change under it. Eight
+  // elements at a few hertz is not the cost worth keeping a live mutable array
+  // to save.
+  return [rows copy];
+}
+
 - (NSString*)fusionSummary {
   const app::FusionStats s = _impl->fusion.stats();
   // The upload is the render thread's stage, so it is not in FusionStats -- but
@@ -1595,6 +1645,117 @@ struct RendererImpl {
     }
   }
 
+  // The fused stages, from the rows recon reported rather than from the host
+  // scalars beside them.
+  //
+  // Both halves, because the gap is the finding: the host figure is wall clock
+  // around a fence-blocked submit -- host record, submit, the fence stall and
+  // device execution together -- while `gpu` is the dispatch alone. A stage
+  // whose device share is small is not a slow kernel and will not be fixed by
+  // a faster one, and on this device that distinction has been guesswork.
+  //
+  // But subtract the two ONLY on a row with no breakdown beneath it. The halves
+  // nest differently: a host scope spans a whole call, a device span covers one
+  // dispatch, so an indented `..` row's kernel ran inside its parent's host
+  // span while reporting its device time on its own line. `integrate` measured
+  // 18.86 ms host / 10.61 gpu with `..active set` at 6.98 / 6.39 beneath it --
+  // reading the 8.25 ms difference as submit overhead sends the reader after a
+  // stall that is 6.39 ms of measured kernel printed on the next line.
+  // recon encodes this asymmetry deliberately; see StageMetrics::
+  // kBreakdownPrefix and total_gpu_ms, which skips breakdowns in one total and
+  // not the other for exactly this reason.
+  //
+  // Built as a block rather than as more varargs, for the reason the phase
+  // cells are: same-typed floats in a positional list are the one mislabel
+  // -Wformat cannot see. A row with no device span prints a dash rather than
+  // 0.00 -- "not measured" and "measured, and fast" are different claims, and
+  // `has_gpu` is what tells them apart.
+  //
+  // A sub-table in the 12-column gutter, exactly as `phases/ms` is, rather than
+  // rows sitting directly in the outer table. That is what lets the label field
+  // be 14 wide: recon's breakdown rows carry its `"  .."` prefix on top of
+  // their own name, so `  ..active set` is 14 characters and will not fit the
+  // 10 the outer gutter leaves. In a `%-9s` field it did not truncate, it
+  // *shifted* -- its two figures printed five columns right of every
+  // neighbouring row's, on the one row this whole change exists to surface --
+  // and widening the outer table instead would move every other line on the
+  // read-out to suit one library label.
+  //
+  // The prefix survives into the display deliberately: indentation is how the
+  // breakdown says it decomposes the row above rather than standing beside it,
+  // which is the distinction the paragraph above is about.
+  std::string stage_rows;
+  const auto stage_gutter = [&stage_rows](bool first) {
+    stage_rows += first ? " " : "\n            ";
+  };
+  for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+    const vr::StageRow& row = s.stages[i];
+    // Fixed widths for the reason the phase cells have them: this string is
+    // rebuilt continuously, and a value gaining a digit would shift every
+    // column to its right.
+    char cell[64];
+    if (row.has_gpu) {
+      std::snprintf(cell, sizeof(cell), "%-14s%7.2f   gpu %7.2f", row.name,
+                    row.cpu_ms, row.gpu_ms);
+    } else {
+      std::snprintf(cell, sizeof(cell), "%-14s%7.2f   gpu %7s", row.name,
+                    row.cpu_ms, "-");
+    }
+    stage_gutter(i == 0);
+    stage_rows += cell;
+  }
+  if (s.stage_count == 0) {
+    // The fallback, which is what keeps `FusionConfig::measure_stages` a switch
+    // rather than a regression: these two scalars are measured on every fused
+    // frame either way. No `gpu` column at all, because there is genuinely no
+    // measurement to put in one -- a dash there would report a row that was
+    // never asked for as one that was asked for and came back empty.
+    char cell[64];
+    std::snprintf(cell, sizeof(cell), "%-14s%7.2f", "allocate",
+                  static_cast<double>(s.allocate_ms));
+    stage_gutter(true);
+    stage_rows += cell;
+    std::snprintf(cell, sizeof(cell), "%-14s%7.2f", "integrate",
+                  static_cast<double>(s.integrate_ms));
+    stage_gutter(false);
+    stage_rows += cell;
+  } else {
+    // What the rows above are, when they are not this frame's. They publish
+    // only on the fully-successful fuse path, so four early returns leave the
+    // last good set standing -- the same hazard `extract_stale` and
+    // `survey_stale` cover, and the reason FusionStats carries an age for them.
+    //
+    // Measured *against* `ms_since_fuse` rather than against a wall clock of
+    // its own, because the pair is the reading and neither half means much
+    // alone. An ARKit interruption stops both, and announcing stale timings
+    // there would blame the fusion for a phone call -- the same fault
+    // `ms_since_fuse` was added to stop this read-out making one row above. The
+    // difference isolates the other case: frames arriving, none completing.
+    //
+    // A second of that, for the reason the fuse-liveness note uses a second --
+    // generous against a 60 Hz capture, so this fires on a stage that is
+    // failing rather than on a slow frame.
+    constexpr float kStagesStaleAfterMs = 1000.0f;
+    if (s.ms_since_stages > s.ms_since_fuse + kStagesStaleAfterMs) {
+      char note[96];
+      std::snprintf(note, sizeof(note), "\n            (%.1f s old)",
+                    static_cast<double>(s.ms_since_stages) / 1000.0);
+      stage_rows += note;
+    }
+    if (s.stages_truncated) {
+      stage_rows += "\n            (more stages than this holds)";
+    }
+    // Named, because the aftermath is silent by construction: every row goes
+    // host-only and every gpu cell becomes a dash, which is exactly what a
+    // device with no timestamp support looks like. One is a fault, the other is
+    // hardware. See FusionConfig::measure_stages.
+    if (s.gpu_timing_retired) {
+      stage_rows +=
+          "\n            (device timing retired after a fence failure -- host "
+          "only for the rest of this run)";
+    }
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can both be present and both carry a `Status::message()`.
   //
@@ -1635,8 +1796,12 @@ struct RendererImpl {
       // block rather than given a row of its own here.
       "%s"
       "  mesh      %u verts / %u tris\n"
-      "  allocate  %.1f ms\n"
-      "  integrate %.1f ms\n"
+      // The fuse's own stages, host and device. A labelled group with its rows
+      // in the 12-column gutter, like `phases/ms` below and for the same two
+      // reasons: its widest label does not fit the outer table, and same-typed
+      // doubles in a positional vararg list are the one mislabel -Wformat
+      // cannot see. Built above, where the branches are.
+      "  stages/ms%s\n"
       "  extract   %.1f ms%s\n"
       // recon's phase split, listed rather than grouped into host/GPU totals:
       // several are genuinely both (`compact` is a dispatch plus its readback
@@ -1666,8 +1831,8 @@ struct RendererImpl {
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
       errors.c_str(), upload.c_str(), memory_warnings.c_str(),
-      memory_rows.c_str(), s.vertices, s.triangles, s.allocate_ms,
-      s.integrate_ms, s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
+      memory_rows.c_str(), s.vertices, s.triangles, stage_rows.c_str(),
+      s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
       s.extract.triangle_capacity,
       s.extract.triangle_capacity > 0
           ? 100.0 * static_cast<double>(s.triangles) /

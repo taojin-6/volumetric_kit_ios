@@ -32,6 +32,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
@@ -161,6 +162,33 @@ struct FusionConfig {
   /// calling a transient cost a limit.) Nothing retries or falls back, so
   /// turning the survey off must not need a source edit and a rebuild.
   bool track_dirty_blocks = true;
+  /// Ask each tier for its host/device stage rows -- @ref FusionStats::stages.
+  ///
+  /// **A field for the same reason @ref track_dirty_blocks is one, and the rule
+  /// stated there applies verbatim: turning this off must not need a source
+  /// edit and a rebuild.** A non-null `StageMetrics*` is not merely somewhere
+  /// to write timings; it routes every dispatch behind it onto recon's *timed*
+  /// submit path, which resets a query pool, writes two timestamps and reads
+  /// them back per command buffer. On a fused frame that is the allocate (once
+  /// per grow retry, so up to `kMaxGrowAttempts + 1` times), the fusion
+  /// dispatch, and the active-set compaction -- every frame, at capture rate.
+  ///
+  /// On, because the numbers are the point: a host span around a fence-blocked
+  /// submit cannot separate a slow kernel from a stalled queue, and that
+  /// distinction has been guesswork on this device. The readback rides an
+  /// already-blocking wait rather than adding a second stall. Off costs only
+  /// the device column -- @ref FusionStats::allocate_ms and @ref
+  /// FusionStats::integrate_ms are measured either way and the read-out falls
+  /// back to them.
+  ///
+  /// @warning Device timing can retire itself mid-run, and does not come back.
+  ///          recon's tiers hold long-lived `GpuTimer`s; a failed
+  ///          `vkWaitForFences` leaks the command buffer carrying that window's
+  ///          queries, so the timer calls `abandon()` and every row is
+  ///          host-only from then on. Nothing here can reset it, and without
+  ///          @ref FusionStats::gpu_timing_retired that state is
+  ///          indistinguishable from a device that never had timestamps at all.
+  bool measure_stages = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
   /// **Still off, and still load-bearing that it is.** `ProjectiveTexturer`
@@ -240,10 +268,79 @@ struct FusionStats {
   std::uint32_t vertices = 0;
   std::uint32_t triangles = 0;
   std::uint32_t mesh_version = 0;
+  /// Host spans around the allocate and the integrate, measured on every fused
+  /// frame whatever @ref FusionConfig::measure_stages says.
+  ///
+  /// These are what the read-out falls back to when @ref stage_count is 0, so
+  /// turning stage measurement off costs the device column and nothing else.
+  /// When rows *are* present they carry these same host spans and more --
+  /// recon's `allocate` row accumulates across the grow retries this pair can
+  /// only total, and each row has a device half beside it.
   float allocate_ms = 0.0f;
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
+
+  /// @brief Upper bound on @ref stages; rows past it are dropped, not grown
+  ///        into.
+  static constexpr std::size_t kMaxStages = 8;
+
+  /// @brief The per-stage host/device rows recon reported for the last fused
+  ///        frame, or none when @ref FusionConfig::measure_stages is off.
+  ///
+  /// Empty until a frame fuses all the way through, and **not cleared by a
+  /// frame that fails before then** -- see @ref ms_since_stages, which is what
+  /// says how old they are.
+  ///
+  /// A fixed array, not a `std::vector`: this struct is copied out under the
+  /// publish mutex the fuse thread takes every frame, and a vector would malloc
+  /// inside that critical section -- the reason @ref FusionTraceStats exists at
+  /// all.
+  ///
+  /// Five rows on a healthy frame -- `allocate`, `resize`, `integrate`, its
+  /// `"  ..active set"` breakdown, and `texture` when @ref
+  /// FusionConfig::texture is on -- so eight leaves room. **The extract is not
+  /// among them:** `MarchingCubes::extract_device` reports through
+  /// `mesh::ExtractTimings`, a richer per-phase struct this app already holds
+  /// whole in @ref extract and prints beneath these. A row for it would be a
+  /// second, coarser copy of a number already on screen.
+  ///
+  /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
+  ///          from a recon tier reporting with a string literal, or from a
+  ///          literal this file passes to `StageScope`, so the pointers outlive
+  ///          any read -- but a row added from a non-literal would dangle.
+  vr::StageRow stages[kMaxStages]{};
+  /// How many of @ref stages are real.
+  std::uint32_t stage_count = 0;
+  /// Whether recon reported more rows than @ref kMaxStages held.
+  ///
+  /// A dropped row is otherwise invisible: `stage_count == kMaxStages` reads
+  /// exactly like a frame that happened to have eight. A consumer summing the
+  /// column would under-report with no error and no counter to notice it by.
+  bool stages_truncated = false;
+  /// Milliseconds since @ref stages was last published, computed when the
+  /// snapshot is taken.
+  ///
+  /// The staleness half, in the one unit that can carry it. The rows publish on
+  /// the same fully-successful path that increments @ref frames_fused, so a
+  /// frame count between them is always zero by construction and says nothing
+  /// -- the frames that leave these rows behind are exactly the ones that never
+  /// reach the counter. Compare @ref ms_since_fuse: that one is stamped at
+  /// every `fuse` *entry*, so a large gap between the two is precisely "the
+  /// loop is running and no frame is completing", which is the state a
+  /// persistently failing integrate leaves the read-out in.
+  ///
+  /// Zero when no frame has ever published rows, where "0 ms ago" would read as
+  /// current. Check @ref stage_count first.
+  float ms_since_stages = 0.0f;
+  /// Whether device timing was measured once and has since retired itself.
+  ///
+  /// recon's tiers hold long-lived `GpuTimer`s that `abandon()` on a failed
+  /// fence wait, permanently and process-wide. Without this the aftermath --
+  /// every row host-only, every device cell a dash -- is indistinguishable from
+  /// a queue family that never reported timestamps, which is a hardware verdict
+  /// rather than a fault. See @ref FusionConfig::measure_stages.
+  bool gpu_timing_retired = false;
   /// @brief The last successful extract's own timings and counts, held whole.
   ///
   /// recon's struct by value rather than a hand-picked copy of its fields.
@@ -618,7 +715,17 @@ class Fusion {
   bool valid() const noexcept { return grid_.has_value(); }
 
  private:
-  void remesh(const vr::sensor::CapturedFrame& frame);
+  /// @brief Extract the mesh, and texture it when @ref FusionConfig::texture is
+  ///        on.
+  /// @param metrics  @ref fuse's reporting window, or null when @ref
+  ///                 FusionConfig::measure_stages is off. Threaded through
+  ///                 rather than opened here because the `texture` row belongs
+  ///                 beside the fuse's own: one window per frame is what makes
+  ///                 the rows comparable. The extract is *not* measured into it
+  ///                 -- it reports through `mesh::ExtractTimings`; see @ref
+  ///                 FusionStats::stages.
+  void remesh(const vr::sensor::CapturedFrame& frame,
+              vr::StageMetrics* metrics);
 
   FusionConfig config_{};
   // recon's per-scan state is create-only (no default constructor), which is
@@ -687,6 +794,20 @@ class Fusion {
   // loop is alive, and stamping only the success path would report a *running*
   // scan as interrupted. `stats()` reads it on the main thread.
   std::atomic<std::int64_t> last_fuse_ns_{0};
+  // steady_clock nanoseconds at the last publish of `stats_.stages`, for
+  // FusionStats::ms_since_stages. The same shape as last_fuse_ns_ above and
+  // read the same way -- but stamped on the *success* path only, which is the
+  // whole point: the difference between the two is what a failing stage looks
+  // like. See that field for why a frame count cannot express this.
+  std::atomic<std::int64_t> last_stages_ns_{0};
+  // Whether any published row has ever carried a device span.
+  //
+  // A one-way latch, and it has to be: what it detects is a GpuTimer that
+  // retired mid-run (FusionConfig::measure_stages), which is permanent and
+  // leaves no other trace. Rows arriving host-only *before* this is set are an
+  // ordinary device without timestamp support, so the latch is exactly the term
+  // that tells those two apart.
+  bool gpu_timing_seen_ = false;
   // `stats_.frames_fused` when the current dirty window opened -- the last time
   // `fuse` called `reset_dirty`. The published window length is measured from
   // this rather than assumed to be the survey cadence, because a frame that
