@@ -237,6 +237,46 @@ std::string api_version_string(std::uint32_t v) {
          std::to_string(VK_API_VERSION_PATCH(v));
 }
 
+/// The read-out's word for an @ref app::AllocationStop, and the only place one
+/// is turned into English.
+///
+/// A lookup rather than a literal at each site, because the read-out's job here
+/// is to report a cause, not to guess one. The `table` row used to append a
+/// hard-coded "(volume full)" to a flag that meant only "not allocating this
+/// frame", so a failed `load_factor` -- which fabricates a full table to fail
+/// safe -- printed a full volume directly beneath the banner naming the real
+/// upstream fault, and told the user to coarsen their voxels over it. Fusion
+/// deliberately withholds its own "volume full" string on that path; this is
+/// what stops the panel undoing that.
+const char* allocation_stop_note(app::AllocationStop stop) {
+  switch (stop) {
+    case app::AllocationStop::None:
+      return "";
+    case app::AllocationStop::VolumeFull:
+      return "  -- NOT TAKING NEW GEOMETRY (volume full)";
+    case app::AllocationStop::OccupancyUnknown:
+      return "  -- NOT TAKING NEW GEOMETRY (occupancy unreadable, see error)";
+    case app::AllocationStop::BlocksDropped:
+      return "  -- NOT TAKING NEW GEOMETRY (blocks dropped, see error)";
+  }
+  return "";
+}
+
+/// The same cause, abbreviated for the frame trace's fixed-width line.
+const char* allocation_stop_tag(app::AllocationStop stop) {
+  switch (stop) {
+    case app::AllocationStop::None:
+      return "ok";
+    case app::AllocationStop::VolumeFull:
+      return "full";
+    case app::AllocationStop::OccupancyUnknown:
+      return "unknown";
+    case app::AllocationStop::BlocksDropped:
+      return "dropped";
+  }
+  return "ok";
+}
+
 // --- Frame trace -------------------------------------------------------------
 // A device loss is reported by the *next* vkWaitForFences, so by the time the
 // error surfaces the frame that faulted is already gone and nothing on the
@@ -259,6 +299,14 @@ struct FrameTrace {
     std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry
     std::uint32_t active_blocks = 0;
     float extract_ms = 0.0f;
+    // The table as the *map* reported it, beside `active_blocks` as the last
+    // successful extract reported it. Both, because the gap between them is
+    // often the fault: this ring is dumped on a device-lost, which is what the
+    // occupancy guard exists to prevent, and in the regime that fires the
+    // guard `active_blocks` is exactly the frozen number the guard stopped
+    // trusting. `stop` says whether the guard was engaged at the time.
+    float occupancy = 0.0f;
+    app::AllocationStop stop = app::AllocationStop::None;
     bool drew_mesh = false;
   };
 
@@ -293,12 +341,13 @@ struct FrameTrace {
       std::snprintf(
           line, sizeof(line),
           "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
-          "arena=%llu blocks=%u extract=%.1fms",
+          "arena=%llu blocks=%u occ=%.1f%% alloc=%s extract=%.1fms",
           static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
           static_cast<unsigned long long>(e.generation), e.mesh_slot,
           static_cast<unsigned long long>(e.released_through), e.triangles,
           e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
-          e.active_blocks, static_cast<double>(e.extract_ms));
+          e.active_blocks, 100.0 * static_cast<double>(e.occupancy),
+          allocation_stop_tag(e.stop), static_cast<double>(e.extract_ms));
       os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);
       std::fprintf(stderr, "vk-trace: %s\n", line);
     }
@@ -991,8 +1040,8 @@ struct RendererImpl {
 
     // The narrow accessor, not stats(): this runs every frame, and FusionStats
     // carries a std::string whose copy would malloc inside the mutex the fuse
-    // thread takes on every one of its own frames. Five scalars is all the ring
-    // holds. See Fusion::trace_stats.
+    // thread takes on every one of its own frames. A handful of scalars is all
+    // the ring holds. See Fusion::trace_stats.
     const app::FusionTraceStats s = _impl->fusion.trace_stats();
     trace.drew_mesh = true;
     trace.generation = live_src.generation;
@@ -1001,6 +1050,8 @@ struct RendererImpl {
     trace.triangle_capacity = s.triangle_capacity;
     trace.arena_bytes = s.arena_bytes;
     trace.active_blocks = s.active_blocks;
+    trace.occupancy = s.occupancy;
+    trace.stop = s.allocation_stop;
     trace.extract_ms = s.extract_ms;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is
@@ -1314,6 +1365,56 @@ struct RendererImpl {
     extract_note += "  [stale " + std::to_string(s.frames_since_extract) + "f]";
   }
 
+  // The `table` row's figure and its suffix, built here rather than as four
+  // more varargs down in the body -- the same argument the phase rows make, and
+  // this row now has a branch in it.
+  //
+  // Both halves of the ratio come from `fuse`, sampled after every resize that
+  // frame: `occupancy` from the map's own heap counter and `table_blocks` from
+  // the bucket count that produced it. Deliberately *not* `table_capacity`,
+  // which is stamped beside `extract.active_blocks` on a successful remesh --
+  // pairing that denominator with this numerator divided a per-fused-frame
+  // figure by a per-remesh one, so the row read "4.3% of 0 blocks" before the
+  // first extract, halved after a doubling whose remesh skipped, and under a
+  // persistent extract failure froze the denominator for the session while the
+  // map doubled beneath it. See FusionStats::table_blocks.
+  std::string table_row;
+  {
+    char cell[192];
+    if (!s.occupancy_known) {
+      // The number in `occupancy` is a fabricated 1.0 that makes the allocate
+      // guard fail safe; printing it as a reading would be inventing a
+      // measurement. See FusionStats::occupancy_known.
+      std::snprintf(cell, sizeof(cell), "occupancy unreadable, of %u blocks",
+                    s.table_blocks);
+    } else {
+      std::snprintf(cell, sizeof(cell), "%.1f%% of %u blocks",
+                    100.0 * static_cast<double>(s.occupancy), s.table_blocks);
+    }
+    table_row = cell;
+    // A stopped scan is a present-tense claim, so it has to stop being made
+    // when the fuse loop stops running. `allocation_stop` and `occupancy` are
+    // per-frame values latched into a snapshot that outlives the frame, and an
+    // ARKit interruption -- a call, Control Centre, the app switcher -- stops
+    // frames without stopping the display link, so the panel went on announcing
+    // a full volume for the length of a phone call, about a scan that was not
+    // allocating because it was not scanning.
+    //
+    // A second is generous against a 60 Hz capture decimated to whatever
+    // `fuse_every` is, and deliberately so: this should fire on an
+    // interruption, not on a slow frame.
+    constexpr float kFuseStaleAfterMs = 1000.0f;
+    if (s.ms_since_fuse > kFuseStaleAfterMs) {
+      char note[96];
+      std::snprintf(note, sizeof(note),
+                    "  -- not fusing (%.1f s since a frame)",
+                    static_cast<double>(s.ms_since_fuse) / 1000.0);
+      table_row += note;
+    } else {
+      table_row += allocation_stop_note(s.allocation_stop);
+    }
+  }
+
   // The dirty-block survey, built here and placed *beside* `table` in the body
   // below rather than appended after the whole thing.
   //
@@ -1558,8 +1659,9 @@ struct RendererImpl {
       // that number refreshes only on a successful remesh, and this row is
       // where someone looks to see whether a scan is still taking geometry in.
       // The suffix is the whole point -- 85% is a threshold, and a threshold a
-      // reader has to already know is one they will miss.
-      "  table     %.1f%% of %u blocks%s%s\n"
+      // reader has to already know is one they will miss. Built above, because
+      // the figure has a branch in it and the suffix has four cases.
+      "  table     %s%s\n"
       "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
@@ -1572,9 +1674,7 @@ struct RendererImpl {
                 static_cast<double>(s.extract.triangle_capacity)
           : 0.0,
       static_cast<double>(s.extract.arena_bytes) / (1024.0 * 1024.0),
-      s.mesh_slots, s.extract.active_blocks,
-      100.0 * static_cast<double>(s.occupancy), s.table_capacity,
-      s.allocation_stopped ? "  -- ALLOCATION STOPPED (volume full)" : "",
+      s.mesh_slots, s.extract.active_blocks, table_row.c_str(),
       dirty_rows.c_str(), s.texture_ms);
   // Mirror the read-out to os_log, throttled.
   //
