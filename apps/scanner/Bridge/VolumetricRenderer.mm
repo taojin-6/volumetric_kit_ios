@@ -1626,6 +1626,34 @@ struct RendererImpl {
     }
   }
 
+  // The fused stages, from the rows recon reported rather than from the host
+  // scalars beside them.
+  //
+  // Both halves, because the gap is the finding: the host figure is wall clock
+  // around a fence-blocked submit -- host record, submit, the fence stall and
+  // device execution together -- while `gpu` is the dispatch alone. A stage
+  // whose device share is small is not a slow kernel and will not be fixed by
+  // a faster one, and on this device that distinction has been guesswork.
+  //
+  // Built as a block rather than as more varargs, for the reason the phase
+  // cells are: same-typed floats in a positional list are the one mislabel
+  // -Wformat cannot see. A row with no device span prints a dash rather than
+  // 0.00 -- "not measured" and "measured, and fast" are different claims, and
+  // `has_gpu` is what tells them apart.
+  std::string stage_rows;
+  for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+    const vr::StageRow& row = s.stages[i];
+    char line[96];
+    if (row.has_gpu) {
+      std::snprintf(line, sizeof(line), "  %-9s %6.2f ms   gpu %6.2f ms\n",
+                    row.name, row.cpu_ms, row.gpu_ms);
+    } else {
+      std::snprintf(line, sizeof(line), "  %-9s %6.2f ms   gpu      -\n",
+                    row.name, row.cpu_ms);
+    }
+    stage_rows += line;
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can both be present and both carry a `Status::message()`.
   //
@@ -1666,8 +1694,7 @@ struct RendererImpl {
       // block rather than given a row of its own here.
       "%s"
       "  mesh      %u verts / %u tris\n"
-      "  allocate  %.1f ms\n"
-      "  integrate %.1f ms\n"
+      "%s"
       "  extract   %.1f ms%s\n"
       // recon's phase split, listed rather than grouped into host/GPU totals:
       // several are genuinely both (`compact` is a dispatch plus its readback
@@ -1697,8 +1724,8 @@ struct RendererImpl {
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
       errors.c_str(), upload.c_str(), memory_warnings.c_str(),
-      memory_rows.c_str(), s.vertices, s.triangles, s.allocate_ms,
-      s.integrate_ms, s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
+      memory_rows.c_str(), s.vertices, s.triangles, stage_rows.c_str(),
+      s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
       s.extract.triangle_capacity,
       s.extract.triangle_capacity > 0
           ? 100.0 * static_cast<double>(s.triangles) /
