@@ -133,13 +133,21 @@ struct DashboardView: View {
             if let failure = model.failure { failureBanner(failure) }
 
             LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-              // Timeline and Pipeline first and by name, not from `groups`:
-              // they are the two that carry a chart and bars rather than rows,
-              // and the pipeline is the whole end-to-end sequence in one panel.
               Card("Timeline") { timeline }
-              Card("Pipeline") { stageBars }
+              // One card per section, and no card built outside this loop.
+              // A separate "Pipeline" card used to be added here while the
+              // bridge also published the same figures as a section, so every
+              // stage appeared twice -- once as a bar and once as a row. The
+              // stage group is rendered as bars *in place* instead, which keeps
+              // one source and one card.
               ForEach(model.groups) { group in
-                Card(group.id) { rows(group.items) }
+                Card(group.id) {
+                  if group.id == "Pipeline" {
+                    stageBars
+                  } else {
+                    rows(group.items)
+                  }
+                }
               }
               if !model.captureLines.isEmpty {
                 Card("Capture") { lines(model.captureLines) }

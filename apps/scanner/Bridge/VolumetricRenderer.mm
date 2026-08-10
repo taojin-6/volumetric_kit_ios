@@ -1561,6 +1561,12 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   return [rows copy];
 }
 
+// TODO(scanner): fusionSummary still formats its own text with snprintf, so
+// this and the log line are two independent formatters over one set of figures
+// and can drift. Rendering the summary FROM these sections is the fix; it is
+// not done here because that string carries layout this does not (banner
+// ordering, the clipped-tail argument) and folding it in deserves its own
+// change rather than a footnote to a UI one.
 - (NSArray<VolumetricStatSection*>*)statSections {
   const app::FusionStats s = _impl->fusion.stats();
   const app::MemoryBudget budget = app::query_memory_budget();
@@ -1592,7 +1598,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                       : fmt("%6.2f ms   gpu      -", row.cpu_ms);
       add(r, [NSString stringWithUTF8String:row.name], value);
     }
-    if (s.stage_count > 0) [out addObject:make_section(@"Stages", r)];
+    if (s.stage_count > 0) [out addObject:make_section(@"Pipeline", r)];
   }
 
   // --- Extract: what is left once its timings became pipeline stages -------
