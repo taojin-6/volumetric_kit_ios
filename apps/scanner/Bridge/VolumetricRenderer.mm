@@ -815,22 +815,43 @@ struct RendererImpl {
   // an involution, so applying it again is the conversion back.
   glm::mat4 device_pose = vr::sensor::cv_from_gl_camera(_impl->camera_to_world);
   // ...and then round to the viewport. ARKit fixes the camera basis to the
-  // *sensor*: "the x-axis always points along the long axis of the device, from
-  // the front-facing camera toward the Home button", +Y along the short axis,
-  // +Z out of the screen (ARCamera.transform). That frame does not turn when
-  // the interface does, so in portrait the camera's +X is viewport-*down* and
-  // its +Y is viewport-right -- and the scan renders on its side, which reads
-  // as a broken reconstruction rather than a misaligned render camera.
+  // *sensor*: +X along the long axis of the device toward the front-facing
+  // camera, +Y along the short axis, +Z out of the screen (ARCamera.transform).
+  // That frame does not turn when the interface does, so in portrait the
+  // camera's +X is viewport-*up* and its +Y is viewport-left -- and the scan
+  // renders on its side, which reads as a broken reconstruction rather than a
+  // misaligned render camera.
+  //
+  // Which way +X runs is the part ARCamera.transform's own documentation is
+  // contradictory about, and it is worth 180 degrees. It says the axis "points
+  // to the right when the device is in UIDeviceOrientation.landscapeRight" and,
+  // in the same sentence, that it runs "from the front-facing camera toward the
+  // Home button" -- which in that orientation, home button on the left, is
+  // viewport-*left*. This took the second reading, and so derived the turn with
+  // the wrong sign. Hardware settled it: portrait rendered upside down, and the
+  // first drag corrected it by handing the view to the turntable, which imposes
+  // world +Y as up and drops the device's roll entirely. The sensor's own image
+  // agrees with the first reading -- a back-camera buffer needs a quarter turn
+  // *clockwise* to sit upright in portrait, which puts its +u, the camera's +X,
+  // along the device's long axis toward the front camera.
   //
   // Fusion is unaffected either way (the pose and the intrinsics are mutually
   // consistent in the sensor frame), so the correction belongs here and nowhere
   // else. A rotation about the camera's own +Z carries its basis onto the
-  // viewport's: portrait needs +90 degrees, and each further quarter turn of
-  // the interface adds another -- which is what VolumetricViewOrientation's
-  // values count. Landscape-left is the sensor's own basis and needs none.
+  // viewport's, and +Z points out of the screen at the viewer -- so a positive
+  // angle turns the basis counterclockwise on screen, while each quarter turn
+  // of the interface (landscape-left -> portrait -> landscape-right) carries
+  // the viewport clockwise past it. The correction is therefore *negative*:
+  // portrait needs -90 degrees, and each further quarter turn subtracts another
+  // -- which is what VolumetricViewOrientation's values count. Landscape-left
+  // is the sensor's own basis and needs none.
+  //
+  // Note what that costs to test: the two landscape orientations need 0 and 180
+  // degrees, and a sign cannot show on either, so only the portrait cases can
+  // ever expose this one.
   if (const float quarter_turns = static_cast<float>(_impl->view_orientation)) {
     constexpr float kHalfPi = 1.5707964f;
-    device_pose = glm::rotate(device_pose, quarter_turns * kHalfPi,
+    device_pose = glm::rotate(device_pose, -quarter_turns * kHalfPi,
                               glm::vec3(0.0f, 0.0f, 1.0f));
   }
   _impl->camera.set_device_pose(device_pose);

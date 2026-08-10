@@ -52,16 +52,18 @@ FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 /// @brief How far the viewport is turned from the camera's own basis.
 ///
 /// ARKit fixes `ARCamera.transform` to the **sensor**, not to the interface:
-/// its x-axis "always points along the long axis of the device, from the
-/// front-facing camera toward the Home button", y along the short axis, z out
-/// of the screen. Rotating the phone does not move that basis, so rendering it
-/// straight into a portrait drawable puts the scan on its side — which reads as
-/// a broken reconstruction rather than a misaligned render camera.
+/// its x-axis runs along the long axis of the device toward the front-facing
+/// camera, y along the short axis, z out of the screen. Rotating the phone does
+/// not move that basis, so rendering it straight into a portrait drawable puts
+/// the scan on its side — which reads as a broken reconstruction rather than a
+/// misaligned render camera.
 ///
 /// The values are **quarter turns**: the renderer rotates the device pose about
-/// the camera's own +Z by `90° × rawValue`. Landscape-left is the sensor's own
-/// basis (`UIDeviceOrientationLandscapeRight`, where ARKit documents +x as
-/// pointing viewport-right), so it is the zero.
+/// the camera's own +Z by `−90° × rawValue`. Negative because +Z points out of
+/// the screen at the viewer, so as this counts up the interface turns
+/// *clockwise* past the sensor's basis. Landscape-left is that basis
+/// (`UIDeviceOrientationLandscapeRight`, where ARKit documents +x as pointing
+/// viewport-right), so it is the zero.
 ///
 /// Fusion is unaffected — the pose and the intrinsics are mutually consistent
 /// in the sensor frame either way — so this is a render-camera concern only.
