@@ -1215,6 +1215,78 @@ struct RendererImpl {
     extract_note += "  [stale " + std::to_string(s.frames_since_extract) + "f]";
   }
 
+  // The dirty-block survey, built here and placed *beside* `table` in the body
+  // below rather than appended after the whole thing.
+  //
+  // Beside `table` because it is a fraction of that block count and means very
+  // little anywhere else. Not appended, for two reasons the appended version
+  // demonstrated: the body deliberately ends without a trailing newline, so a
+  // row added after it rendered glued onto the texture line; and the tail is
+  // what a clipped overlay loses first -- the banners were moved to the top for
+  // exactly that reason, and the statusLabel is bottom-constrained on a phone
+  // -- which put this PR's headline measurement in the first place to go.
+  std::string dirty_rows;
+  if (s.survey_active_blocks > 0) {
+    // Named markers, because each makes the sample mean something other than
+    // what it looks like: the first window reads ~100% on any scene (the map
+    // grew from empty inside it), and a stale sample is an old one that the
+    // gate above -- a one-way latch on `survey_active_blocks > 0` -- cannot
+    // take back off the screen.
+    std::string note;
+    if (s.survey_first_window) {
+      note += "  [first window: grew from empty]";
+    }
+    if (s.survey_stale) {
+      note += "  [stale " + std::to_string(s.frames_since_survey) + "f]";
+    }
+    char cell[320];
+    if (s.survey_changed_blocks == 0) {
+      // The steady state, not a degenerate case: recon documents a scan
+      // revisiting converged surface at `max_weight` as marking nothing. This
+      // is the branch that used to print "0.0%, 0.0x saved" -- the best reading
+      // available, reported as no benefit at all, on the column a reader scans.
+      // There is no ratio to print here, so the sentence is the result.
+      std::snprintf(cell, sizeof(cell),
+                    "\n  dirty     nothing changed in %llu fused frames"
+                    "  %.1f ms"
+                    "\n            (%u blocks active at the survey)%s",
+                    static_cast<unsigned long long>(s.survey_window_frames),
+                    s.survey_ms, s.survey_active_blocks, note.c_str());
+    } else {
+      // Dilation (remesh / changed), not a "saved" factor. The share of the map
+      // is printed beside it and a speedup would be exactly `100 / share`, so
+      // the pair carried one number twice; and recon's own read-out refuses to
+      // call it a speedup at all, because only the marching-cubes dispatch
+      // scales with the block count while compact walks every table slot, the
+      // arena is sized by the whole surface, and readback copies all of it.
+      // Dilation is the one ratio here that is not a restatement: it is the
+      // cost of the marching-cubes stencil, 1.3-1.4x on room0.
+      //
+      // The window is printed because the sample is a union across it, not one
+      // frame's work -- see FusionStats::survey_window_frames.
+      std::snprintf(
+          cell, sizeof(cell),
+          // The cost trails the row like every other stage on this read-out.
+          // It is here at all because the survey was the only stage in `fuse`
+          // with no timer around it, while asserting in a comment that it was
+          // invisible in the frame budget -- on a device where `extract` alone
+          // measures 132.7 ms.
+          "\n  dirty     %u changed -> %u to remesh  (%.2fx dilation)  %.1f ms"
+          "\n            %.1f%% of %u blocks active at the survey, "
+          "%llu-frame window%s",
+          s.survey_changed_blocks, s.survey_remesh_blocks,
+          static_cast<double>(s.survey_remesh_blocks) /
+              static_cast<double>(s.survey_changed_blocks),
+          s.survey_ms,
+          100.0 * static_cast<double>(s.survey_remesh_blocks) /
+              static_cast<double>(s.survey_active_blocks),
+          s.survey_active_blocks,
+          static_cast<unsigned long long>(s.survey_window_frames),
+          note.c_str());
+    }
+    dirty_rows = cell;
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can both be present and both carry a `Status::message()`.
   //
@@ -1254,7 +1326,7 @@ struct RendererImpl {
       // slot count.
       "  arena     %u tris planned for this slot (%.2f%% full)\n"
       "            %.1f MB across %u slots / %u blocks\n"
-      "  table     %u / %u blocks (%.1f%% occupied)\n"
+      "  table     %u / %u blocks (%.1f%% occupied)%s\n"
       "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
@@ -1272,29 +1344,18 @@ struct RendererImpl {
           ? 100.0 * static_cast<double>(s.extract.active_blocks) /
                 static_cast<double>(s.table_capacity)
           : 0.0,
-      s.texture_ms);
-  // The dirty-block survey, appended so it rides the same throttled log line.
-  if (s.survey_active_blocks > 0) {
-    const std::size_t used = std::strlen(buf);
-    std::snprintf(
-        buf + used, sizeof(buf) - used,
-        "  dirty     %u changed -> %u to remesh of %u (%.1f%%, %.1fx saved)\n",
-        s.survey_changed_blocks, s.survey_remesh_blocks, s.survey_active_blocks,
-        100.0 * static_cast<double>(s.survey_remesh_blocks) /
-            static_cast<double>(s.survey_active_blocks),
-        s.survey_remesh_blocks > 0
-            ? static_cast<double>(s.survey_active_blocks) /
-                  static_cast<double>(s.survey_remesh_blocks)
-            : 0.0);
-  }
-  // Mirror the read-out to the log, throttled.
+      dirty_rows.c_str(), s.texture_ms);
+  // Mirror the read-out to os_log, throttled.
   //
-  // Both channels, for the reason FrameTrace::dump states: os_log survives a
-  // run with no debugger and is readable afterwards via `log collect`, while
-  // stderr is what reaches `devicectl process launch --console` live. Until now
-  // the only thing on either channel was the *failure* dump, so a healthy scan
-  // -- the run whose numbers actually settle a question -- left no record at
-  // all and had to be read off the screen.
+  // os_log and nothing else. stderr would be a third copy of a string that
+  // already reaches a console twice over: ScannerViewController interpolates
+  // this very property into its status text and `print`s it to stdout every
+  // 0.5 s, and `devicectl device process launch --console` connects both
+  // standard streams. What os_log adds is the part neither stream has -- it
+  // survives a run with no console and no debugger attached, readable
+  // afterwards via `log collect`, which is what a scan whose numbers settle a
+  // question needs. FrameTrace::dump writes both because a crash dump has no
+  // Swift tick behind it that has already printed; a healthy read-out does.
   //
   // Throttled by wall clock rather than by call: this is a property the Swift
   // view polls at its own refresh rate, which is not a cadence this file
@@ -1305,9 +1366,30 @@ struct RendererImpl {
     const auto now = std::chrono::steady_clock::now();
     if (now - last_logged >= std::chrono::seconds(2)) {
       last_logged = now;
-      os_log(OS_LOG_DEFAULT, "vk-scan: %{public}s", buf);
-      std::fprintf(stderr, "vk-scan: %s\n", buf);
-      std::fflush(stderr);
+      // One os_log per line, not one call for the whole buffer. os/log.h caps
+      // dynamic content -- `%s` and `%@` -- at 1024 bytes per logged line and
+      // truncates the rest before it is written to disk, and `buf` is
+      // deliberately twice that, sized for two full library messages.
+      // FrameTrace::dump splits for this reason; handing the whole buffer over
+      // while citing that as precedent would silently drop the tail, and the
+      // tail is where this read-out's numbers now live.
+      //
+      // Split in place and put back, so the string this function returns is
+      // unchanged: `buf` is a local, and each newline is restored before the
+      // next line is read.
+      char* line = buf;
+      while (*line != '\0') {
+        char* end = std::strchr(line, '\n');
+        if (end != nullptr) {
+          *end = '\0';
+        }
+        os_log(OS_LOG_DEFAULT, "vk-scan: %{public}s", line);
+        if (end == nullptr) {
+          break;
+        }
+        *end = '\n';
+        line = end + 1;
+      }
     }
   }
   // Through the nil-guarding helper, like every other string property here: the

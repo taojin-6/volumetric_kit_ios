@@ -118,6 +118,24 @@ struct FusionConfig {
   /// a large enough volume will still outrun the frame budget -- but it starts
   /// at 1, because a reconstruction that updates every frame is the point.
   std::uint32_t remesh_every = 1;
+  /// Track which blocks each fuse actually changed, for the dirty-block survey.
+  ///
+  /// **On here, and not free anywhere.** recon's default is off and that
+  /// default costs nothing: no `num_blocks * 4` host-visible flag array (which
+  /// doubles with every map grow) and not one store in the fusion kernel. This
+  /// app pays it because the survey in @ref Fusion::fuse is the only instrument
+  /// that can say whether incremental extraction is worth building.
+  ///
+  /// A **field** rather than a constant at the create site, because the cost is
+  /// not confined to the diagnostic. recon sizes the flag array inside
+  /// `integrate`, rebuilding it beside the old one on every map grow, so a
+  /// frame that cannot get that allocation fails its *integrate* -- which @ref
+  /// Fusion::fuse treats as fatal to the frame, where before this was turned on
+  /// the same frame fused normally. The exposure is worst where it can least be
+  /// afforded: the frame after a doubling toward @ref max_buckets, which that
+  /// field documents as the ~1.1 GiB jetsam range. Nothing retries or falls
+  /// back, so turning the survey off must not need a source edit and a rebuild.
+  bool track_dirty_blocks = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
   /// **Still off, and still load-bearing that it is.** `ProjectiveTexturer`
@@ -227,22 +245,31 @@ struct FusionStats {
   /// the displayed occupancy exactly when the map is under most pressure. Both
   /// halves of a ratio move together or neither does.
   std::uint32_t table_capacity = 0;
-  /// @brief The dirty-block survey: how much of the map one frame can see.
+  /// @brief The dirty-block survey: how much of the map a window of fusing
+  ///        actually changed.
   ///
   /// The question incremental mesh extraction rests on -- re-meshing only what
   /// changed is worth its complexity only if "what changed" is a small fraction
-  /// of the map. Measured on Replica room0 it came out at **87%**, which would
-  /// kill the idea; but room0 is one small enclosed room and a 90-degree, 8 m
-  /// cone from inside it contains nearly everything, so that number may be the
-  /// fixture rather than the truth. This device walks a real space with a
-  /// short-range LiDAR depth, which is the case that matters.
+  /// of the map. A *frustum* survey measured on Replica room0 came out at
+  /// **87%**, which would kill the idea; but room0 is one small enclosed room
+  /// and a 90-degree, 8 m cone from inside it contains nearly everything, so
+  /// that number was the fixture rather than the truth. On device it was worse
+  /// than uninformative -- wrong in both directions depending on pose (4.5%
+  /// where the truth was 18.7%) -- and this replaced it outright.
   ///
-  /// `touched` is the active blocks inside the current depth camera's frustum.
-  /// It **over-estimates** what an integrate actually writes -- the frustum is
-  /// the whole view cone, while only voxels within +/-trunc_dist of the
-  /// measured depth are touched -- so a *low* number here is conclusive and a
-  /// high one is not. Surveyed periodically, because each survey costs two full
-  /// active-set compactions (a dispatch and a readback apiece).
+  /// This field is the **whole active set** as of the survey:
+  /// `compact_active_blocks().size()`, with no frustum and no frame dependence
+  /// in it at all. It is the denominator @ref survey_changed_blocks and @ref
+  /// survey_remesh_blocks are fractions of, and it is deliberately *not* the
+  /// `active_blocks` in @ref extract: that one is refreshed by a successful
+  /// remesh, this one by a successful survey, and the two cadences differ by
+  /// ~60x. When they disagree, @ref survey_stale and @ref extract_stale are
+  /// what say which of them stopped moving.
+  ///
+  /// Surveyed periodically, because one survey costs a full active-set
+  /// compaction (a dispatch, a fence wait and a readback of the whole set), an
+  /// O(active) dilation walk, and an O(num_blocks) host scan of the flag array.
+  /// @ref survey_ms is what that actually came to.
   std::uint32_t survey_active_blocks = 0;
   /// Blocks the fuse actually CHANGED in the window -- not "was dispatched"
   /// (the dispatch covers every active block and returns early for most) and
@@ -254,6 +281,56 @@ struct FusionStats {
   /// so a changed block invalidates every block reaching into it. Measured at
   /// 1.3-1.4x the changed set on room0.
   std::uint32_t survey_remesh_blocks = 0;
+  /// How many fused frames of changes this sample accumulated.
+  ///
+  /// **The sample is a union over this many integrates, not one frame's work.**
+  /// recon ORs the flags in and never clears them itself; @ref Fusion::fuse
+  /// re-arms once per survey. So with @ref FusionConfig::remesh_every at 1 --
+  /// every fused frame extracts -- the share printed beside this is a *ceiling*
+  /// on what one incremental extract would redo rather than that quantity: it
+  /// is what a remesh running once per window would redo. The direction is the
+  /// safe one, a union being a strict superset, but reading it as a per-extract
+  /// figure overstates the work and prices the optimisation against the wrong
+  /// baseline.
+  ///
+  /// Published rather than assumed equal to the survey cadence, because it is
+  /// not: a frame that takes one of @ref Fusion::fuse's error early-returns
+  /// never reaches the survey, and the window then runs on into the next one.
+  /// Without this, the next sample reports a double-length union through an
+  /// identical-looking line.
+  std::uint64_t survey_window_frames = 0;
+  /// What the survey itself cost, on the fuse frame that ran one.
+  ///
+  /// Measured because nothing else here measures it: every other stage of @ref
+  /// Fusion::fuse is timed and published, while the survey's claim to be
+  /// "invisible in the frame budget" was an assertion with no number behind it
+  /// -- on a device where @ref extract alone already measures 132.7 ms.
+  float survey_ms = 0.0f;
+  /// Whether this sample is the **first** window of the scan, which reads
+  /// near-100% changed whatever the scene is.
+  ///
+  /// A block's first integrate always moves its weight off zero, so every block
+  /// the map grew during the first window is necessarily marked -- and the map
+  /// grew from empty during exactly those frames. Nothing converges inside one
+  /// window either: at `max_weight` 5.0 with an inverse-square observation
+  /// weight, a surface at 2-3 m needs 20-45 observations. So the first sample
+  /// is ~100% on any scene, and without this flag it is indistinguishable from
+  /// a steady-state one -- while being, at a 2 s log throttle against a ~1 s
+  /// window, a live candidate for the first line ever recorded for a run.
+  bool survey_first_window = false;
+  /// @brief How far behind the current frame the survey is, and whether that is
+  ///        further than its own cadence explains.
+  ///
+  /// What @ref frames_since_extract is for the extract, against a worse
+  /// failure. The read-out gates the survey rows on `survey_active_blocks > 0`,
+  /// which is a one-way latch, and both survey calls used to fail silently --
+  /// so one good sample followed by a permanently failing survey (the
+  /// device-lost regime this app has already hit once) reprinted a minute-old
+  /// figure as this frame's number for the rest of the run. The failures are
+  /// counted now, through @ref errors like every other stage; this is the half
+  /// that says the printed numbers are no longer current.
+  std::uint64_t frames_since_survey = 0;
+  bool survey_stale = false;
   /// @brief How far behind the current frame @ref extract is, and whether that
   ///        is further than the remesh cadence explains.
   ///
@@ -463,6 +540,19 @@ class Fusion {
   // reality and waving a filling table through.
   std::uint64_t active_blocks_at_frame_ = 0;
   bool active_blocks_measured_ = false;
+  // `stats_.frames_fused` when the current dirty window opened -- the last time
+  // `fuse` called `reset_dirty`. The published window length is measured from
+  // this rather than assumed to be the survey cadence, because a frame that
+  // takes an error early-return never reaches the survey and the window then
+  // spans two cadences. Zero is the first window, the one that reads ~100% by
+  // construction; see FusionStats::survey_first_window.
+  std::uint64_t dirty_window_start_ = 0;
+  // `stats_.frames_fused` as of the last survey that actually published, and
+  // whether one ever has. The same pair as active_blocks_at_frame_ /
+  // active_blocks_measured_ above, for the same reason: a latched read-out
+  // needs something that can tell a live sample from a frozen one.
+  std::uint64_t survey_at_frame_ = 0;
+  bool survey_measured_ = false;
   vr::Mat4f last_pose_{1.0f};
   FusionStats stats_{};
 };
