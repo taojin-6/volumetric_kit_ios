@@ -29,6 +29,8 @@ final class ScannerViewController: UIViewController {
   /// reconstruction, which is still the thing being judged -- a panel that
   /// covered it would make the numbers unfalsifiable by eye.
   private let dashboardHeightFraction: CGFloat = 0.55
+  /// Active only while the dashboard is expanded; see the hosting setup.
+  private var expandedHeight: NSLayoutConstraint?
   private var cameraGestures: CameraGestureController?
 
   /// Whether the capture + fuse + draw loop is running, so a resume cannot
@@ -118,7 +120,14 @@ final class ScannerViewController: UIViewController {
     // screen is the reconstruction, and the orbit/pan/zoom recognizers live on
     // `metalView` underneath. A full-bleed host would swallow them -- the same
     // reason a scroll view was rejected for the label it replaces.
-    let host = UIHostingController(rootView: DashboardView(model: dashboard))
+    let host = UIHostingController(
+      rootView: DashboardView(model: dashboard) { [weak self] expanded in
+        // The height constraint follows the toggle. Collapsed, the body is a
+        // plain VStack and sizes itself; expanded, it contains a ScrollView,
+        // which has no intrinsic height and would otherwise keep whatever it
+        // was last given.
+        self?.expandedHeight?.isActive = expanded
+      })
     host.view.backgroundColor = .clear
     host.view.translatesAutoresizingMaskIntoConstraints = false
     addChild(host)
@@ -140,10 +149,13 @@ final class ScannerViewController: UIViewController {
         equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 10),
       host.view.trailingAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
-      host.view.heightAnchor.constraint(
-        equalTo: view.safeAreaLayoutGuide.heightAnchor,
-        multiplier: dashboardHeightFraction),
     ])
+    expandedHeight = host.view.heightAnchor.constraint(
+      equalTo: view.safeAreaLayoutGuide.heightAnchor,
+      multiplier: dashboardHeightFraction)
+    // Activated by the view's own onAppear, so the stored expanded/collapsed
+    // choice decides it rather than this defaulting to one of them.
+    expandedHeight?.isActive = false
   }
 
   override func viewDidAppear(_ animated: Bool) {

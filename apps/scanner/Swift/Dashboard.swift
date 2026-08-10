@@ -108,6 +108,12 @@ final class DashboardModel: ObservableObject {
 
 struct DashboardView: View {
   @ObservedObject var model: DashboardModel
+  /// Told to UIKit rather than kept here alone: the host's height constraint
+  /// has to follow, because a ScrollView has no intrinsic height and would
+  /// otherwise keep its expanded size around a collapsed body.
+  let onExpandedChange: (Bool) -> Void
+
+  @AppStorage("dashboardExpanded") private var expanded = true
 
   /// Adaptive rather than a fixed column count: the same panel has to work on
   /// a landscape iPad, where six groups fit across, and a portrait phone, where
@@ -115,28 +121,41 @@ struct DashboardView: View {
   private let columns = [GridItem(.adaptive(minimum: 290), spacing: 12)]
 
   var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 10) {
-        headline
-        if model.allocationStopped { volumeFull }
-        if let failure = model.failure { failureBanner(failure) }
+    VStack(alignment: .leading, spacing: 0) {
+      // Always visible, collapsed or not: the state line is the one thing worth
+      // seeing without deciding to look.
+      headline.padding(12)
 
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-          Card("Timeline") { timeline }
-          Card("Pipeline") { stageBars }
-          ForEach(model.groups) { group in
-            Card(group.id) { rows(group.items) }
+      if expanded {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 10) {
+            if model.allocationStopped { volumeFull }
+            if let failure = model.failure { failureBanner(failure) }
+
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+              // Timeline and Pipeline first and by name, not from `groups`:
+              // they are the two that carry a chart and bars rather than rows,
+              // and the pipeline is the whole end-to-end sequence in one panel.
+              Card("Timeline") { timeline }
+              Card("Pipeline") { stageBars }
+              ForEach(model.groups) { group in
+                Card(group.id) { rows(group.items) }
+              }
+              if !model.captureLines.isEmpty {
+                Card("Capture") { lines(model.captureLines) }
+              }
+              if !model.deviceLines.isEmpty {
+                Card("Device") { lines(model.deviceLines) }
+              }
+            }
           }
-          if !model.captureLines.isEmpty {
-            Card("Capture") { lines(model.captureLines) }
-          }
-          if !model.deviceLines.isEmpty {
-            Card("Device") { lines(model.deviceLines) }
-          }
+          .padding(.horizontal, 12)
+          .padding(.bottom, 12)
         }
       }
-      .padding(12)
     }
+    .onAppear { onExpandedChange(expanded) }
+    .onChange(of: expanded) { onExpandedChange($0) }
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
     .overlay(
       RoundedRectangle(cornerRadius: 16)
@@ -183,6 +202,20 @@ struct DashboardView: View {
         if model.dropFraction > 0.2 {
           Chip("\(Int(model.dropFraction * 100))% dropped", tone: .warn)
         }
+        Button {
+          withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+        } label: {
+          Image(
+            systemName: expanded
+              ? "chevron.up.circle.fill"
+              : "chevron.down.circle.fill"
+          )
+          .font(.title3)
+          .symbolRenderingMode(.hierarchical)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel(expanded ? "Hide details" : "Show details")
       }
     }
     .padding(.horizontal, 4)

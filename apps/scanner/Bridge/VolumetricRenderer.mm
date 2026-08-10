@@ -1595,18 +1595,15 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     if (s.stage_count > 0) [out addObject:make_section(@"Stages", r)];
   }
 
-  // --- Extract: its own phases ---------------------------------------------
+  // --- Extract: what is left once its timings became pipeline stages -------
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    add(r, @"total",
-        fmt("%.1f ms  (%u pass)", s.extract_ms, s.extract.dispatches),
+    add(r, @"passes", fmt("%u", s.extract.dispatches),
         s.extract.dispatches > 1 ? VolumetricStatToneWarn
                                  : VolumetricStatToneNeutral);
-    add(r, @"meshing", fmt("%.2f ms", s.extract.dispatch_ms));
-    add(r, @"compact", fmt("%.2f ms", s.extract.compact_ms));
-    add(r, @"inputs", fmt("%.2f ms", s.extract.input_upload_ms));
-    add(r, @"sizing", fmt("%.2f ms", s.extract.arena_alloc_ms));
-    add(r, @"readback", fmt("%.2f ms", s.extract.readback_ms));
+    add(r, @"emitted",
+        fmt("%u tris / %u verts", s.extract.emitted_triangles,
+            s.extract.emitted_vertices));
     if (s.extract_stale) {
       add(r, @"stale",
           fmt("%llu frames since", (unsigned long long)s.frames_since_extract),
