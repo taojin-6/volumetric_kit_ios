@@ -1554,7 +1554,12 @@ struct RendererImpl {
       // slot count.
       "  arena     %u tris planned for this slot (%.2f%% full)\n"
       "            %.1f MB across %u slots / %u blocks\n"
-      "  table     %u / %u blocks (%.1f%% occupied)%s\n"
+      // Occupancy from the map itself, not from the extract's block count:
+      // that number refreshes only on a successful remesh, and this row is
+      // where someone looks to see whether a scan is still taking geometry in.
+      // The suffix is the whole point -- 85% is a threshold, and a threshold a
+      // reader has to already know is one they will miss.
+      "  table     %.1f%% of %u blocks%s%s\n"
       "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
@@ -1567,12 +1572,9 @@ struct RendererImpl {
                 static_cast<double>(s.extract.triangle_capacity)
           : 0.0,
       static_cast<double>(s.extract.arena_bytes) / (1024.0 * 1024.0),
-      s.mesh_slots, s.extract.active_blocks, s.extract.active_blocks,
-      s.table_capacity,
-      s.table_capacity > 0
-          ? 100.0 * static_cast<double>(s.extract.active_blocks) /
-                static_cast<double>(s.table_capacity)
-          : 0.0,
+      s.mesh_slots, s.extract.active_blocks,
+      100.0 * static_cast<double>(s.occupancy), s.table_capacity,
+      s.allocation_stopped ? "  -- ALLOCATION STOPPED (volume full)" : "",
       dirty_rows.c_str(), s.texture_ms);
   // Mirror the read-out to os_log, throttled.
   //
