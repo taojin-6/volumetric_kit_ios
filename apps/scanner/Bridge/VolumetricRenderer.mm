@@ -1427,6 +1427,26 @@ struct RendererImpl {
   return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
 }
 
+- (uint32_t)blockCapacity {
+  return _impl->fusion.stats().table_capacity;
+}
+
+- (uint64_t)memoryFootprintBytes {
+  return app::query_memory_budget().footprint_bytes;
+}
+
+- (uint64_t)memoryLimitBytes {
+  const app::MemoryBudget budget = app::query_memory_budget();
+  // 0 when the OS declined to answer or is over the limit, which the dashboard
+  // reads as "no ceiling known" rather than drawing a full bar -- see
+  // MemoryBudget::limit_known.
+  return budget.limit_known ? budget.limit_bytes : 0;
+}
+
+- (uint64_t)gpuWorkingSetBytes {
+  return gpu_working_set_bytes();
+}
+
 - (NSArray<VolumetricFrameSample*>*)frameHistory {
   // Asked how many there are before allocating room for them, rather than
   // value-initialising the full ring on every poll: for most of a scan's first

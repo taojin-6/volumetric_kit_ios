@@ -92,8 +92,8 @@ target_link_libraries(
 add_executable(
   ${VI_APP_NAME} MACOSX_BUNDLE
   Swift/AppDelegate.swift Swift/ARSessionController.swift
-  Swift/CameraGestureController.swift Swift/MetalView.swift
-  Swift/ScannerViewController.swift)
+  Swift/CameraGestureController.swift Swift/Dashboard.swift
+  Swift/MetalView.swift Swift/ScannerViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
 

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Tao Jin
 
 import ARKit
+import SwiftUI
 import UIKit
 
 /// Drives the renderer from a `CADisplayLink` and shows what it reports.
@@ -15,7 +16,15 @@ final class ScannerViewController: UIViewController {
   private var renderer: VolumetricRenderer?
   private let arSession = ARSessionController()
   private var displayLink: CADisplayLink?
-  private let statusLabel = UILabel()
+  /// What the dashboard draws. Populated in `updateStatus`, at the display
+  /// cadence -- the *history* it charts is sampled per fused frame on the
+  /// fusion thread, which is a different rate on purpose (see DashboardModel).
+  private let dashboard = DashboardModel()
+  private var dashboardHost: UIHostingController<DashboardView>?
+  /// When the view appeared, for the dashboard's elapsed clock. Wall clock
+  /// rather than a fused-frame count: it is how long the person has been
+  /// scanning, which is not the same as how much fusion got done.
+  private let sessionStartedAt = CFAbsoluteTimeGetCurrent()
   private var cameraGestures: CameraGestureController?
 
   /// Whether the capture + fuse + draw loop is running, so a resume cannot
@@ -92,33 +101,37 @@ final class ScannerViewController: UIViewController {
       self, selector: #selector(appWillEnterForeground),
       name: UIApplication.willEnterForegroundNotification, object: nil)
 
-    statusLabel.numberOfLines = 0
-    statusLabel.textColor = .white
-    statusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-    statusLabel.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(statusLabel)
+    // The dashboard, hosted rather than laid out here.
+    //
+    // This replaces a UILabel fed a thirty-line monospace string. Two things
+    // that cost us are gone with it: the string was rebuilt and re-laid-out by
+    // CoreText on every tick until a 0.5 s gate was added to stop it, and it
+    // had no bottom constraint, so it ran off a landscape iPhone silently and
+    // took whatever was last in it. SwiftUI re-renders only what changed and
+    // sizes itself inside the safe area.
+    //
+    // Pinned top-leading and deliberately NOT filling the view: the rest of the
+    // screen is the reconstruction, and the orbit/pan/zoom recognizers live on
+    // `metalView` underneath. A full-bleed host would swallow them -- the same
+    // reason a scroll view was rejected for the label it replaces.
+    let host = UIHostingController(rootView: DashboardView(model: dashboard))
+    host.view.backgroundColor = .clear
+    host.view.translatesAutoresizingMaskIntoConstraints = false
+    addChild(host)
+    view.addSubview(host.view)
+    host.didMove(toParent: self)
+    dashboardHost = host
     NSLayoutConstraint.activate([
-      statusLabel.topAnchor.constraint(
-        equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-      statusLabel.leadingAnchor.constraint(
-        equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
-      statusLabel.trailingAnchor.constraint(
+      host.view.topAnchor.constraint(
+        equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+      host.view.leadingAnchor.constraint(
+        equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 10),
+      host.view.trailingAnchor.constraint(
         lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor,
-        constant: -12),
-      // Bounded, where it previously had no bottom at all. The overlay grew
-      // past the safe area on a landscape iPhone — verified only on an iPad,
-      // where it fits — and an unconstrained label simply ran off the screen,
-      // silently, taking whatever was last in the string with it. The failure
-      // banners now come first for that reason (see `fusionSummary`), so what
-      // this clips is the least load-bearing end.
-      //
-      // A scroll view would make the tail reachable instead of merely bounded,
-      // and was rejected on purpose: sized to the safe area it would sit over
-      // `metalView` and swallow the orbit/pan/zoom recognizers, trading a debug
-      // overlay's tail for the camera controls.
-      statusLabel.bottomAnchor.constraint(
+        constant: -10),
+      host.view.bottomAnchor.constraint(
         lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor,
-        constant: -12),
+        constant: -10),
     ])
   }
 
@@ -358,8 +371,7 @@ final class ScannerViewController: UIViewController {
         case .failure(let error):
           let message =
             "Renderer bring-up failed:\n\(error.localizedDescription)"
-          self.statusLabel.text = message
-          self.statusLabel.textColor = .systemRed
+          self.dashboard.failure = message
           // To stdout as well: this path never reaches updateStatus, so without
           // it a bring-up failure is visible only on the screen.
           print(message)
@@ -403,8 +415,7 @@ final class ScannerViewController: UIViewController {
     do {
       try renderer.renderFrame(withDrawableSize: metalView.metalLayer.drawableSize)
     } catch {
-      statusLabel.text = "Render failed:\n\(error.localizedDescription)"
-      statusLabel.textColor = .systemRed
+      dashboard.failure = "Render failed: \(error.localizedDescription)"
       // The whole loop, not just the draw. Stopping the display link alone left
       // `RendererImpl::fusing` true, so on a VK_ERROR_DEVICE_LOST the fuse
       // thread went on polling ARKit at 60 Hz and issuing allocate/integrate/
@@ -524,7 +535,45 @@ final class ScannerViewController: UIViewController {
           convert   \(convert)
         """
     }
-    statusLabel.text = text
+    // Publish what the dashboard draws. Read from the same renderer snapshot
+    // the text above was built from, so the two cannot disagree about a frame.
+    dashboard.scanning =
+      arSession.unsupportedReason == nil
+      && arSession.sessionError == nil
+    dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
+    dashboard.fps = fps
+    dashboard.trackingText = arSession.tracking.description
+    // "normal" is ARKit's own word for a usable pose; anything else -- limited,
+    // initializing, relocalizing -- means frames are being withheld from
+    // fusion, which is exactly when this chip should stop being quiet.
+    dashboard.trackingHealthy = arSession.tracking.description == "normal"
+    dashboard.framesIn = Int(arSession.capture.stats.frames_submitted)
+    dashboard.framesDropped = Int(arSession.capture.stats.frames_dropped)
+    dashboard.blockCapacity = Int(renderer.blockCapacity)
+    dashboard.memoryUsedBytes = renderer.memoryFootprintBytes
+    // The GPU working set, not the jetsam limit: the jetsam ceiling on this
+    // hardware sits above installed RAM, so showing it reports headroom that
+    // does not exist. See VolumetricRenderer.gpuWorkingSetBytes.
+    dashboard.memoryCeilingBytes = renderer.gpuWorkingSetBytes
+    dashboard.stages = renderer.stageRows.map {
+      StageBar(
+        id: $0.name, name: $0.name, hostMs: $0.cpuMs,
+        deviceMs: $0.gpuMs, hasGPU: $0.hasGpu)
+    }
+    let samples = renderer.frameHistory
+    dashboard.history = samples.map {
+      FrameSample(id: $0.frame, hostMs: $0.hostMs, deviceMs: $0.deviceMs)
+    }
+    if let latest = samples.last {
+      dashboard.triangles = Int(latest.triangles)
+      dashboard.occupancy = latest.occupancy
+      dashboard.activeBlocks = Int(latest.activeBlocks)
+      dashboard.allocationStopped = latest.allocationStopped
+    }
+
+    // The text survives for stdout alone: `devicectl process launch --console`
+    // is how every device run in this project has been read, and the dashboard
+    // above is not a substitute for a transcript.
     // Unconditional now: the 0.5 s gate at the top of this function is the same
     // cadence `shouldLog` used to carry, so the flag was tracking a rate the
     // whole body already runs at.

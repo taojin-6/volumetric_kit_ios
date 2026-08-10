@@ -427,6 +427,27 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Swift, so a bridged accessor is the only thing that actually prevents it.
 @property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
 
+/// @brief Block-table capacity — the denominator behind
+///        @ref VolumetricFrameSample.occupancy.
+///
+/// Beside the fraction rather than folded into it: a meter reads as "85% full"
+/// while the sentence under it wants "223k of 262k". The fraction says how
+/// close; the pair says how much room the last doubling bought.
+@property(nonatomic, readonly) uint32_t blockCapacity;
+
+/// @brief What the process is charged, and the two ceilings it is charged
+///        against.
+///
+/// Two, because they are different numbers and the **smaller one binds**:
+/// @ref memoryLimitBytes is the jetsam ceiling, which on this hardware sits
+/// above installed RAM and so is not what runs out first, while
+/// @ref gpuWorkingSetBytes is Metal's recommended working set — the figure the
+/// voxel grid and the mesh arenas are really sized against. A dashboard showing
+/// only the first reports comfortable headroom that does not exist.
+@property(nonatomic, readonly) uint64_t memoryFootprintBytes;
+@property(nonatomic, readonly) uint64_t memoryLimitBytes;
+@property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
+
 /// @brief Record that the OS asked the app to free memory.
 ///
 /// The one piece of this app's memory picture the OS *pushes* rather than
