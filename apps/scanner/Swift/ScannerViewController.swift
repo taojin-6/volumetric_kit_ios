@@ -261,6 +261,25 @@ final class ScannerViewController: UIViewController {
     }
   }
 
+  /// The turn the renderer is actually holding, for the read-out.
+  ///
+  /// Four different faults all present on screen as "the scan is rotated": a
+  /// wrong sign, a correct sign against a wrong zero, a value that went stale
+  /// across a rotation, and a renderer that was never told at all and is still
+  /// on its default. The fix differs for each, and flipping the sign is wrong
+  /// for three of them. Printing what the renderer holds separates them without
+  /// a rebuild — which matters while the zero point is still unsettled (see
+  /// `VolumetricViewOrientation` in VolumetricRenderer.h). The raw value is
+  /// printed alongside the name because the mapping is argued in raw values.
+  private func orientationName(_ orientation: VolumetricViewOrientation)
+    -> String
+  {
+    let names = ["landscape-left", "portrait", "landscape-right", "upside-down"]
+    let raw = orientation.rawValue
+    let name = names.indices.contains(raw) ? names[raw] : "invalid"
+    return "\(name) (\(raw))"
+  }
+
   private func startRendererIfNeeded() {
     guard renderer == nil, !bringUpInFlight else { return }
     // Never while backgrounded. Bring-up is `vkCreateSwapchainKHR`, a blocking
@@ -409,6 +428,7 @@ final class ScannerViewController: UIViewController {
     var text = """
       \(deviceSummary)
       drawable  \(Int(size.width)) x \(Int(size.height)) px
+      orient    \(orientationName(renderer.viewOrientation))
       presented \(renderer.framesPresented)
       camera    \(camera)
       \(String(format: "%.0f", fps)) fps
