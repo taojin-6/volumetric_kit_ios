@@ -1,29 +1,71 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  On the dashes below: this comment uses em-dashes where the rest of the repo
+  writes a doubled hyphen. That is deliberate, and normalising it back to house
+  style breaks the build in a way nothing in the gate catches. A doubled hyphen
+  is illegal inside an XML comment, and while CFPropertyList is lenient enough
+  that `plutil -lint` passes, AMFI's parser is not: pointing codesign at this
+  file directly fails with "AMFIUnserializeXML: syntax error" and leaves the
+  binary unsigned. It is latent today only because Xcode's packaging step strips
+  the comment before codesign reads the file. The literal codesign invocation
+  for reading the entitlement back off a signed binary lives in
+  apps/scanner/CMakeLists.txt, whose shell-style comments can carry the doubled
+  hyphen this one cannot.
+
   A live 1 cm reconstruction is a genuinely large-memory app, and the default
   per-app jetsam limit is what killed it: at 3.2 M triangles the mesh arenas held
   3089 MB (resident_arena_bytes, summed over the mesh_slots ring) beside an
-  805 MB voxel grid, and the OS sent SIGKILL -- no OutOfMemory to report, the
+  805 MB voxel grid, and the OS sent SIGKILL — no OutOfMemory to report, the
   process simply disappears.
 
-  increased-memory-limit raises that jetsam ceiling on devices that have the RAM
-  (this iPad Pro reports 10922 MB).
+  increased-memory-limit raises that jetsam ceiling. Bridge/MemoryBudget reads
+  the raised ceiling at runtime, which is the point of having it: no figure here
+  needs to be trusted for the app to know its own position.
 
-  extended-virtual-addressing would normally sit beside it -- the arena ring can
-  exceed the 4 GB a 32-bit address space covers -- but it is deliberately absent:
+  Three different ceilings get confused with each other, so this records which
+  is which. All three are quoted against the same base, the device's *nominal*
+  16 GiB (16384 MiB) on this iPad Pro (M5, 11-inch):
+
+    - hw.memsize reports 15469 MB. That is not a fourth number and not a
+      contradiction: iOS reports installed RAM net of firmware and
+      secure-enclave carve-outs, about 915 MB here. It is the least useful of
+      these for sizing, because no process is offered all of it.
+    - The jetsam ceiling is what increased-memory-limit moves and the only one
+      of the three whose breach kills the process outright, with no Status and
+      nothing in the log.
+    - MoltenVK's "GPU memory available" banner reports 10922 MB, which is
+      Metal's recommendedMaxWorkingSetSize, two thirds of 16384. An earlier
+      version of this comment recorded that number as the jetsam ceiling; it is
+      a different quantity and was never a process memory limit. It is also the
+      *lowest* of the three, and it is the one the voxel grid and the mesh
+      arenas are actually charged against, since both are Metal buffers.
+
+  So do not read a comfortable jetsam percentage as headroom: the working set
+  binds first, and the read-out prints both for that reason.
+
+  Note what this does *not* establish. The jetsam ceiling and hw.memsize sit
+  close together on a 16 GB device precisely because of the carve-out above, so
+  their ratio is not evidence of anything, in either direction — an entitled and
+  an unentitled build are not told apart by it, and on a phone build the ceiling
+  sits below hw.memsize either way. The way to check the entitlement is to read
+  it off the signed binary; the way to check the ceiling is Bridge/MemoryBudget.
+
+  extended-virtual-addressing would normally sit beside it — the arena ring can
+  exceed the 4 GB a 32-bit address space covers — but it is deliberately absent:
   a **personal** (free) development team cannot provision it. Xcode fails the
   build outright with "Personal development teams ... do not support the Extended
   Virtual Addressing capability", so adding it back costs the whole build, not
   just the capability. It needs a paid Apple Developer Program membership with
   the capability enabled on the App ID. increased-memory-limit alone does
-  provision on a personal team, and is verifiable in the signed binary with
-  `codesign -d --entitlements -`.
+  provision on a personal team.
 
   Not a licence to be careless: this moves the wall, it does not remove it.
-  voxel_size, FusionConfig::max_buckets and mesh_slots are still what decide
-  whether a scan fits, and the occupancy guard in Fusion::fuse is still what
-  keeps the *GPU* out of trouble independently of any of this.
+  iOS still jetsams entitled processes under system-wide memory pressure, and
+  the working set above binds below the jetsam ceiling regardless. voxel_size,
+  FusionConfig::max_buckets and mesh_slots are still what decide whether a scan
+  fits, and the occupancy guard in Fusion::fuse is still what keeps the *GPU*
+  out of trouble independently of any of this.
 -->
 <plist version="1.0">
 <dict>

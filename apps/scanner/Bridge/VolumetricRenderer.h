@@ -235,6 +235,25 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 
+/// @brief Record that the OS asked the app to free memory.
+///
+/// The one piece of this app's memory picture the OS *pushes* rather than
+/// waiting to be asked for, and the only warning that arrives before jetsam
+/// rather than after. Everything else on the memory row is a poll at whatever
+/// rate the view happens to tick, which cannot see a spike shorter than its own
+/// interval; this fires on the OS's schedule, at the moment the system decided
+/// memory was short.
+///
+/// Recorded, not acted on. Shrinking the arenas or refusing the next allocation
+/// in response is a change to allocation policy and wants its own measured
+/// change; what this buys today is that a scan that was warned and then died
+/// says so on the read-out and in `log collect`, which is the difference
+/// between a diagnosable SIGKILL and a process that simply vanished.
+///
+/// Safe to call from the main thread at any point in the renderer's life,
+/// including before fusion starts.
+- (void)noteMemoryWarning;
+
 /// @brief Draw and present one frame at @p size.
 ///
 /// Pass the layer's current `drawableSize` in pixels; the frame loop rebuilds

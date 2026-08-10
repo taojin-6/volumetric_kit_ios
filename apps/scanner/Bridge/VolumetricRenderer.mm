@@ -7,7 +7,10 @@
 
 #import "VolumetricRenderer.h"
 
+#import <Metal/Metal.h>
+
 #import "Fusion.hpp"
+#import "MemoryBudget.hpp"
 #import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
 
@@ -112,6 +115,36 @@ NSString* to_ns_string(const std::string& text) {
                                               length:text.size()
                                             encoding:NSISOLatin1StringEncoding];
   return latin1 != nil ? latin1 : @"(unprintable)";
+}
+
+// Metal's recommended working-set ceiling in bytes, or 0 when unavailable.
+//
+// The third of the three ceilings this app runs under, and by the numbers in
+// scanner.entitlements the *lowest* of them: two thirds of physical RAM against
+// a jetsam limit near the whole of it. It is also the one the voxel grid and
+// the mesh arenas are charged against, since both are Metal buffers underneath
+// MoltenVK -- so a comfortable jetsam percentage on its own is the reassuring
+// half of the picture, which is why the read-out prints this beside it.
+//
+// Deliberately not in Bridge/MemoryBudget: that file reads the jetsam ledger
+// through Mach and stays plain C++, and these are separate subsystems that
+// scanner.entitlements is explicit about keeping apart. Read from Metal rather
+// than from VMA's HeapStats::budget_bytes, which is a heuristic until
+// VK_EXT_memory_budget is enabled -- an open TODO in both sibling libraries,
+// and exactly the kind of estimate this read-out exists to stop relying on.
+//
+// Cached: iOS has one GPU and this value does not move, so the device is
+// created once rather than at the polling rate. `recommendedMaxWorkingSetSize`
+// is ios(16.0), which is this app's deployment target (see
+// cmake/ios.toolchain.cmake).
+std::uint64_t gpu_working_set_bytes() {
+  static const std::uint64_t cached = []() -> std::uint64_t {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    return device == nil ? 0
+                         : static_cast<std::uint64_t>(
+                               device.recommendedMaxWorkingSetSize);
+  }();
+  return cached;
 }
 
 VolumetricRendererError error_code(vg::Status::Code domain) {
@@ -331,6 +364,12 @@ struct RendererImpl {
   // a rising vertex count next to a frozen screen.
   std::uint64_t mesh_upload_failures = 0;
   std::string mesh_upload_error;
+  // Memory warnings the OS pushed at us, and what the process was holding the
+  // last time one arrived. See -noteMemoryWarning. Plain values rather than
+  // atomics for the same reason the counter above is: UIKit delivers the
+  // warning on the main thread and `fusionSummary` is built on it too.
+  std::uint64_t memory_warnings = 0;
+  std::uint64_t memory_warning_footprint_bytes = 0;
   // The pose the newest mesh was fused at; the camera follows the scan until
   // the user's fingers take it over.
   vr::Mat4f camera_to_world{1.0f};
@@ -1187,6 +1226,24 @@ struct RendererImpl {
     errors = "\n  ! errors x" + std::to_string(s.errors) +
              (s.last_error.empty() ? "" : ": " + s.last_error);
   }
+  // The OS's own warning, which is the only part of this read-out that is not a
+  // poll: see -noteMemoryWarning. A banner rather than a row on the memory
+  // block below, because it is an event with a time rather than a level -- and
+  // because it means the system has already decided memory is short, which puts
+  // it with the failures and not with the gauges. The footprint at the moment
+  // it fired is carried along; the polled one beside it will usually have
+  // moved.
+  std::string memory_warnings;
+  if (_impl->memory_warnings > 0) {
+    memory_warnings =
+        "\n  ! memory warning x" + std::to_string(_impl->memory_warnings);
+    if (_impl->memory_warning_footprint_bytes > 0) {
+      memory_warnings += " (last at " +
+                         std::to_string(_impl->memory_warning_footprint_bytes /
+                                        (1024ULL * 1024ULL)) +
+                         " MB)";
+    }
+  }
   // The phase rows, built here as label/value pairs rather than as eight more
   // positional varargs on the format below. That format already couples ~19
   // conversions to their arguments by position, and a run of same-typed floats
@@ -1329,16 +1386,129 @@ struct RendererImpl {
     dirty_rows = cell;
   }
 
+  // What the OS will actually allow, asked of the OS.
+  //
+  // This is the number every sizing knob in FusionConfig is really chosen
+  // against -- voxel_size, max_buckets, mesh_slots -- and until now it appeared
+  // nowhere the app could see: only as a figure in scanner.entitlements that
+  // nothing measured. Its absence is why the run that motivated
+  // increased-memory-limit could only be diagnosed after the fact, from a
+  // process that had already vanished.
+  //
+  // Two rows, because there are two ceilings and the *lower* one is the one
+  // nothing here used to print. The jetsam limit kills the process; the GPU
+  // working set is roughly two thirds of it and is what the voxel grid and the
+  // mesh arenas are really charged against. A footprint that reads as a
+  // comfortable fraction of the jetsam limit is half again as much of the
+  // working set, and reporting only the first is reassuring in exactly the
+  // direction that gets a scan killed.
+  //
+  // The working-set row compares the *footprint* against that ceiling rather
+  // than a GPU-only figure. That overstates GPU pressure, because the footprint
+  // also charges host allocations Metal never sees -- which is the safe
+  // direction for an instrument whose job is to warn, and it needs no second
+  // allocator to agree with. `device RAM` rides along on the same row for scale
+  // and is not a ceiling anyone should size against; see MemoryBudget.hpp.
+  //
+  // Assembled by concatenation, with every number adjacent to the words naming
+  // it, rather than as one format string. The version this replaces bound four
+  // same-typed `%.0f`/`%.1f` conversions to their arguments by position, which
+  // is the one mistake -Wformat cannot see: transposing the limit and the
+  // device's RAM printed a fully plausible row whose verdict was inverted, and
+  // left the printed fraction disagreeing with the printed percentage. Same
+  // reasoning as the phase cells above; the difference is that this actually
+  // removes the class rather than relocating it into a smaller format.
+  const auto mb = [](std::uint64_t bytes) {
+    char cell[32];
+    std::snprintf(cell, sizeof(cell), "%.0f",
+                  static_cast<double>(bytes) / (1024.0 * 1024.0));
+    return std::string(cell);
+  };
+  const auto pct = [](std::uint64_t part, std::uint64_t whole) {
+    char cell[32];
+    std::snprintf(cell, sizeof(cell), "%.1f",
+                  whole > 0 ? 100.0 * static_cast<double>(part) /
+                                  static_cast<double>(whole)
+                            : 0.0);
+    return std::string(cell);
+  };
+  std::string memory_rows;
+  {
+    const app::MemoryBudget budget = app::query_memory_budget();
+    const std::uint64_t working_set = gpu_working_set_bytes();
+
+    std::string held;
+    if (!budget.valid) {
+      // The kernel's own code, not a bare "unavailable". MemoryBudget
+      // enumerates two reasons a reading can fail and they want different
+      // responses; a placeholder that cannot tell them apart asks the reader to
+      // guess, and this row is read when something has already gone wrong.
+      held = "unavailable [task_info kr=" +
+             std::to_string(budget.task_info_status) + "]";
+    } else if (budget.at_limit) {
+      // The kernel clamps the remainder to 0 here, so there is no ceiling to
+      // derive -- deriving one anyway yields limit == footprint and prints a
+      // tidy 100% under a ceiling that rose to meet the number it was
+      // measuring. This is the last state before jetsam; it gets a banner, not
+      // a ratio.
+      held = "! " + mb(budget.footprint_bytes) +
+             " MB held, no headroom left before jetsam";
+    } else if (budget.limit_known) {
+      held = mb(budget.footprint_bytes) + " / " + mb(budget.limit_bytes) +
+             " MB jetsam (" + pct(budget.footprint_bytes, budget.limit_bytes) +
+             "%)";
+    } else {
+      held =
+          mb(budget.footprint_bytes) + " MB held, jetsam ceiling not reported";
+    }
+    // The high-water mark, which is the only part of this row that can survive
+    // the gap between polls. See MemoryBudget::peak_footprint_bytes: a resize
+    // spike lasts well under one polling interval, so the sampled footprint
+    // beside it is the steady state and reads as comfortable no matter what the
+    // scan just survived.
+    if (budget.peak_footprint_bytes > 0) {
+      held += ", peak " + mb(budget.peak_footprint_bytes) + " MB";
+    }
+
+    std::string context;
+    if (working_set > 0) {
+      context = budget.valid
+                    ? mb(budget.footprint_bytes) + " / " + mb(working_set) +
+                          " MB gpu working set (" +
+                          pct(budget.footprint_bytes, working_set) + "%)"
+                    : mb(working_set) + " MB gpu working set";
+    }
+    // Printed even when task_info refused, because it is a separate reading
+    // that did not fail: suppressing the whole block on one sub-failure would
+    // drop two figures that are still obtainable.
+    if (budget.device_ram_bytes > 0) {
+      if (!context.empty()) {
+        context += ", ";
+      }
+      context += "device RAM " + mb(budget.device_ram_bytes) + " MB";
+    }
+
+    memory_rows = "  memory    " + held + "\n";
+    if (!context.empty()) {
+      memory_rows += "            " + context + "\n";
+    }
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can both be present and both carry a `Status::message()`.
   //
+  // 4096 rather than 2048. The worst case measured at 1766 bytes when this was
+  // sized, which is 86% of 2048 rather than the "well under half" the previous
+  // note claimed, and the memory block above adds up to ~150 more. That left
+  // less margin than the comment described, against a buffer whose overflow is
+  // silent: snprintf's return is discarded, so a cut would not be reported.
+  // Doubling it is stack memory on a thread that has megabytes of it, and it
+  // restores the headroom the comment always assumed.
+  //
   // Truncation, if it ever happened, could only cut the *tail*, and the tail is
-  // now the phase rows and the fixed body rather than the banners -- those
-  // moved to the top precisely so a clipped read-out keeps its failures.
-  // snprintf's return is discarded, so a cut would be silent either way; the
-  // buffer is sized generously rather than checked because it is stack memory
-  // and the realistic worst case measures well under half of it.
-  char buf[2048];
+  // now the phase rows and the fixed body rather than the banners or the memory
+  // block -- those are at the top precisely so a clipped read-out keeps them.
+  char buf[4096];
   std::snprintf(
       buf, sizeof(buf),
       // Banners directly under the header, not at the end. They were last,
@@ -1346,7 +1516,23 @@ struct RendererImpl {
       // an overlay that already runs past the safe area on a landscape iPhone
       // -- so they were the first things clipped. Nothing below them is worth
       // more screen than they are.
-      "fused %llu / remesh %llu  v%u%s%s\n"
+      "fused %llu / remesh %llu  v%u%s%s%s\n"
+      // Directly under the banners, and above every capacity row, because this
+      // is the only quantity on the read-out whose ceiling is enforced by
+      // something outside the app and the only one whose breach takes the
+      // process with it. It sat second-from-last, which is the position the
+      // comment above `dirty_rows` warns about in as many words: the
+      // statusLabel is bottom-constrained and clips silently, and at 12 pt this
+      // body plus the ARKit rows below it overruns a landscape iPhone by enough
+      // that the tail is simply not on screen. With an `! errors` banner
+      // present -- the OOM-adjacent case where the reading matters most -- the
+      // old position was off the bottom of every iPhone. Nothing below it is
+      // worth more screen than it is, which is the same argument that moved the
+      // banners up.
+      //
+      // Carries its own newlines and may be two rows, so it is spliced in as a
+      // block rather than given a row of its own here.
+      "%s"
       "  mesh      %u verts / %u tris\n"
       "  allocate  %.1f ms\n"
       "  integrate %.1f ms\n"
@@ -1372,7 +1558,8 @@ struct RendererImpl {
       "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
-      errors.c_str(), upload.c_str(), s.vertices, s.triangles, s.allocate_ms,
+      errors.c_str(), upload.c_str(), memory_warnings.c_str(),
+      memory_rows.c_str(), s.vertices, s.triangles, s.allocate_ms,
       s.integrate_ms, s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
       s.extract.triangle_capacity,
       s.extract.triangle_capacity > 0
@@ -1439,6 +1626,30 @@ struct RendererImpl {
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`
   // returns for invalid UTF-8.
   return to_ns_string(buf);
+}
+
+- (void)noteMemoryWarning {
+  if (!_impl) {
+    return;
+  }
+  _impl->memory_warnings += 1;
+  // Sampled here rather than left to the next poll, because this is the one
+  // moment the OS has told us the number matters and the next tick is up to
+  // half a second away -- long enough for the allocation that provoked the
+  // warning to have been freed again.
+  const app::MemoryBudget budget = app::query_memory_budget();
+  if (budget.valid) {
+    _impl->memory_warning_footprint_bytes = budget.footprint_bytes;
+  }
+  // os_log_error rather than os_log: this is the only pre-jetsam signal the app
+  // gets, and the error level is what survives into `log collect` at the
+  // default capture settings -- the read-out's own mirror is os_log, which a
+  // killed process may not have flushed a copy of at the relevant moment.
+  os_log_error(
+      OS_LOG_DEFAULT, "vk-scan: memory warning #%llu, footprint %llu MB",
+      static_cast<unsigned long long>(_impl->memory_warnings),
+      static_cast<unsigned long long>(_impl->memory_warning_footprint_bytes /
+                                      (1024ULL * 1024ULL)));
 }
 
 - (void)waitIdle {

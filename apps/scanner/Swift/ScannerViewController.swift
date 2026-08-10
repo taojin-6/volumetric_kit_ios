@@ -140,6 +140,22 @@ final class ScannerViewController: UIViewController {
     suspend()
   }
 
+  override func didReceiveMemoryWarning() {
+    super.didReceiveMemoryWarning()
+    // Forwarded, not acted on. This is the only notice the OS gives before
+    // jetsam, and until now the app discarded it: everything on the memory row
+    // is a poll at this view's own tick rate, which cannot see a spike shorter
+    // than its interval, and the kill itself reports nothing at all. Recording
+    // it is what makes "the scan was warned, then died" a readable sequence
+    // rather than a process that vanished.
+    //
+    // Deliberately not a wind-down. `suspend()` would stop the session and the
+    // fuse loop, which is a policy decision about what to do with a scan in
+    // progress -- and one that would fire on a warning the app may well survive.
+    // See VolumetricRenderer.noteMemoryWarning().
+    renderer?.noteMemoryWarning()
+  }
+
   @objc private func appDidEnterBackground() {
     isBackgrounded = true
     suspend()
