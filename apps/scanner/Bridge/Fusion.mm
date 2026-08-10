@@ -36,14 +36,6 @@ constexpr std::int32_t kBlocksPerBucket = 8;
 /// The floor on `FusionConfig::mesh_slots`; see that field.
 constexpr std::uint32_t kMinMeshSlots = 2;
 
-/// How many remeshes' worth of fused frames an occupancy reading may go
-/// unrefreshed before it is treated as unusable rather than current.
-///
-/// Several rather than one: a remesh legitimately skips its extract when the
-/// renderer has not collected the last mesh (see @ref Fusion::remesh), so a
-/// one-remesh window would trip on the steady state.
-constexpr std::uint64_t kMaxStaleRemeshes = 4;
-
 /// How many *fused* frames between dirty-block surveys.
 ///
 /// Fused rather than captured, which is the unit the window is reported in and
@@ -200,30 +192,33 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // and counting them made the one genuine failure impossible to see.
   bool frame_stage_failed = false;
 
-  // --- Is the occupancy reading still live? --------------------------------
+  // --- How full is the table, right now? -----------------------------------
   //
-  // Both guards below read `stats_.extract.active_blocks`, and the only thing
-  // that writes it is a *successful* extract in remesh. So a persistent extract
-  // failure -- a refit that runs out of memory, a capacity past
-  // maxStorageBufferRange -- freezes the numerator while the real table goes on
-  // filling, and the guards then wave through exactly the regime they exist to
-  // prevent. Worse, they do it silently: the read-out keeps printing the frozen
-  // count as though the protection were live.
+  // `VoxelHashMap::load_factor` -- a 4-byte read of the mapped heap counter,
+  // which recon added as the constant-time reading a per-frame caller can
+  // afford. Both guards below used `stats_.extract.active_blocks` instead,
+  // which only a *successful extract* refreshes, so a persistent extract
+  // failure froze the numerator while the real table went on filling and the
+  // guards waved through exactly the regime they exist to prevent.
   //
-  // Measured in fused frames rather than trusted, because the reading has a
-  // legitimate lag: it refreshes every `remesh_every` frames, and a remesh
-  // skips its extract outright when the renderer has not collected the last
-  // mesh. A window several remeshes wide is therefore quiet in normal operation
-  // and trips promptly when extracts actually stop.
-  //
-  // Past it the table is treated as full, which is the safe direction: new
-  // allocation stops, everything already in the table keeps fusing, and the
-  // reason says the reading is stale rather than implying a healthy volume.
-  const std::uint64_t stale_after =
-      kMaxStaleRemeshes * std::max<std::uint32_t>(config_.remesh_every, 1u);
-  const bool occupancy_stale =
-      active_blocks_measured_ &&
-      stats_.frames_fused - active_blocks_at_frame_ > stale_after;
+  // The whole staleness apparatus that stood here -- a fused-frame window, a
+  // measured-yet flag, a stale-reading branch on both guards and a separate
+  // error message for it -- existed only to cope with that input. A reading
+  // that cannot go stale needs none of it: this one is taken this frame, from
+  // the map itself, and does not depend on meshing having succeeded.
+  float occupancy = 0.0f;
+  if (vr::Result<float> lf = grid_->map().load_factor()) {
+    occupancy = lf.value();
+  } else {
+    // A moved-from map is the only failure, and this class owns it -- so this
+    // is unreachable rather than tolerated. Report and treat the table as full:
+    // refusing to allocate on an unknown occupancy is the safe direction, and
+    // it is the direction the old stale branch took for the same reason.
+    ++stats_.errors;
+    frame_error = "load_factor: " + lf.status().message();
+    frame_stage_failed = true;
+    occupancy = 1.0f;
+  }
 
   // --- Grow *ahead* of density, before allocating into it -------------------
   //
@@ -246,13 +241,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // afforded. So grow on occupancy instead, well before the fallback dominates.
   // The reactive path below stays as a backstop for a frame that fills the
   // table faster than one doubling absorbs.
-  constexpr float kGrowAtOccupancy = 0.7f;
-  if (!occupancy_stale && stats_.extract.active_blocks > 0 &&
+  // recon's own constant, not a third copy of the number: the map's header
+  // gives this figure as the occupancy a caller should grow at rather than run
+  // past, and a UI drawing its own ceiling or an embedder refusing at its own
+  // threshold otherwise ends up disagreeing with the library it is guarding.
+  if (occupancy > vr::volume::VoxelHashMap::kGrowThreshold &&
       config_.num_buckets < config_.max_buckets) {
-    const float capacity = static_cast<float>(config_.num_buckets) *
-                           static_cast<float>(kBlocksPerBucket);
-    if (static_cast<float>(stats_.extract.active_blocks) >
-        capacity * kGrowAtOccupancy) {
+    {
       const std::int32_t grown_to =
           std::min(config_.num_buckets * 2, config_.max_buckets);
       const vr::Status grown = grid_->resize(grown_to);
@@ -284,12 +279,12 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // ("a scan that is missing far geometry, still running, and saying so") -- it
   // just was not actually enforced anywhere, and the unenforced version was a
   // GPU hang.
+  // Deliberately NOT kGrowThreshold. That one says "start growing"; this one
+  // says "stop feeding the overflow scan", and the band between them is the
+  // room a doubling needs to land in. Collapsing them would refuse allocation
+  // at the moment growth begins, on a table with plenty of room.
   constexpr float kRefuseAllocateAtOccupancy = 0.85f;
-  const float table_capacity = static_cast<float>(config_.num_buckets) *
-                               static_cast<float>(kBlocksPerBucket);
-  const bool table_exhausted =
-      occupancy_stale || static_cast<float>(stats_.extract.active_blocks) >
-                             table_capacity * kRefuseAllocateAtOccupancy;
+  const bool table_exhausted = occupancy > kRefuseAllocateAtOccupancy;
 
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
@@ -298,29 +293,23 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       table_exhausted ? vr::Result<std::uint32_t>(0u)
                       : grid_->map().allocate_from_depth(
                             frame.depth, frame.depth_camera, &failures);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.occupancy = occupancy;
+    stats_.allocation_stopped = table_exhausted;
+  }
   if (table_exhausted && frame_error.empty()) {
-    // Two different situations, and the difference is the whole point of
-    // saying which: a full volume is the documented trade working, while a
-    // stale reading means the guard has no idea how full the table is and has
-    // stopped allocating *because* it cannot tell. Reporting the second as
-    // "volume full" would name a cause the user could act on when the real one
-    // is upstream, in whatever is failing every extract.
-    if (occupancy_stale) {
-      frame_error =
-          "occupancy unknown: no extract has measured the block table for " +
-          std::to_string(stats_.frames_fused - active_blocks_at_frame_) +
-          " fused frames (last read " +
-          std::to_string(stats_.extract.active_blocks) +
-          " blocks); not allocating new blocks until it does. See the extract "
-          "error above.";
-    } else {
-      frame_error =
-          "volume full: " + std::to_string(stats_.extract.active_blocks) +
-          " of " + std::to_string(static_cast<std::int64_t>(table_capacity)) +
-          " blocks at the " + std::to_string(config_.max_buckets) +
-          "-bucket ceiling; not allocating new blocks (existing surface still "
-          "fusing). Raise max_buckets or use a coarser voxel_size.";
-    }
+    // One situation now, not two. The old branch here distinguished "volume
+    // full" from "occupancy unknown", because the guard read a number only a
+    // successful extract refreshed and had to say when it could not trust it.
+    // This reading comes from the map every frame, so there is no unknown left
+    // to report.
+    frame_error =
+        "volume full: " + std::to_string(static_cast<int>(occupancy * 100.0f)) +
+        "% of " + std::to_string(config_.num_buckets * kBlocksPerBucket) +
+        " blocks at the " + std::to_string(config_.max_buckets) +
+        "-bucket ceiling; not allocating new blocks (existing surface still "
+        "fusing). Raise max_buckets or use a coarser voxel_size.";
   }
   if (!overflow) {
     std::lock_guard<std::mutex> lock(mutex_);

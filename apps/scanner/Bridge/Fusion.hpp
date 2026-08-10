@@ -116,7 +116,7 @@ struct FusionConfig {
   /// does, and costs no memory. Raising it further needs the
   /// `extended-virtual-addressing` entitlement, which a personal signing team
   /// cannot provision -- see apps/scanner/scanner.entitlements.
-  std::int32_t max_buckets = 16384;
+  std::int32_t max_buckets = 32768;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
   /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
@@ -260,6 +260,19 @@ struct FusionStats {
   /// the displayed occupancy exactly when the map is under most pressure. Both
   /// halves of a ratio move together or neither does.
   std::uint32_t table_capacity = 0;
+  /// Live block-table occupancy from `VoxelHashMap::load_factor` -- read every
+  /// fused frame, so unlike @ref table_capacity it never lags a remesh.
+  float occupancy = 0.0f;
+  /// Whether the guard is refusing to allocate new blocks this frame.
+  ///
+  /// Its own field rather than a line in @ref last_error, because that string
+  /// is most-recent-wins and shows only when @ref errors is non-zero -- and
+  /// this is deliberately *not* an error (a full volume is the documented trade
+  /// working). The result was that a scan stopped taking in new geometry and
+  /// said so nowhere: an M5 iPad Pro ran half a scan frozen at 85% behind an
+  /// `errors 0` banner, with `table` the only clue and only to someone who
+  /// already knew 85% was the threshold.
+  bool allocation_stopped = false;
   /// @brief The dirty-block survey: how much of the map a window of fusing
   ///        actually changed.
   ///
@@ -553,6 +566,12 @@ class Fusion {
   // reading from one frozen by a persistent extract failure -- at which point
   // the guards would otherwise be reading a number that stopped tracking
   // reality and waving a filling table through.
+  // `stats_.frames_fused` as of the last extract that published a breakdown,
+  // and whether one ever has. These fed the occupancy guard too, until it moved
+  // to VoxelHashMap::load_factor -- a reading that cannot go stale, so the
+  // guard needs no such pair. What remains is the read-out's own concern:
+  // `extract.*` publishes only on a fully-successful remesh, so without this
+  // the panel reprints a frozen breakdown as current.
   std::uint64_t active_blocks_at_frame_ = 0;
   bool active_blocks_measured_ = false;
   // `stats_.frames_fused` when the current dirty window opened -- the last time
