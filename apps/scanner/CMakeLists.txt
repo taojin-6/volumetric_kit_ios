@@ -26,14 +26,24 @@ add_library(
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
   Bridge/Fusion.mm Bridge/OrbitCamera.cpp Bridge/MemoryBudget.cpp)
 
-# ARC is an Objective-C feature, so OrbitCamera.cpp and MemoryBudget.cpp are
-# deliberately absent from this list: both are plain C++ with no object pointers
-# to manage, and clang warns on -fobjc-arc for a translation unit that is not
-# Objective-C. MemoryBudget reaches the OS through <os/proc.h> and Mach, which
-# are C.
-set_source_files_properties(
-  Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  Bridge/Fusion.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+# ARC, selected by language rather than by a second copy of the source list.
+#
+# The set_source_files_properties form this replaces named four of the six
+# sources explicitly, seven lines below the list it had to agree with and with
+# nothing deriving one from the other. Omitting a new Bridge/*.mm from it is
+# silent: a translation unit compiled without -fobjc-arc is not an error and not
+# a warning, it is manual retain/release, so every ARFrame, CVPixelBuffer and
+# CAMetalDrawable that file touches simply leaks -- in the app whose documented
+# worst failure is a jetsam SIGKILL with nothing in the log.
+#
+# COMPILE_LANGUAGE:OBJCXX is the discriminator the exclusion was really about:
+# .cpp sources compile as CXX and never see the flag, so OrbitCamera.cpp and
+# MemoryBudget.cpp stay out of it by construction rather than by being
+# remembered. (Neither is excluded for reaching the OS through C headers -- an
+# ARC translation unit may include <mach/mach.h> and <sys/sysctl.h> and call
+# into them perfectly well. It is the file extension that decides.)
+target_compile_options(scanner_bridge
+                       PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
 # VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella
@@ -146,7 +156,15 @@ set_target_properties(
              #
              # Capability entitlements fail signing loudly when the App ID lacks
              # them, which is the good outcome -- a silently dropped entitlement
-             # would look like a fix that quietly is not one.
+             # would look like a fix that quietly is not one. So a build that
+             # runs at all is already carrying this one; to confirm it on the
+             # binary rather than infer it from a running app:
+             #
+             # codesign -d --entitlements - <path to scanner.app>
+             #
+             # That command lives here rather than in scanner.entitlements
+             # because a doubled hyphen cannot appear inside an XML comment --
+             # see the note at the top of that file.
              # ~~~
              XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
              "${CMAKE_CURRENT_SOURCE_DIR}/scanner.entitlements")

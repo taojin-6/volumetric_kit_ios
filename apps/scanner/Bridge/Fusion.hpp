@@ -88,6 +88,17 @@ struct FusionConfig {
   /// ~1.1 GiB at the doubling that reaches it -- an iPad-Pro number, not a
   /// phone number. Lower it for phone builds.
   ///
+  /// @note Those costs are measured; the *ceiling* they were judged against was
+  ///       not. This value was chosen when `scanner.entitlements` recorded
+  ///       10922 MB as the process memory limit, which turned out to be
+  ///       MoltenVK's GPU working set rather than a limit at all. 16384 still
+  ///       fits comfortably under both real ceilings, so the number is not
+  ///       being changed on a guess -- but the derivation behind it is void,
+  ///       and raising this further wants re-deriving against what
+  ///       Bridge/MemoryBudget and the working-set figure actually report on
+  ///       the target device. The arenas are Metal buffers, so the working set
+  ///       is the ceiling that binds, not the jetsam limit.
+  ///
   /// **What this ceiling does is now enforced, which it previously was not.**
   /// It was 4096, and reaching it meant the table simply kept filling: the
   /// allocate kernel's overflow path scans every entry, so its cost per insert
@@ -133,8 +144,12 @@ struct FusionConfig {
   /// Fusion::fuse treats as fatal to the frame, where before this was turned on
   /// the same frame fused normally. The exposure is worst where it can least be
   /// afforded: the frame after a doubling toward @ref max_buckets, which that
-  /// field documents as the ~1.1 GiB jetsam range. Nothing retries or falls
-  /// back, so turning the survey off must not need a source edit and a rebuild.
+  /// field prices at a ~1.1 GiB transient -- the largest single allocation
+  /// spike this app makes, and so the one most likely to be refused. (It was
+  /// described here as "the jetsam range", which it is not: that phrasing came
+  /// from a ceiling `scanner.entitlements` had recorded ~50% too low, and from
+  /// calling a transient cost a limit.) Nothing retries or falls back, so
+  /// turning the survey off must not need a source edit and a rebuild.
   bool track_dirty_blocks = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
