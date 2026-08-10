@@ -242,6 +242,12 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // last_error unconditionally, which meant a frame fused with missing blocks
   // left no trace anywhere -- the read-out showed a rising vertex count and an
   // empty error line while a whole region of the scan quietly never filled.
+  // One reporting window per fused frame. The tiers open their own host scopes
+  // and publish their device spans into it, so the hand-rolled Clock::now()
+  // spans this function used to keep are gone -- and each row now carries the
+  // GPU half those never could.
+  vr::StageMetrics stages;
+
   std::string frame_error;
   // Whether that error is a *stage failure* rather than a report of an expected
   // outcome. Only the former reaches `stats_.errors` -- see that field: dropped
@@ -422,9 +428,10 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   const auto t_alloc = Clock::now();
   vr::volume::AllocFailures failures;
   vr::Result<std::uint32_t> overflow =
-      table_exhausted ? vr::Result<std::uint32_t>(0u)
-                      : grid_->map().allocate_from_depth(
-                            frame.depth, frame.depth_camera, &failures);
+      table_exhausted
+          ? vr::Result<std::uint32_t>(0u)
+          : grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
+                                             &failures, &stages);
   // Whether this frame took no new geometry in, by either route. The guard
   // above is one of them; the reactive loop below hitting the ceiling, or
   // running out of per-frame grow budget with blocks still dropped, is the
@@ -529,8 +536,10 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // the only thing that says whether the grown map actually absorbed the
     // frame; dropping it fuses against a grid still missing those blocks and
     // reports success.
+    // Accumulates into the same "allocate" row: a frame that resizes and
+    // re-allocates reports what it actually cost, not just the last attempt.
     overflow = grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
-                                                &failures);
+                                                &failures, &stages);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -602,7 +611,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   color.encoding = frame.color_encoding;
   const vr::Status fused = integrator_->integrate(
       *grid_, frame.depth, frame.depth_camera, /*max_weight=*/5.0f,
-      vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr);
+      vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr,
+      &stages);
   if (!fused) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -640,6 +650,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.table_blocks =
         static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
     stats_.allocation_stop = allocation_stop;
+    // Copied whole rather than picked apart: every field recon adds to a row
+    // arrives without a lockstep edit here, and the read-out below reads the
+    // same rows the bridge publishes -- one source, not two that can disagree.
+    stats_.stage_count = 0;
+    for (const vr::StageRow& row : stages.rows()) {
+      if (stats_.stage_count >= FusionStats::kMaxStages) break;
+      stats_.stages[stats_.stage_count++] = row;
+    }
     // How far behind this frame the published extract breakdown now is.
     // Everything in `stats_.extract` -- the phases, the block count, the arena,
     // `dispatches` -- is written only by a fully-successful remesh, so without

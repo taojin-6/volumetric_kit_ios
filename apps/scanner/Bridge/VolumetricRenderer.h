@@ -84,6 +84,38 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
   VolumetricViewOrientationPortraitUpsideDown = 3,
 };
 
+/// @brief One pipeline stage's host and device time, for the Swift side to
+///        chart.
+///
+/// The counterpart to @ref fusionSummary, and the reason it is not enough: that
+/// property is *rendered text*, so Swift can print it and nothing else. A chart
+/// needs the numbers. Same rows, same source -- the summary is built from
+/// these.
+///
+/// @note `gpuMs` is meaningful only where `hasGpu` is set. That flag IS the
+///       capability report: it is false both for a stage recon timed on the
+///       host alone and for every stage on a queue family reporting no
+///       timestamps, and a reader must not distinguish those by inspecting
+///       `gpuMs` for a zero.
+@interface VolumetricStageRow : NSObject
+/// Stage label; a breakdown of the row above it is prefixed with spaces.
+@property(nonatomic, readonly, copy) NSString* name;
+/// Wall clock around the stage. For a recon compute stage this covers host
+/// record, submit, the fence stall AND device execution -- an end-to-end cost,
+/// not a host-only one.
+@property(nonatomic, readonly) double cpuMs;
+/// Device time from a timestamp span around the dispatch alone.
+@property(nonatomic, readonly) double gpuMs;
+/// Whether @ref gpuMs holds a real measurement.
+@property(nonatomic, readonly) BOOL hasGpu;
+@end
+
+/// @brief The last fused frame's stages, newest first call wins.
+///
+/// Allocated per read, which is affordable because the read-out polls at a few
+/// hertz -- it would not be at frame rate, and a caller sampling faster should
+/// take @ref fusionSummary or add a POD accessor rather than churn this.
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -234,6 +266,17 @@ NS_SWIFT_NAME(VolumetricRenderer)
 
 /// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
+
+/// @brief The last fused frame's stages, for charting.
+///
+/// The counterpart to @ref fusionSummary and the reason it is not enough: that
+/// property is *rendered text*, so Swift can print it and nothing else. Same
+/// rows, same source -- the summary is built from these.
+///
+/// Allocated per read, which is affordable because the read-out polls at a few
+/// hertz. It would not be at frame rate; a caller sampling faster wants a POD
+/// accessor rather than churning this.
+@property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stageRows;
 
 /// @brief Record that the OS asked the app to free memory.
 ///

@@ -32,6 +32,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
@@ -244,6 +245,28 @@ struct FusionStats {
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
+
+  /// @brief The per-stage host/device rows recon reported for the last fused
+  ///        frame.
+  ///
+  /// The scalars above are the same host spans and stay for the existing
+  /// read-out; these carry the **device** half beside them, which no wall-clock
+  /// span around a fence-blocked submit can show.
+  ///
+  /// A fixed array, not a `std::vector`: this struct is copied out under the
+  /// publish mutex the fuse thread takes every frame, and a vector would malloc
+  /// inside that critical section -- the reason @ref FusionTraceStats exists at
+  /// all. Eight covers the pipeline (allocate, its compact breakdown,
+  /// integrate, texture) with room left; rows past it are dropped rather than
+  /// grown into, and @ref stage_count says how many are real.
+  ///
+  /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
+  ///          from a recon tier reporting with a string literal, so the
+  ///          pointers outlive any read -- but a row added from a non-literal
+  ///          would dangle.
+  static constexpr std::size_t kMaxStages = 8;
+  vr::StageRow stages[kMaxStages]{};
+  std::uint32_t stage_count = 0;
   /// @brief The last successful extract's own timings and counts, held whole.
   ///
   /// recon's struct by value rather than a hand-picked copy of its fields.

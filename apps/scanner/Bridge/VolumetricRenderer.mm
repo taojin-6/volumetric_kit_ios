@@ -536,6 +536,27 @@ struct RendererImpl {
   RendererImpl& operator=(const RendererImpl&) = delete;
 };
 
+// The stage-row value type. At file scope, not inside the renderer's
+// @implementation -- Objective-C has no nested implementations.
+@interface VolumetricStageRow ()
+- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row;
+@end
+
+@implementation VolumetricStageRow
+- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row {
+  if ((self = [super init])) {
+    // Copied, unlike the C++ row which borrows: an NSString outliving the
+    // literal costs nothing here, and it frees the Swift side from the
+    // lifetime rule StageRow carries.
+    _name = [NSString stringWithUTF8String:row.name != nullptr ? row.name : ""];
+    _cpuMs = row.cpu_ms;
+    _gpuMs = row.gpu_ms;
+    _hasGpu = row.has_gpu ? YES : NO;
+  }
+  return self;
+}
+@end
+
 @implementation VolumetricRenderer {
   std::unique_ptr<RendererImpl> _impl;
   // Retained, not borrowed. The fuse thread dereferences the raw
@@ -1255,6 +1276,16 @@ struct RendererImpl {
 
 - (float)cameraDistance {
   return _impl->camera.distance();
+}
+
+- (NSArray<VolumetricStageRow*>*)stageRows {
+  const app::FusionStats s = _impl->fusion.stats();
+  NSMutableArray<VolumetricStageRow*>* rows =
+      [NSMutableArray arrayWithCapacity:s.stage_count];
+  for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+    [rows addObject:[[VolumetricStageRow alloc] initWithRow:s.stages[i]]];
+  }
+  return rows;
 }
 
 - (NSString*)fusionSummary {
