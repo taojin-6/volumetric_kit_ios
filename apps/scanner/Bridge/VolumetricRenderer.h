@@ -231,6 +231,35 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 @property(nonatomic, readonly) BOOL allocationStopped;
 @end
 
+/// @brief How a stat should read: plain, healthy, or wanting attention.
+typedef NS_ENUM(NSInteger, VolumetricStatTone) {
+  VolumetricStatToneNeutral = 0,
+  VolumetricStatToneGood,
+  VolumetricStatToneWarn,
+  VolumetricStatToneCritical,
+};
+
+/// @brief One labelled figure.
+@interface VolumetricStatRow : NSObject
+@property(nonatomic, readonly, copy) NSString* label;
+@property(nonatomic, readonly, copy) NSString* value;
+/// Semantic, not decorative -- set only where a reader is meant to act.
+@property(nonatomic, readonly) VolumetricStatTone tone;
+@end
+
+/// @brief A named group of figures.
+///
+/// The read-out used to be one string, which meant it could only ever be laid
+/// out as one block of text: no grouping a UI could act on, no per-figure
+/// state, and everything in it competing for the same attention. Published as
+/// sections instead, so the same information can be a grid of cards -- and the
+/// log line is rendered *from* these, so the screen and the transcript cannot
+/// drift apart.
+@interface VolumetricStatSection : NSObject
+@property(nonatomic, readonly, copy) NSString* title;
+@property(nonatomic, readonly, copy) NSArray<VolumetricStatRow*>* rows;
+@end
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -380,6 +409,13 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @}
 
 /// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
+/// @brief Everything the read-out carries, grouped.
+///
+/// @ref fusionSummary is these joined into text for the log; this is the same
+/// content before it was flattened.
+@property(nonatomic, readonly, copy)
+    NSArray<VolumetricStatSection*>* statSections;
+
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 
 /// @brief The last fused frame's stages, for charting.

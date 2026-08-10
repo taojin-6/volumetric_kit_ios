@@ -24,6 +24,7 @@
 // FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
 // fusionSummary uses std::snprintf. It compiled only because some gfx or recon
 // header happens to pull <cstdio> in transitively today.
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -686,6 +687,77 @@ struct RendererImpl {
 @interface VolumetricFrameSample ()
 - (instancetype)initWithSample:(const app::FrameSample&)sample;
 @end
+
+@interface VolumetricStatRow ()
+- (instancetype)initWithLabel:(NSString*)label
+                        value:(NSString*)value
+                         tone:(VolumetricStatTone)tone;
+@end
+
+@implementation VolumetricStatRow
+- (instancetype)initWithLabel:(NSString*)label
+                        value:(NSString*)value
+                         tone:(VolumetricStatTone)tone {
+  if ((self = [super init])) {
+    _label = [label copy];
+    _value = [value copy];
+    _tone = tone;
+  }
+  return self;
+}
+@end
+
+@interface VolumetricStatSection ()
+- (instancetype)initWithTitle:(NSString*)title
+                         rows:(NSArray<VolumetricStatRow*>*)rows;
+@end
+
+@implementation VolumetricStatSection
+- (instancetype)initWithTitle:(NSString*)title
+                         rows:(NSArray<VolumetricStatRow*>*)rows {
+  if ((self = [super init])) {
+    _title = [title copy];
+    _rows = [rows copy];
+  }
+  return self;
+}
+@end
+
+namespace {
+
+// Small helpers so building a section reads as a list of figures rather than a
+// wall of alloc/init.
+NSString* fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
+NSString* fmt(const char* format, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, format);
+  std::vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  return [NSString stringWithUTF8String:buf];
+}
+
+void add(NSMutableArray<VolumetricStatRow*>* rows, NSString* label,
+         NSString* value, VolumetricStatTone tone = VolumetricStatToneNeutral) {
+  [rows addObject:[[VolumetricStatRow alloc] initWithLabel:label
+                                                     value:value
+                                                      tone:tone]];
+}
+
+VolumetricStatSection* make_section(NSString* title,
+                                    NSArray<VolumetricStatRow*>* rows) {
+  return [[VolumetricStatSection alloc] initWithTitle:title rows:rows];
+}
+
+// A fraction's tone against two thresholds, so every meter in the app agrees
+// about when a number stops being routine.
+VolumetricStatTone tone_for(double fraction, double warn, double crit) {
+  if (fraction >= crit) return VolumetricStatToneCritical;
+  if (fraction >= warn) return VolumetricStatToneWarn;
+  return VolumetricStatToneNeutral;
+}
+
+}  // namespace
 
 @implementation VolumetricFrameSample
 - (instancetype)initWithSample:(const app::FrameSample&)sample {
@@ -1487,6 +1559,119 @@ struct RendererImpl {
   // elements at a few hertz is not the cost worth keeping a live mutable array
   // to save.
   return [rows copy];
+}
+
+- (NSArray<VolumetricStatSection*>*)statSections {
+  const app::FusionStats s = _impl->fusion.stats();
+  const app::MemoryBudget budget = app::query_memory_budget();
+  const double mb = 1024.0 * 1024.0;
+  NSMutableArray<VolumetricStatSection*>* out = [NSMutableArray array];
+
+  // --- Fusion ---------------------------------------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
+    add(r, @"remesh",
+        fmt("%llu  (v%u)", (unsigned long long)s.remeshes, s.mesh_version));
+    add(r, @"mesh", fmt("%u verts / %u tris", s.vertices, s.triangles));
+    if (s.errors > 0) {
+      add(r, @"errors",
+          fmt("%llu  %s", (unsigned long long)s.errors, s.last_error.c_str()),
+          VolumetricStatToneCritical);
+    }
+    [out addObject:make_section(@"Fusion", r)];
+  }
+
+  // --- Stages: the host/device split, per stage -----------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+      const vr::StageRow& row = s.stages[i];
+      NSString* value =
+          row.has_gpu ? fmt("%6.2f ms   gpu %6.2f", row.cpu_ms, row.gpu_ms)
+                      : fmt("%6.2f ms   gpu      -", row.cpu_ms);
+      add(r, [NSString stringWithUTF8String:row.name], value);
+    }
+    if (s.stage_count > 0) [out addObject:make_section(@"Stages", r)];
+  }
+
+  // --- Extract: its own phases ---------------------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    add(r, @"total",
+        fmt("%.1f ms  (%u pass)", s.extract_ms, s.extract.dispatches),
+        s.extract.dispatches > 1 ? VolumetricStatToneWarn
+                                 : VolumetricStatToneNeutral);
+    add(r, @"meshing", fmt("%.2f ms", s.extract.dispatch_ms));
+    add(r, @"compact", fmt("%.2f ms", s.extract.compact_ms));
+    add(r, @"inputs", fmt("%.2f ms", s.extract.input_upload_ms));
+    add(r, @"sizing", fmt("%.2f ms", s.extract.arena_alloc_ms));
+    add(r, @"readback", fmt("%.2f ms", s.extract.readback_ms));
+    if (s.extract_stale) {
+      add(r, @"stale",
+          fmt("%llu frames since", (unsigned long long)s.frames_since_extract),
+          VolumetricStatToneWarn);
+    }
+    [out addObject:make_section(@"Extract", r)];
+  }
+
+  // --- Volume: the ceiling that stops a scan --------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    add(r, @"occupied",
+        fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_capacity),
+        tone_for(s.occupancy, 0.7, 0.85));
+    if (s.allocation_stopped) {
+      add(r, @"state", @"ALLOCATION STOPPED — volume full",
+          VolumetricStatToneCritical);
+    }
+    add(r, @"active", fmt("%u blocks", s.extract.active_blocks));
+    if (s.survey_active_blocks > 0) {
+      add(r, @"dirty",
+          fmt("%u changed -> %u remesh (%.1f%%)", s.survey_changed_blocks,
+              s.survey_remesh_blocks,
+              100.0 * s.survey_remesh_blocks / (double)s.survey_active_blocks));
+    }
+    [out addObject:make_section(@"Volume", r)];
+  }
+
+  // --- Arena: the mesh ring -------------------------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    const double fill = s.extract.triangle_capacity > 0
+                            ? (double)s.triangles / s.extract.triangle_capacity
+                            : 0.0;
+    add(r, @"fill",
+        fmt("%.1f%% of %u tris", 100.0 * fill, s.extract.triangle_capacity),
+        tone_for(fill, 0.9, 0.98));
+    add(r, @"resident",
+        fmt("%.0f MB across %u slots", s.extract.arena_bytes / mb,
+            s.mesh_slots));
+    [out addObject:make_section(@"Arena", r)];
+  }
+
+  // --- Memory: both ceilings, because the smaller one binds -----------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    const std::uint64_t ws = gpu_working_set_bytes();
+    if (ws > 0) {
+      const double f = budget.footprint_bytes / (double)ws;
+      add(r, @"gpu working set",
+          fmt("%.0f / %.0f MB  (%.1f%%)", budget.footprint_bytes / mb, ws / mb,
+              100.0 * f),
+          tone_for(f, 0.7, 0.85));
+    }
+    if (budget.limit_known) {
+      add(r, @"jetsam",
+          fmt("%.0f / %.0f MB", budget.footprint_bytes / mb,
+              budget.limit_bytes / mb));
+    }
+    add(r, @"peak", fmt("%.0f MB", budget.peak_footprint_bytes / mb));
+    add(r, @"device RAM", fmt("%.0f MB", budget.device_ram_bytes / mb));
+    [out addObject:make_section(@"Memory", r)];
+  }
+
+  return out;
 }
 
 - (NSString*)fusionSummary {

@@ -549,7 +549,6 @@ final class ScannerViewController: UIViewController {
     dashboard.trackingHealthy = arSession.tracking.description == "normal"
     dashboard.framesIn = Int(arSession.capture.stats.frames_submitted)
     dashboard.framesDropped = Int(arSession.capture.stats.frames_dropped)
-    dashboard.blockCapacity = Int(renderer.blockCapacity)
     dashboard.memoryUsedBytes = renderer.memoryFootprintBytes
     // The GPU working set, not the jetsam limit: the jetsam ceiling on this
     // hardware sits above installed RAM, so showing it reports headroom that
@@ -567,9 +566,20 @@ final class ScannerViewController: UIViewController {
     if let latest = samples.last {
       dashboard.triangles = Int(latest.triangles)
       dashboard.occupancy = latest.occupancy
-      dashboard.activeBlocks = Int(latest.activeBlocks)
       dashboard.allocationStopped = latest.allocationStopped
     }
+    // The grouping is the bridge's, not this file's -- the same sections the
+    // log line is rendered from, so screen and transcript cannot drift.
+    dashboard.groups = renderer.statSections.map { s in
+      StatGroup(
+        id: s.title,
+        items: s.rows.map {
+          StatItem(label: $0.label, value: $0.value, tone: $0.tone)
+        })
+    }
+    // True prose rather than figures, so these stay as lines.
+    dashboard.deviceLines = deviceSummary.components(separatedBy: "\n")
+      .filter { !$0.isEmpty }
 
     // The text survives for stdout alone: `devicectl process launch --console`
     // is how every device run in this project has been read, and the dashboard
