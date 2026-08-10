@@ -90,8 +90,13 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   }
   grid_.emplace(std::move(made).value());
 
+  // Dirty tracking is opt-in: it costs a num_blocks*4 array and a store per
+  // voxel, which a consumer that reads no flag should not pay. This one reads
+  // it -- the survey below is the whole reason the counters exist.
+  vr::tsdf::TsdfIntegratorConfig integ_config;
+  integ_config.track_dirty_blocks = true;
   vr::Result<vr::tsdf::TsdfIntegrator> integrator =
-      vr::tsdf::TsdfIntegrator::create(device, allocator);
+      vr::tsdf::TsdfIntegrator::create(device, allocator, integ_config);
   if (!integrator) {
     return integrator.status();
   }
@@ -443,6 +448,39 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   if (stats_.frames_fused % config_.remesh_every == 0) {
     remesh(frame);
+  }
+
+  // --- Dirty-block survey ---------------------------------------------------
+  //
+  // Throttled hard: two compactions, each a dispatch plus a readback of the
+  // whole active set, which at 100k+ blocks is the second most expensive thing
+  // in a fuse. Every 60th fused frame is enough to characterise a scan and is
+  // invisible in the frame budget. See FusionStats::survey_touched_blocks for
+  // what the number does and does not prove.
+  if (captured_ % 60 == 0) {
+    vr::Result<std::vector<vr::volume::BlockIndex>> all =
+        grid_->map().compact_active_blocks();
+    if (all) {
+      // The caller's already-compacted set is passed in rather than letting the
+      // integrator compact a second time -- a full dispatch and readback, and
+      // the second most expensive thing in a fuse at 100k+ blocks.
+      vr::Result<std::vector<vr::Vec3i>> remesh =
+          integrator_->dirty_remesh_blocks(*grid_, all.value().data(),
+                                           all.value().size());
+      if (remesh) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.survey_active_blocks =
+            static_cast<std::uint32_t>(all.value().size());
+        stats_.survey_changed_blocks = integrator_->dirty_block_count();
+        stats_.survey_remesh_blocks =
+            static_cast<std::uint32_t>(remesh.value().size());
+      }
+    }
+    // Re-armed every window, so each sample is ONE window's changes rather than
+    // everything since the scan began -- which is the quantity an incremental
+    // remesh would actually redo. Also clears the refusal a topology change
+    // (remove/clear) latches, since a slot-keyed flag means nothing across one.
+    integrator_->reset_dirty();
   }
 }
 

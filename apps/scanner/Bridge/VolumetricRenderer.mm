@@ -1273,6 +1273,43 @@ struct RendererImpl {
                 static_cast<double>(s.table_capacity)
           : 0.0,
       s.texture_ms);
+  // The dirty-block survey, appended so it rides the same throttled log line.
+  if (s.survey_active_blocks > 0) {
+    const std::size_t used = std::strlen(buf);
+    std::snprintf(
+        buf + used, sizeof(buf) - used,
+        "  dirty     %u changed -> %u to remesh of %u (%.1f%%, %.1fx saved)\n",
+        s.survey_changed_blocks, s.survey_remesh_blocks, s.survey_active_blocks,
+        100.0 * static_cast<double>(s.survey_remesh_blocks) /
+            static_cast<double>(s.survey_active_blocks),
+        s.survey_remesh_blocks > 0
+            ? static_cast<double>(s.survey_active_blocks) /
+                  static_cast<double>(s.survey_remesh_blocks)
+            : 0.0);
+  }
+  // Mirror the read-out to the log, throttled.
+  //
+  // Both channels, for the reason FrameTrace::dump states: os_log survives a
+  // run with no debugger and is readable afterwards via `log collect`, while
+  // stderr is what reaches `devicectl process launch --console` live. Until now
+  // the only thing on either channel was the *failure* dump, so a healthy scan
+  // -- the run whose numbers actually settle a question -- left no record at
+  // all and had to be read off the screen.
+  //
+  // Throttled by wall clock rather than by call: this is a property the Swift
+  // view polls at its own refresh rate, which is not a cadence this file
+  // controls. Two seconds is slow enough to stay readable in a console and fast
+  // enough to show an arena growing.
+  {
+    static std::chrono::steady_clock::time_point last_logged{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_logged >= std::chrono::seconds(2)) {
+      last_logged = now;
+      os_log(OS_LOG_DEFAULT, "vk-scan: %{public}s", buf);
+      std::fprintf(stderr, "vk-scan: %s\n", buf);
+      std::fflush(stderr);
+    }
+  }
   // Through the nil-guarding helper, like every other string property here: the
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`

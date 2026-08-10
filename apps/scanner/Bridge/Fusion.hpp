@@ -227,6 +227,33 @@ struct FusionStats {
   /// the displayed occupancy exactly when the map is under most pressure. Both
   /// halves of a ratio move together or neither does.
   std::uint32_t table_capacity = 0;
+  /// @brief The dirty-block survey: how much of the map one frame can see.
+  ///
+  /// The question incremental mesh extraction rests on -- re-meshing only what
+  /// changed is worth its complexity only if "what changed" is a small fraction
+  /// of the map. Measured on Replica room0 it came out at **87%**, which would
+  /// kill the idea; but room0 is one small enclosed room and a 90-degree, 8 m
+  /// cone from inside it contains nearly everything, so that number may be the
+  /// fixture rather than the truth. This device walks a real space with a
+  /// short-range LiDAR depth, which is the case that matters.
+  ///
+  /// `touched` is the active blocks inside the current depth camera's frustum.
+  /// It **over-estimates** what an integrate actually writes -- the frustum is
+  /// the whole view cone, while only voxels within +/-trunc_dist of the
+  /// measured depth are touched -- so a *low* number here is conclusive and a
+  /// high one is not. Surveyed periodically, because each survey costs two full
+  /// active-set compactions (a dispatch and a readback apiece).
+  std::uint32_t survey_active_blocks = 0;
+  /// Blocks the fuse actually CHANGED in the window -- not "was dispatched"
+  /// (the dispatch covers every active block and returns early for most) and
+  /// not "was in the frustum" (that is the whole view cone, which on Replica
+  /// room0 read 87% and was useless).
+  std::uint32_t survey_changed_blocks = 0;
+  /// Those dilated into the `-x/-y/-z` octant: the set an incremental extract
+  /// must actually redo, because a cell reads its corners as `base + {0,1}^3`,
+  /// so a changed block invalidates every block reaching into it. Measured at
+  /// 1.3-1.4x the changed set on room0.
+  std::uint32_t survey_remesh_blocks = 0;
   /// @brief How far behind the current frame @ref extract is, and whether that
   ///        is further than the remesh cadence explains.
   ///
