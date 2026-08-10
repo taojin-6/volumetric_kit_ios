@@ -44,6 +44,27 @@ constexpr std::uint32_t kMinMeshSlots = 2;
 /// one-remesh window would trip on the steady state.
 constexpr std::uint64_t kMaxStaleRemeshes = 4;
 
+/// How many *fused* frames between dirty-block surveys.
+///
+/// Fused rather than captured, which is the unit the window is reported in and
+/// the one `FusionConfig::fuse_every` does not distort: keying the survey off
+/// the capture counter made the real period 60/gcd(60, fuse_every) fused
+/// frames, so every value sharing a factor with 60 shortened the window
+/// silently and `fuse_every == 60` collapsed it to *every* fused frame -- a
+/// full compaction, fence and readback per fuse, on the knob someone reaches
+/// for precisely to buy frame budget back.
+constexpr std::uint64_t kSurveyEveryFrames = 60;
+
+/// How far past its own cadence a survey reading may fall before the read-out
+/// stops presenting it as current.
+///
+/// A window and a half: wide enough that the ordinary cadence never trips it
+/// (the sample publishes exactly every kSurveyEveryFrames frames when it is
+/// working), narrow enough that a survey which has stopped is named within
+/// another half-window rather than at some unbounded later point.
+constexpr std::uint64_t kSurveyStaleAfter =
+    kSurveyEveryFrames + kSurveyEveryFrames / 2;
+
 }  // namespace
 
 vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
@@ -90,8 +111,18 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   }
   grid_.emplace(std::move(made).value());
 
+  // Dirty tracking is opt-in: it costs a num_blocks*4 array and a store per
+  // voxel, which a consumer that reads no flag should not pay. This one reads
+  // it -- the survey in `fuse` is the whole reason the counters exist.
+  //
+  // Taken from the config rather than pinned on here, and that is the point of
+  // the field: recon allocates the flag array inside `integrate` and rebuilds
+  // it on every map grow, so a failure to get it fails the *frame*, not just
+  // the diagnostic. See FusionConfig::track_dirty_blocks.
+  vr::tsdf::TsdfIntegratorConfig integ_config;
+  integ_config.track_dirty_blocks = config.track_dirty_blocks;
   vr::Result<vr::tsdf::TsdfIntegrator> integrator =
-      vr::tsdf::TsdfIntegrator::create(device, allocator);
+      vr::tsdf::TsdfIntegrator::create(device, allocator, integ_config);
   if (!integrator) {
     return integrator.status();
   }
@@ -390,6 +421,19 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
     stats_.last_error = "integrate: " + fused.message();
+    if (config_.track_dirty_blocks) {
+      // Named here because dirty tracking put an allocation on this path that
+      // was not on it before: recon sizes the per-block flag array inside
+      // integrate and rebuilds it beside the old one on every map grow, so the
+      // frame after a resize can fail here for want of a *diagnostic* buffer
+      // while the fuse itself was affordable. Nothing falls back, so a reader
+      // who cannot otherwise account for this failure needs the switch named.
+      stats_.last_error +=
+          " -- note: FusionConfig::track_dirty_blocks is on, which allocates a "
+          "num_blocks*4 flag array inside integrate on every map grow; turning "
+          "it off takes the dirty survey with it but removes that allocation "
+          "from this path";
+    }
     return;
   }
   const float integrate_ms = ms_since(t_integrate);
@@ -420,6 +464,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         2ull * std::max<std::uint32_t>(config_.remesh_every, 1u);
     stats_.extract_stale =
         active_blocks_measured_ && stats_.frames_since_extract > fresh_within;
+    // The same pair for the survey, which needs it more: the read-out gates the
+    // dirty rows on `survey_active_blocks > 0` and never lowers that gate, so
+    // without this a survey that has stopped publishing keeps its last sample
+    // on screen indefinitely, presented as this frame's.
+    stats_.frames_since_survey =
+        survey_measured_ ? stats_.frames_fused - survey_at_frame_ : 0;
+    stats_.survey_stale =
+        survey_measured_ && stats_.frames_since_survey > kSurveyStaleAfter;
     // Assigned, not cleared: a frame that fused with dropped blocks says so.
     //
     // This assignment is also what makes `errors` load-bearing. It runs every
@@ -443,6 +495,100 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   if (stats_.frames_fused % config_.remesh_every == 0) {
     remesh(frame);
+  }
+
+  // --- Dirty-block survey ---------------------------------------------------
+  //
+  // Throttled hard: one compaction -- a dispatch, a fence wait and a readback
+  // of the whole active set -- plus an O(active) dilation walk and an
+  // O(num_blocks) host scan of the flag array. Once per kSurveyEveryFrames is
+  // enough to characterise a scan; `survey_ms` is what it actually cost, rather
+  // than this comment's word for it. See FusionStats::survey_active_blocks for
+  // what the number does and does not prove.
+  //
+  // Keyed on frames_fused, matching the remesh gate above and the unit the
+  // window is reported in -- see kSurveyEveryFrames for what keying it off the
+  // capture counter did to `fuse_every`.
+  if (stats_.frames_fused % kSurveyEveryFrames == 0) {
+    const auto t_survey = Clock::now();
+    // Sampled into locals first, published in one short critical section below.
+    // dirty_block_count in particular walks the whole num_blocks flag array on
+    // the host -- 131072 entries at the max_buckets ceiling -- and mutex_ is
+    // the lock the *main* thread takes four times per rendered frame. This file
+    // already declined to malloc under it (see FusionTraceStats); a 131k-entry
+    // scan is not a smaller ask than that one.
+    std::uint32_t active = 0;
+    std::uint32_t changed = 0;
+    std::uint32_t to_remesh = 0;
+    bool sampled = false;
+    std::string survey_error;
+    vr::Result<std::vector<vr::volume::BlockIndex>> all =
+        grid_->map().compact_active_blocks();
+    if (!all) {
+      survey_error = "dirty survey (compact): " + all.status().message();
+    } else {
+      // The caller's already-compacted set is passed in rather than letting the
+      // integrator compact a second time -- a dispatch, a fence wait and a full
+      // readback, on a call that is already O(active blocks).
+      //
+      // `remesh_set`, not `remesh`: the member function of that name is called
+      // earlier in this same function body, and a local shadowing it resolves
+      // to the member only because the declaration has not been reached yet.
+      // Moving this block above that call -- which is what hoisting the survey
+      // over the error early-returns would mean -- turns it into a "called
+      // object type is not a function" error on a line nobody edited.
+      vr::Result<std::vector<vr::Vec3i>> remesh_set =
+          integrator_->dirty_remesh_blocks(*grid_, all.value().data(),
+                                           all.value().size());
+      if (!remesh_set) {
+        survey_error =
+            "dirty survey (remesh set): " + remesh_set.status().message();
+      } else {
+        active = static_cast<std::uint32_t>(all.value().size());
+        to_remesh = static_cast<std::uint32_t>(remesh_set.value().size());
+        changed = integrator_->dirty_block_count();
+        sampled = true;
+      }
+    }
+    const float survey_ms = ms_since(t_survey);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Published either way: what the survey cost is worth knowing most on the
+      // frame where it failed, since a failure still paid for the compaction.
+      stats_.survey_ms = survey_ms;
+      if (sampled) {
+        stats_.survey_active_blocks = active;
+        stats_.survey_changed_blocks = changed;
+        stats_.survey_remesh_blocks = to_remesh;
+        // Measured from the last re-arm, not assumed to be the cadence: see
+        // FusionStats::survey_window_frames.
+        stats_.survey_window_frames = stats_.frames_fused - dirty_window_start_;
+        stats_.survey_first_window = dirty_window_start_ == 0;
+        survey_at_frame_ = stats_.frames_fused;
+        survey_measured_ = true;
+        stats_.frames_since_survey = 0;
+        stats_.survey_stale = false;
+      } else {
+        // Counted and named, like every other stage in this function. These two
+        // calls were the only fallible ones here that reported nothing at all
+        // -- and the read-out's gate on the survey is a one-way latch, so a
+        // survey that fails from here on leaves its last good sample on screen
+        // forever. See FusionStats::frames_since_survey.
+        ++stats_.errors;
+        stats_.last_error = survey_error;
+      }
+    }
+    // Re-armed every window, so each sample is ONE window's changes rather than
+    // everything since the scan began.
+    //
+    // Unconditional, including on the failure path above, because this call is
+    // also the *recovery*: dirty_remesh_blocks refuses outright once blocks
+    // have been removed from the grid -- a slot-keyed flag means nothing across
+    // a remove, the heap being LIFO -- and reset_dirty is what re-arms it.
+    // Skipping it when the sample failed would latch that refusal for the rest
+    // of the scan, which is the one failure mode here that cannot self-heal.
+    integrator_->reset_dirty();
+    dirty_window_start_ = stats_.frames_fused;
   }
 }
 
