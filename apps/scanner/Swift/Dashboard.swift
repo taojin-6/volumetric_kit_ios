@@ -112,7 +112,7 @@ struct DashboardView: View {
   /// Adaptive rather than a fixed column count: the same panel has to work on
   /// a landscape iPad, where six groups fit across, and a portrait phone, where
   /// one does. A hardcoded grid would be right on exactly one of them.
-  private let columns = [GridItem(.adaptive(minimum: 220), spacing: 10)]
+  private let columns = [GridItem(.adaptive(minimum: 290), spacing: 12)]
 
   var body: some View {
     ScrollView {
@@ -153,9 +153,9 @@ struct DashboardView: View {
           .fill(model.scanning ? Color.red : Color.secondary)
           .frame(width: 8, height: 8)
         Text(model.scanning ? "Scanning" : "Paused")
-          .font(.subheadline.weight(.semibold))
+          .font(.title3.weight(.semibold))
         Text(Self.clock(model.elapsed))
-          .font(.subheadline.monospacedDigit())
+          .font(.title3.monospacedDigit())
           .foregroundStyle(.secondary)
       }
 
@@ -163,15 +163,15 @@ struct DashboardView: View {
 
       HStack(alignment: .firstTextBaseline, spacing: 5) {
         Text(Self.millions(model.triangles))
-          .font(.system(size: 26, weight: .bold, design: .rounded))
+          .font(.system(size: 34, weight: .bold, design: .rounded))
           .monospacedDigit()
-        Text("M tris").font(.caption2).foregroundStyle(.secondary)
+        Text("M tris").font(.footnote).foregroundStyle(.secondary)
       }
 
       VStack(alignment: .leading, spacing: 3) {
         Meter(fraction: model.occupancy, threshold: 0.85)
         Text("volume \(Int(model.occupancy * 100))% full")
-          .font(.caption2).foregroundStyle(.secondary)
+          .font(.footnote).foregroundStyle(.secondary)
       }
       .frame(maxWidth: 150)
 
@@ -197,7 +197,7 @@ struct DashboardView: View {
         "Existing surface keeps refining, but new areas will not be added. "
           + "Finish here, or restart with a coarser voxel size."
       )
-      .font(.caption2).foregroundStyle(.secondary)
+      .font(.footnote).foregroundStyle(.secondary)
     }
   }
 
@@ -218,9 +218,9 @@ struct DashboardView: View {
             Text(String(format: "peak %.0f ms", peak)).monospacedDigit()
           }
         }
-        .font(.caption2).foregroundStyle(.secondary)
+        .font(.footnote).foregroundStyle(.secondary)
       } else {
-        Text("collecting…").font(.caption2).foregroundStyle(.secondary)
+        Text("collecting…").font(.footnote).foregroundStyle(.secondary)
       }
     }
   }
@@ -234,7 +234,7 @@ struct DashboardView: View {
         LegendSwatch(color: .secondary, text: "host")
         LegendSwatch(color: .accentColor, text: "device")
       }
-      .font(.caption2).foregroundStyle(.secondary).padding(.top, 2)
+      .font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
     }
   }
 
@@ -256,7 +256,7 @@ struct DashboardView: View {
             .multilineTextAlignment(.trailing)
             .foregroundStyle(Self.color(for: item.tone))
         }
-        .font(.caption2)
+        .font(.footnote)
       }
     }
   }
@@ -265,7 +265,7 @@ struct DashboardView: View {
     VStack(alignment: .leading, spacing: 2) {
       ForEach(text, id: \.self) { line in
         Text(line)
-          .font(.caption2.monospaced())
+          .font(.footnote.monospaced())
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -301,10 +301,10 @@ private struct StageRowView: View {
   var body: some View {
     HStack(spacing: 7) {
       Text(stage.trimmed)
-        .font(.caption2.monospaced())
+        .font(.footnote.monospaced())
         .foregroundStyle(stage.isBreakdown ? .secondary : .primary)
         .padding(.leading, stage.isBreakdown ? 9 : 0)
-        .frame(width: 74, alignment: .leading)
+        .frame(width: 92, alignment: .leading)
 
       GeometryReader { geo in
         ZStack(alignment: .leading) {
@@ -323,9 +323,9 @@ private struct StageRowView: View {
       .frame(height: 7)
 
       Text(String(format: "%.1f", stage.hostMs))
-        .font(.caption2.monospacedDigit())
+        .font(.footnote.monospacedDigit())
         .foregroundStyle(.secondary)
-        .frame(width: 34, alignment: .trailing)
+        .frame(width: 44, alignment: .trailing)
     }
   }
 }
@@ -340,7 +340,7 @@ private struct FrameChart: View {
     }
     .chartYAxis { AxisMarks(position: .leading) }
     .chartXAxis(.hidden)
-    .frame(height: 70)
+    .frame(height: 92)
   }
 }
 
@@ -357,7 +357,7 @@ private struct Chip: View {
 
   var body: some View {
     Text(text)
-      .font(.caption2)
+      .font(.footnote)
       .padding(.horizontal, 6)
       .padding(.vertical, 2)
       .background(bg, in: RoundedRectangle(cornerRadius: 5))
@@ -452,7 +452,7 @@ private struct Card<Content: View>: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       Text(title.uppercased())
-        .font(.system(size: 9.5, weight: .semibold))
+        .font(.system(size: 11.5, weight: .semibold))
         .tracking(0.8)
         .foregroundStyle(.tertiary)
       content

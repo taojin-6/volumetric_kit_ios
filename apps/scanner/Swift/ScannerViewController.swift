@@ -25,6 +25,10 @@ final class ScannerViewController: UIViewController {
   /// rather than a fused-frame count: it is how long the person has been
   /// scanning, which is not the same as how much fusion got done.
   private let sessionStartedAt = CFAbsoluteTimeGetCurrent()
+  /// How much of the safe area the dashboard occupies. The rest is the
+  /// reconstruction, which is still the thing being judged -- a panel that
+  /// covered it would make the numbers unfalsifiable by eye.
+  private let dashboardHeightFraction: CGFloat = 0.55
   private var cameraGestures: CameraGestureController?
 
   /// Whether the capture + fuse + draw loop is running, so a resume cannot
@@ -121,17 +125,24 @@ final class ScannerViewController: UIViewController {
     view.addSubview(host.view)
     host.didMove(toParent: self)
     dashboardHost = host
+    // A DEFINITE size, which the first cut did not give it.
+    //
+    // A ScrollView has no intrinsic content height, so pinning top/leading and
+    // leaving trailing and bottom as `lessThanOrEqualTo` left the host with
+    // nothing forcing a size -- it collapsed toward its minimum and the grid
+    // packed into a single narrow column. Width is pinned on both sides and
+    // height is a fraction of the safe area, so the dashboard is as wide as the
+    // screen allows and the reconstruction keeps the rest.
     NSLayoutConstraint.activate([
       host.view.topAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
       host.view.leadingAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 10),
       host.view.trailingAnchor.constraint(
-        lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor,
-        constant: -10),
-      host.view.bottomAnchor.constraint(
-        lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor,
-        constant: -10),
+        equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
+      host.view.heightAnchor.constraint(
+        equalTo: view.safeAreaLayoutGuide.heightAnchor,
+        multiplier: dashboardHeightFraction),
     ])
   }
 
