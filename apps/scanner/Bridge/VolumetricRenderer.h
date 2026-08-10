@@ -92,29 +92,44 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 /// needs the numbers. Same rows, same source -- the summary is built from
 /// these.
 ///
-/// @note `gpuMs` is meaningful only where `hasGpu` is set. That flag IS the
-///       capability report: it is false both for a stage recon timed on the
-///       host alone and for every stage on a queue family reporting no
-///       timestamps, and a reader must not distinguish those by inspecting
-///       `gpuMs` for a zero.
+/// @note `gpuMs` is meaningful only where `hasGpu` is set, and a reader must
+///       never distinguish the cases by inspecting `gpuMs` for a zero. But read
+///       that flag as **"a device span was measured for this row"**, which is
+///       the only thing it can mean, and *not* as a capability report. It is
+///       false for all three of: a stage that is genuinely host-only; a call
+///       that returned before dispatching anything (an empty active set, a
+///       refused argument), whose host row is still charged deliberately; and
+///       every stage on a queue family reporting no timestamps. Rendering "this
+///       device does not support GPU timestamps" off a false here is a hardware
+///       verdict drawn from a correct measurement of a stage that merely
+///       early-returned. Nothing on this object can tell the three apart --
+///       recon's own rule is that a caller who must know asks the device.
 @interface VolumetricStageRow : NSObject
 /// Stage label; a breakdown of the row above it is prefixed with spaces.
+///
+/// @warning A breakdown's `cpuMs` is **contained in** the `cpuMs` of the row
+///          above it, while its `gpuMs` is not contained in that row's `gpuMs`
+///          -- the two halves nest differently, because a host scope spans a
+///          whole call and a device span covers one dispatch. So summing this
+///          column over every row double-counts the host half, and the
+///          host-minus-device gap of a row that *has* a breakdown is not idle
+///          time. See @ref cpuMs.
 @property(nonatomic, readonly, copy) NSString* name;
 /// Wall clock around the stage. For a recon compute stage this covers host
 /// record, submit, the fence stall AND device execution -- an end-to-end cost,
 /// not a host-only one.
+///
+/// It follows that `cpuMs - gpuMs` is *not* a measure of host overhead wherever
+/// the row has a breakdown beneath it: that child's kernel ran inside this
+/// host span and reports its device time on its own row, so the difference
+/// counts it as stall. See @ref name.
 @property(nonatomic, readonly) double cpuMs;
 /// Device time from a timestamp span around the dispatch alone.
 @property(nonatomic, readonly) double gpuMs;
-/// Whether @ref gpuMs holds a real measurement.
+/// Whether @ref gpuMs holds a real measurement -- see the note on this class,
+/// which is not the same claim as "this device can time the GPU".
 @property(nonatomic, readonly) BOOL hasGpu;
 @end
-
-/// @brief The last fused frame's stages, newest first call wins.
-///
-/// Allocated per read, which is affordable because the read-out polls at a few
-/// hertz -- it would not be at frame rate, and a caller sampling faster should
-/// take @ref fusionSummary or add a POD accessor rather than churn this.
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
@@ -273,9 +288,20 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// property is *rendered text*, so Swift can print it and nothing else. Same
 /// rows, same source -- the summary is built from these.
 ///
+/// Empty when nothing has fused yet, and empty for the whole run when
+/// `FusionConfig::measure_stages` is off. It is **not** emptied by a frame that
+/// failed: these are the last rows measured, however long ago that was, which
+/// is why the summary carries an age beside them.
+///
 /// Allocated per read, which is affordable because the read-out polls at a few
 /// hertz. It would not be at frame rate; a caller sampling faster wants a POD
 /// accessor rather than churning this.
+///
+/// @note This and @ref fusionSummary each take their own snapshot, so reading
+///       both gives two instants of a struct the fuse thread is writing. They
+///       agree in practice at a few hertz against a 60 Hz producer, but a
+///       consumer that needs them to agree *exactly* should render the text
+///       from these rows rather than read both.
 @property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stageRows;
 
 /// @brief Record that the OS asked the app to free memory.

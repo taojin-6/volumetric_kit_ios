@@ -47,6 +47,29 @@ constexpr int kMaxGrowAttempts = 2;
 /// pathological regime.
 constexpr std::int32_t kBlocksPerBucket = 8;
 
+/// The stage labels this file seeds, restated from the tiers that report them.
+///
+/// Restated rather than pointed at because recon has no constants to point at:
+/// each tier passes its own literal, and `StageMetrics` matches rows by string
+/// **content** precisely so a label named from two places still lands in one
+/// row. That is what lets this file seed a row whose timing happens inside the
+/// library -- and it is also the coupling: a label that drifts upstream splits
+/// into two rows rather than failing to compile. Cheap to notice, since the
+/// seeded row then reads 0.00 forever beside a duplicate that does not.
+///
+/// @ref kResizeStage is the exception -- it is this file's own row, for the
+/// grow between allocate retries that `allocate_from_depth`'s own row does not
+/// cover (`voxel_hash_map.hpp` says as much where it documents that row).
+constexpr const char* kAllocateStage = "allocate";
+constexpr const char* kResizeStage = "resize";
+constexpr const char* kIntegrateStage = "integrate";
+constexpr const char* kTextureStage = "texture";
+/// The active-set compaction inside `integrate`, which recon names as a
+/// breakdown of the row above it -- `StageMetrics::kBreakdownPrefix` plus the
+/// stage's own name. Seeded in that position so the sub-row sits directly under
+/// the row it decomposes.
+constexpr const char* kActiveSetStage = "  ..active set";
+
 /// The resident bytes `VoxelBlockGrid` holds for a table of `buckets` buckets.
 ///
 /// `num_buckets * kBlocksPerBucket` blocks, 512 voxels each, and 12 B of
@@ -122,6 +145,11 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     stats_.mesh_slots = config.mesh_slots;
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
+  // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
+  // one-way latch, so a scan that carried it in would report the *next* scan's
+  // ordinary host-only first frames as a retired timer.
+  last_stages_ns_.store(0, std::memory_order_relaxed);
+  gpu_timing_seen_ = false;
   active_blocks_at_frame_ = 0;
   active_blocks_measured_ = false;
   preemptive_grow_failed_at_ = 0;
@@ -237,17 +265,54 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     return;
   }
 
+  // One reporting window per fused frame. The tiers open their own host scopes
+  // and publish their device spans into it, so each row carries a GPU half no
+  // wall-clock span around a fence-blocked submit can show.
+  //
+  // Every call below passes `metrics`, never `&stages`: null is what makes
+  // FusionConfig::measure_stages an actual switch, because recon measures
+  // nothing *and takes its untimed submit path* on a null. Passing the address
+  // unconditionally would leave a per-dispatch query-pool round trip armed at
+  // capture rate with no way to turn it off short of a rebuild.
+  vr::StageMetrics stages;
+  vr::StageMetrics* metrics = config_.measure_stages ? &stages : nullptr;
+  if (metrics != nullptr) {
+    // Seeded so the table keeps its shape frame to frame. A row that appears
+    // only when its stage ran makes every row below it jump, which is what
+    // makes a live read-out unreadable -- and worse in a chart indexed by
+    // position, where the series silently relabel instead. The two that need it
+    // most are the ones a frame routinely skips: `allocate` is short-circuited
+    // whole by the occupancy guard below, so recon never reaches its own seed,
+    // and `resize` runs a handful of times in a scan's life.
+    //
+    // Seeded in report order, which is why the breakdown is named here rather
+    // than left to arrive on its own: rows are kept in first-seen order, so
+    // seeding `texture` before the integrate ran would put the active-set
+    // sub-row *below* texture instead of beneath the row it decomposes.
+    //
+    // This is also what keeps a row from ever being appended inside a
+    // destructor. StageScope and GpuStageScope add their rows from `~T()`,
+    // which is implicitly noexcept, so a vector growth that threw there would
+    // be std::terminate rather than an unwind -- and past the fuse thread's
+    // exception guard, which exists because a throw out of a thread function
+    // takes the app with no message and no crash context. Every row a frame can
+    // produce exists before the first scope opens, so those destructors find
+    // rows rather than push_back onto them; the vector's own geometric growth
+    // (eight slots for these five) leaves headroom besides.
+    stages.seed(kAllocateStage);
+    stages.seed(kResizeStage);
+    stages.seed(kIntegrateStage);
+    stages.seed(kActiveSetStage);
+    if (config_.texture) {
+      stages.seed(kTextureStage);
+    }
+  }
+
   // Anything this frame got wrong, carried to the single publish below rather
   // than written straight into stats_. The success path used to clear
   // last_error unconditionally, which meant a frame fused with missing blocks
   // left no trace anywhere -- the read-out showed a rising vertex count and an
   // empty error line while a whole region of the scan quietly never filled.
-  // One reporting window per fused frame. The tiers open their own host scopes
-  // and publish their device spans into it, so the hand-rolled Clock::now()
-  // spans this function used to keep are gone -- and each row now carries the
-  // GPU half those never could.
-  vr::StageMetrics stages;
-
   std::string frame_error;
   // Whether that error is a *stage failure* rather than a report of an expected
   // outcome. Only the former reaches `stats_.errors` -- see that field: dropped
@@ -360,7 +425,19 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
                     "(existing surface still fusing)";
       frame_stage_failed = true;
       preemptive_grow_failed_at_ = config_.num_buckets;
-    } else if (const vr::Status grown = grid_->resize(grown_to)) {
+    } else if (const vr::Status grown = [&] {
+                 // Its own row, because nothing else covers it. recon's
+                 // `allocate` row spans `allocate_from_depth`'s own dispatches
+                 // and voxel_hash_map.hpp says so where it documents that row,
+                 // directing a caller to give a resize between retries a row of
+                 // its own. This is the *other* doubling -- the preemptive one
+                 // -- and it is the more expensive half: a grow toward the
+                 // 32768-bucket ceiling commits ~1.5 GiB with ~2.3 GiB
+                 // transient, hundreds of milliseconds that would otherwise
+                 // appear in no row the read-out prints.
+                 vr::StageScope span(metrics, kResizeStage);
+                 return grid_->resize(grown_to);
+               }()) {
       config_.num_buckets = grown_to;
       preemptive_grow_failed_at_ = 0;
       // Re-read, because the guard below acts on this number and the doubling
@@ -431,7 +508,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       table_exhausted
           ? vr::Result<std::uint32_t>(0u)
           : grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
-                                             &failures, &stages);
+                                             &failures, metrics);
   // Whether this frame took no new geometry in, by either route. The guard
   // above is one of them; the reactive loop below hitting the ceiling, or
   // running out of per-frame grow budget with blocks still dropped, is the
@@ -523,7 +600,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     }
     const std::int32_t grown_to =
         std::min(config_.num_buckets * 2, config_.max_buckets);
-    const vr::Status grown = grid_->resize(grown_to);
+    // Accumulates into the same `resize` row as the preemptive doubling above,
+    // which is the honest total: both are the same operation at the same cost,
+    // and a frame that reaches this loop has usually skipped that one.
+    const vr::Status grown = [&] {
+      vr::StageScope span(metrics, kResizeStage);
+      return grid_->resize(grown_to);
+    }();
     if (!grown) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -539,7 +622,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // Accumulates into the same "allocate" row: a frame that resizes and
     // re-allocates reports what it actually cost, not just the last attempt.
     overflow = grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
-                                                &failures, &stages);
+                                                &failures, metrics);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -612,7 +695,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   const vr::Status fused = integrator_->integrate(
       *grid_, frame.depth, frame.depth_camera, /*max_weight=*/5.0f,
       vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr,
-      &stages);
+      metrics);
   if (!fused) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -650,14 +733,6 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.table_blocks =
         static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
     stats_.allocation_stop = allocation_stop;
-    // Copied whole rather than picked apart: every field recon adds to a row
-    // arrives without a lockstep edit here, and the read-out below reads the
-    // same rows the bridge publishes -- one source, not two that can disagree.
-    stats_.stage_count = 0;
-    for (const vr::StageRow& row : stages.rows()) {
-      if (stats_.stage_count >= FusionStats::kMaxStages) break;
-      stats_.stages[stats_.stage_count++] = row;
-    }
     // How far behind this frame the published extract breakdown now is.
     // Everything in `stats_.extract` -- the phases, the block count, the arena,
     // `dispatches` -- is written only by a fully-successful remesh, so without
@@ -708,7 +783,57 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   }
 
   if (stats_.frames_fused % config_.remesh_every == 0) {
-    remesh(frame);
+    remesh(frame, metrics);
+  }
+
+  // --- Publish the stage rows -----------------------------------------------
+  //
+  // After the remesh, not with the block above, and that order is the only one
+  // that can carry a `texture` row at all: `stages` is this function's local,
+  // remesh writes into it, and copying it out beforehand published a window
+  // whose texture row was still the zero this function seeded.
+  //
+  // Its own critical section rather than widening that one, because widening it
+  // would hold the lock the main thread takes four times per rendered frame
+  // across the extract -- 132.7 ms on this device's own measurement.
+  //
+  // Only when measurement is on. `stage_count` then stays at its zero, which is
+  // what the read-out branches on to fall back to `allocate_ms` /
+  // `integrate_ms`
+  // -- so an off switch costs the device column and no timing at all.
+  if (metrics != nullptr) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Copied whole rather than picked apart: every field recon adds to a row
+    // arrives without a lockstep edit here, and the read-out reads the same
+    // rows the bridge publishes -- one source, not two that can disagree.
+    stats_.stage_count = 0;
+    stats_.stages_truncated = false;
+    bool any_gpu = false;
+    for (const vr::StageRow& row : stages.rows()) {
+      if (stats_.stage_count >= FusionStats::kMaxStages) {
+        // Recorded rather than dropped in silence: a full array reads exactly
+        // like a frame that happened to have this many rows, so a consumer
+        // summing the column would under-report with nothing to notice it by.
+        stats_.stages_truncated = true;
+        break;
+      }
+      any_gpu = any_gpu || row.has_gpu;
+      stats_.stages[stats_.stage_count++] = row;
+    }
+    // A device half that was there and is not any more is a *retired* timer,
+    // not a device that never had timestamps -- and only this latch can tell
+    // those apart, because the aftermath looks identical in every row. See
+    // FusionConfig::measure_stages for what retires one and why it is
+    // permanent.
+    gpu_timing_seen_ = gpu_timing_seen_ || any_gpu;
+    stats_.gpu_timing_retired = gpu_timing_seen_ && !any_gpu;
+    // Stamped here and only here. The rows publish on this path alone, so this
+    // is what the four early returns above leave standing still -- see
+    // FusionStats::ms_since_stages for why a frame count cannot say it.
+    last_stages_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              Clock::now().time_since_epoch())
+                              .count(),
+                          std::memory_order_relaxed);
   }
 
   // --- Dirty-block survey ---------------------------------------------------
@@ -814,7 +939,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   }
 }
 
-void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
+void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
+                    vr::StageMetrics* metrics) {
   // --- Hand the consumer's release to recon, on this thread -----------------
   //
   // `MarchingCubes::release_through` is not atomic, and its header makes
@@ -888,8 +1014,13 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame) {
   float texture_ms = 0.0f;
   if (config_.texture) {
     const auto t_texture = Clock::now();
-    const vr::Status textured = texturer_->texture(
-        device_mesh.value(), frame.depth, frame.depth_camera);
+    // The window reaches this tier too. `fuse` seeds the row when this flag is
+    // on, so the table keeps its shape across the frames between remeshes --
+    // and across a remesh that returns early above, which is the ordinary
+    // steady state rather than a fault.
+    const vr::Status textured =
+        texturer_->texture(device_mesh.value(), frame.depth, frame.depth_camera,
+                           /*occlusion_threshold=*/0.02f, metrics);
     if (!textured) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -992,13 +1123,26 @@ FusionStats Fusion::stats() const {
   // question is how long ago that thread last ran -- which it cannot answer
   // about a frame it has not had. A zero stamp means no frame ever fused, where
   // "0 ms ago" would read as a scan that is running.
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
   const std::int64_t stamped = last_fuse_ns_.load(std::memory_order_relaxed);
-  out.ms_since_fuse =
-      stamped == 0 ? 0.0f
-                   : std::chrono::duration<float, std::milli>(
-                         std::chrono::steady_clock::now().time_since_epoch() -
-                         std::chrono::nanoseconds(stamped))
-                         .count();
+  out.ms_since_fuse = stamped == 0
+                          ? 0.0f
+                          : std::chrono::duration<float, std::milli>(
+                                now - std::chrono::nanoseconds(stamped))
+                                .count();
+  // The same computation for the stage rows, against the same `now` so the two
+  // are comparable -- their *difference* is the reading that matters: this one
+  // stamps only a frame that fused all the way through, so a gap between them
+  // is a loop that is running while nothing completes. Read from one clock
+  // sample rather than two so a slow snapshot cannot make that gap out of
+  // nothing.
+  const std::int64_t stages_stamped =
+      last_stages_ns_.load(std::memory_order_relaxed);
+  out.ms_since_stages =
+      stages_stamped == 0 ? 0.0f
+                          : std::chrono::duration<float, std::milli>(
+                                now - std::chrono::nanoseconds(stages_stamped))
+                                .count();
   return out;
 }
 
