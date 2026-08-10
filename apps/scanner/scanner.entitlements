@@ -7,8 +7,21 @@
   805 MB voxel grid, and the OS sent SIGKILL -- no OutOfMemory to report, the
   process simply disappears.
 
-  increased-memory-limit raises that jetsam ceiling on devices that have the RAM
-  (this iPad Pro reports 10922 MB).
+  increased-memory-limit raises that jetsam ceiling. Measured on this iPad Pro
+  (M5, 11-inch) through Bridge/MemoryBudget rather than assumed: the entitled
+  ceiling is 16384 MB against 15469 MB of installed RAM (hw.memsize) -- i.e.
+  *above* what the device physically has. So on this hardware the entitlement
+  does not merely relax jetsam, it removes it as the binding constraint; RAM
+  itself is what runs out first.
+
+  10922 MB, which this comment previously recorded as that ceiling, is a
+  different quantity and was never a process memory limit. It is MoltenVK's
+  "GPU memory available" banner -- Metal's recommended max working set, two
+  thirds of 16 GiB -- and it is the figure GPU allocations want sizing against,
+  since the voxel grid and the mesh arenas are Metal buffers. It is also now the
+  *lowest* of the three numbers in play. Keep them apart: the read-out prints
+  the footprint and the ceiling every 2 s, and MoltenVK prints the working set
+  once at startup.
 
   extended-virtual-addressing would normally sit beside it -- the arena ring can
   exceed the 4 GB a 32-bit address space covers -- but it is deliberately absent:

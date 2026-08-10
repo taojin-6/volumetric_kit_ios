@@ -24,11 +24,13 @@ set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 add_library(
   scanner_bridge STATIC
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  Bridge/Fusion.mm Bridge/OrbitCamera.cpp)
+  Bridge/Fusion.mm Bridge/OrbitCamera.cpp Bridge/MemoryBudget.cpp)
 
-# ARC is an Objective-C feature, so OrbitCamera.cpp is deliberately absent from
-# this list: it is plain C++ with no object pointers to manage, and clang warns
-# on -fobjc-arc for a translation unit that is not Objective-C.
+# ARC is an Objective-C feature, so OrbitCamera.cpp and MemoryBudget.cpp are
+# deliberately absent from this list: both are plain C++ with no object pointers
+# to manage, and clang warns on -fobjc-arc for a translation unit that is not
+# Objective-C. MemoryBudget reaches the OS through <os/proc.h> and Mach, which
+# are C.
 set_source_files_properties(
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
   Bridge/Fusion.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

@@ -8,6 +8,7 @@
 #import "VolumetricRenderer.h"
 
 #import "Fusion.hpp"
+#import "MemoryBudget.hpp"
 #import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
 
@@ -1287,6 +1288,43 @@ struct RendererImpl {
     dirty_rows = cell;
   }
 
+  // What the OS will actually allow, asked of the OS.
+  //
+  // This is the number every sizing knob in FusionConfig is really chosen
+  // against -- voxel_size, max_buckets, mesh_slots -- and until now it appeared
+  // nowhere the app could see: only as a figure in scanner.entitlements that
+  // nothing measured. Its absence is why the run that motivated
+  // increased-memory-limit could only be diagnosed after the fact, from a
+  // process that had already vanished.
+  //
+  // The limit and the device's RAM are both shown because they are different
+  // quantities and the interesting thing is their ratio: the ceiling is a
+  // per-process fraction of installed memory, so a limit that has not moved off
+  // the unentitled fraction is the one visible sign that
+  // increased-memory-limit was dropped at signing -- which is otherwise silent
+  // until jetsam.
+  //
+  // Built as a finished row rather than four more varargs, for the reason the
+  // phase cells above are: this would add four same-typed floating-point
+  // conversions to a format already carrying ~19, and a positional shift among
+  // those is the one mistake -Wformat cannot see.
+  const app::MemoryBudget budget = app::query_memory_budget();
+  std::string memory_row = "unavailable";
+  if (budget.valid) {
+    const double mb = 1024.0 * 1024.0;
+    char cell[128];
+    std::snprintf(cell, sizeof(cell),
+                  "%.0f / %.0f MB (%.1f%% of limit), device %.0f MB",
+                  static_cast<double>(budget.footprint_bytes) / mb,
+                  static_cast<double>(budget.limit_bytes) / mb,
+                  budget.limit_bytes > 0
+                      ? 100.0 * static_cast<double>(budget.footprint_bytes) /
+                            static_cast<double>(budget.limit_bytes)
+                      : 0.0,
+                  static_cast<double>(budget.device_ram_bytes) / mb);
+    memory_row = cell;
+  }
+
   // Sized for two full library messages plus the fixed body: the error and the
   // upload lines can both be present and both carry a `Status::message()`.
   //
@@ -1327,6 +1365,11 @@ struct RendererImpl {
       "  arena     %u tris planned for this slot (%.2f%% full)\n"
       "            %.1f MB across %u slots / %u blocks\n"
       "  table     %u / %u blocks (%.1f%% occupied)%s\n"
+      // Below the capacity rows rather than among the timings: this is the
+      // outermost "how full is something", and the only one whose ceiling is
+      // set outside the app. After `dirty` so the table row keeps the survey
+      // beside it -- that adjacency is deliberate; see dirty_rows above.
+      "  memory    %s\n"
       "  texture   %.1f ms",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
@@ -1344,7 +1387,7 @@ struct RendererImpl {
           ? 100.0 * static_cast<double>(s.extract.active_blocks) /
                 static_cast<double>(s.table_capacity)
           : 0.0,
-      dirty_rows.c_str(), s.texture_ms);
+      dirty_rows.c_str(), memory_row.c_str(), s.texture_ms);
   // Mirror the read-out to os_log, throttled.
   //
   // os_log and nothing else. stderr would be a third copy of a string that
