@@ -131,6 +131,66 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 @property(nonatomic, readonly) BOOL hasGpu;
 @end
 
+/// @brief Why a fused frame took no new geometry in, when it took none.
+///
+/// Mirrors `app::AllocationStop`. A cause rather than a bool because the advice
+/// a reader acts on differs per cause and one of them is actively wrong for the
+/// others: @ref VolumetricAllocationStopOccupancyUnknown is *not* a full
+/// volume, and telling someone to coarsen their voxels there sends them after a
+/// limit they have not reached.
+typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
+  /// The frame allocated normally.
+  VolumetricAllocationStopNone = 0,
+  /// Past the refuse-to-allocate guard -- the documented trade working, and the
+  /// one cause a user can act on.
+  VolumetricAllocationStopVolumeFull,
+  /// Occupancy could not be read, so the guard refused on a fabricated figure.
+  /// The fault is upstream and named in the summary's error line.
+  VolumetricAllocationStopOccupancyUnknown,
+  /// The allocate hit a capacity limit and blocks were dropped. Can fire with
+  /// occupancy far below the guard, through bucket-local chain exhaustion.
+  VolumetricAllocationStopBlocksDropped,
+};
+
+/// @brief One fused frame, for charting what a snapshot cannot show.
+///
+/// @ref VolumetricRenderer.stageRows is the *current* frame; this is the
+/// history behind it. The distinction matters because fusion runs on its own
+/// thread: polling the snapshot faster does not reveal the frames in between,
+/// so a spike is only visible if it was sampled where it happened.
+///
+/// Totals rather than per-stage rows -- see `FrameSample` for why -- so a chart
+/// answers "which frame was slow, and was it host or device", and the current
+/// breakdown answers "which stage".
+@interface VolumetricFrameSample : NSObject
+/// Fused-frame index, so gaps are visible rather than smoothed over.
+@property(nonatomic, readonly) uint64_t frame;
+/// Summed host milliseconds, breakdown rows excluded.
+@property(nonatomic, readonly) double hostMs;
+/// Summed device milliseconds, breakdown rows included.
+@property(nonatomic, readonly) double deviceMs;
+/// Block-table occupancy in `[0, 1]` at this frame.
+///
+/// Plot this only where @ref occupancyKnown is set: an unreadable figure is
+/// published as a fabricated `1.0`, so a series drawn from this column alone
+/// climbs to 100% at the moment the reader most needs it not to lie.
+@property(nonatomic, readonly) double occupancy;
+/// Whether @ref occupancy was read or fabricated.
+@property(nonatomic, readonly) BOOL occupancyKnown;
+/// Both stamped by the last *successful* remesh rather than by this frame, so
+/// they repeat between remeshes -- a staircase, not a per-frame series.
+@property(nonatomic, readonly) uint32_t triangles;
+@property(nonatomic, readonly) uint32_t activeBlocks;
+/// Whether the scan took new geometry in on this frame, and if not, why.
+@property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
+/// Whether @ref allocationStop is anything but `None`.
+///
+/// The bare "did it stop" for a caller that only draws a marker. Anything that
+/// *names* the stop must read @ref allocationStop instead -- calling every stop
+/// a full volume is the misreport that field exists to prevent.
+@property(nonatomic, readonly) BOOL allocationStopped;
+@end
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -303,6 +363,18 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///       consumer that needs them to agree *exactly* should render the text
 ///       from these rows rather than read both.
 @property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stageRows;
+
+/// @brief The fused-frame history, **oldest first** -- chart order.
+///
+/// Sampled per fused frame on the fusion thread, so it carries the frames a
+/// poll of @ref stageRows steps over. Bounded; the oldest fall off.
+///
+/// Allocated per read like @ref stageRows, and for the same reason it is
+/// affordable: the display refreshes a few times a second, not per frame. The
+/// *sampling* rate and the *display* rate are deliberately different, and this
+/// property is the seam between them.
+@property(nonatomic, readonly, copy)
+    NSArray<VolumetricFrameSample*>* frameHistory;
 
 /// @brief Record that the OS asked the app to free memory.
 ///

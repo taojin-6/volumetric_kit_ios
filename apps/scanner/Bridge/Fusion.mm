@@ -836,6 +836,46 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
                           std::memory_order_relaxed);
   }
 
+  // --- Sample this frame into the history -----------------------------------
+  //
+  // Below the remesh for the same reason the publish above is, and it is the
+  // whole point of the sample: `stages` is this function's local and remesh
+  // writes into it, so sampling beside `frames_fused` would total a window the
+  // meshing had not been added to yet -- the spike this ring exists to catch,
+  // taken just before the thing that causes it.
+  //
+  // Unconditional, unlike that publish: one entry per fused frame is what makes
+  // `frame` an index a gap is visible in. With measurement off the two totals
+  // are the zero `stages` still holds, which reads the same way `stage_count`
+  // does -- no timing rather than a fast frame.
+  //
+  // Its own critical section, not a widening of either neighbour: see the note
+  // above on holding this lock across an extract.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    FrameSample& sample = history_[history_next_ % kHistoryCapacity];
+    ++history_next_;
+    sample = FrameSample{};
+    sample.frame = stats_.frames_fused;
+    // Breakdown rows excluded from the host total (they restate their parent's
+    // time) and INCLUDED in the device total (a device span covers one
+    // dispatch, never the compaction the stage ran first) -- StageMetrics'
+    // totals already draw that distinction, so take it from them rather than
+    // re-deriving it here and getting it differently.
+    //
+    // Both cover allocate, resize, integrate and texture. They do *not* cover
+    // the extract, which reports through `ExtractTimings` and not the row set
+    // -- so the largest cost in a remesh frame is absent from these two
+    // figures. `FusionStats::extract_ms` is where it is.
+    sample.host_ms = static_cast<float>(stages.total_cpu_ms());
+    sample.device_ms = static_cast<float>(stages.total_gpu_ms());
+    sample.occupancy = occupancy;
+    sample.occupancy_known = occupancy_known;
+    sample.allocation_stop = allocation_stop;
+    sample.triangles = stats_.triangles;
+    sample.active_blocks = stats_.extract.active_blocks;
+  }
+
   // --- Dirty-block survey ---------------------------------------------------
   //
   // Throttled hard: one compaction -- a dispatch, a fence wait and a readback
@@ -1165,6 +1205,24 @@ FusionTraceStats Fusion::trace_stats() const {
   out.occupancy = stats_.occupancy;
   out.allocation_stop = stats_.allocation_stop;
   return out;
+}
+
+std::size_t Fusion::history(FrameSample* out, std::size_t capacity) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::size_t written = static_cast<std::size_t>(
+      std::min<std::uint64_t>(history_next_, kHistoryCapacity));
+  if (out == nullptr || capacity == 0) {
+    return written;
+  }
+  // A short buffer takes the NEWEST samples: a history is read from the present
+  // backwards, and handing back the oldest would show a chart that stops
+  // before the moment someone opened it to look at.
+  const std::size_t take = std::min(written, capacity);
+  const std::uint64_t first = history_next_ - take;
+  for (std::size_t i = 0; i < take; ++i) {
+    out[i] = history_[(first + i) % kHistoryCapacity];
+  }
+  return take;
 }
 
 }  // namespace volumetric_kit::ios_app

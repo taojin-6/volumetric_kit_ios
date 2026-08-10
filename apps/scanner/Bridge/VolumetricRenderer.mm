@@ -283,6 +283,27 @@ const char* allocation_stop_tag(app::AllocationStop stop) {
   return "ok";
 }
 
+/// The same cause, as the Swift-facing enum.
+///
+/// Switched rather than cast, though the two enumerations are declared in the
+/// same order: a cast makes that order load-bearing across two files that no
+/// build step compares, and the failure is a sample reporting the
+/// *neighbouring* cause -- a wrong answer that looks exactly like a right one.
+/// This way a value added on one side stops the compile.
+VolumetricAllocationStop allocation_stop_value(app::AllocationStop stop) {
+  switch (stop) {
+    case app::AllocationStop::None:
+      return VolumetricAllocationStopNone;
+    case app::AllocationStop::VolumeFull:
+      return VolumetricAllocationStopVolumeFull;
+    case app::AllocationStop::OccupancyUnknown:
+      return VolumetricAllocationStopOccupancyUnknown;
+    case app::AllocationStop::BlocksDropped:
+      return VolumetricAllocationStopBlocksDropped;
+  }
+  return VolumetricAllocationStopNone;
+}
+
 // --- Frame trace -------------------------------------------------------------
 // A device loss is reported by the *next* vkWaitForFences, so by the time the
 // error surfaces the frame that faulted is already gone and nothing on the
@@ -546,6 +567,30 @@ struct RendererImpl {
 // @implementation -- Objective-C has no nested implementations.
 @interface VolumetricStageRow ()
 - (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row;
+@end
+
+@interface VolumetricFrameSample ()
+- (instancetype)initWithSample:(const app::FrameSample&)sample;
+@end
+
+@implementation VolumetricFrameSample
+- (instancetype)initWithSample:(const app::FrameSample&)sample {
+  if ((self = [super init])) {
+    _frame = sample.frame;
+    _hostMs = sample.host_ms;
+    _deviceMs = sample.device_ms;
+    _occupancy = sample.occupancy;
+    _occupancyKnown = sample.occupancy_known ? YES : NO;
+    _triangles = sample.triangles;
+    _activeBlocks = sample.active_blocks;
+    _allocationStop = allocation_stop_value(sample.allocation_stop);
+    // Derived rather than carried, so the two cannot disagree about the same
+    // frame the way two independently-assigned fields eventually do.
+    _allocationStopped =
+        sample.allocation_stop != app::AllocationStop::None ? YES : NO;
+  }
+  return self;
+}
 @end
 
 @implementation VolumetricStageRow
@@ -1291,6 +1336,21 @@ struct RendererImpl {
 
 - (float)cameraDistance {
   return _impl->camera.distance();
+}
+
+- (NSArray<VolumetricFrameSample*>*)frameHistory {
+  // Sized from the fusion's own bound rather than a number repeated here: a
+  // local constant that drifted below it would silently truncate the history
+  // and look like a shorter scan.
+  std::vector<app::FrameSample> samples(app::Fusion::kHistoryCapacity);
+  const std::size_t count =
+      _impl->fusion.history(samples.data(), samples.size());
+  NSMutableArray<VolumetricFrameSample*>* out =
+      [NSMutableArray arrayWithCapacity:count];
+  for (std::size_t i = 0; i < count; ++i) {
+    [out addObject:[[VolumetricFrameSample alloc] initWithSample:samples[i]]];
+  }
+  return out;
 }
 
 - (NSArray<VolumetricStageRow*>*)stageRows {

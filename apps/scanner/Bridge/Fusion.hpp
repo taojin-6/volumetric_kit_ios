@@ -261,6 +261,58 @@ enum class AllocationStop : std::uint8_t {
   BlocksDropped,
 };
 
+/// @brief One fused frame, kept so a chart can show what a snapshot cannot.
+///
+/// The read-out publishes the *latest* values and the UI polls them a few times
+/// a second, which is enough for a trend and structurally unable to show a
+/// spike: fusion runs on its own thread, so a poll at any rate samples whatever
+/// was last published and never the frame in between. A 154 ms meshing frame
+/// among 20 ms neighbours is invisible to it, and that is exactly the frame
+/// worth seeing.
+///
+/// So the sample is taken where the frame is produced, not where the UI asks.
+///
+/// Deliberately **totals, not per-stage rows**. A stacked-by-stage history
+/// would need the row set carried per entry, and the question a history answers
+/// -- "which frame was slow, and was it host or device" -- is answered by two
+/// numbers. The current frame's per-stage split is already published separately
+/// (@ref FusionStats::stages); a reader wanting both looks at the spike here
+/// and the breakdown there. Grow this when a question needs it to, not before.
+struct FrameSample {
+  /// `FusionStats::frames_fused` as of this sample.
+  std::uint64_t frame = 0;
+  /// Summed host milliseconds across the frame's stages, breakdown rows
+  /// excluded -- they restate time the stage above already counted.
+  float host_ms = 0.0f;
+  /// Summed device milliseconds. Breakdowns ARE counted here: a device span
+  /// covers one dispatch and never the compaction the stage ran first, so
+  /// skipping them deletes that time rather than deduplicating it.
+  float device_ms = 0.0f;
+  /// Live block-table occupancy at this frame.
+  ///
+  /// Paired with @ref occupancy_known for the reason @ref FrameTrace pairs its
+  /// own two: an unreadable `load_factor` publishes a *fabricated* 1.0 here, so
+  /// a chart plotting this column alone draws a hard climb to 100% that never
+  /// happened -- at exactly the moment the reader is trying to find out what
+  /// did. See @ref FusionStats::occupancy_known.
+  float occupancy = 0.0f;
+  /// Whether @ref occupancy was read or fabricated.
+  bool occupancy_known = true;
+  /// Both stamped by the last *successful* remesh, not by this frame: a sample
+  /// between remeshes repeats the previous one's figures. See @ref
+  /// FusionStats::frames_since_extract, which is the freshness half of this
+  /// pair that a single sample cannot carry.
+  std::uint32_t triangles = 0;
+  std::uint32_t active_blocks = 0;
+  /// Whether the scan took new geometry in on this frame, and if not, why.
+  ///
+  /// The cause rather than a bool, matching @ref FrameTrace beside it: the
+  /// advice a reader acts on differs per cause, and a history that recorded
+  /// only *that* it stopped would need the live read-out open at the same
+  /// moment to say which -- which is the coupling this ring exists to remove.
+  AllocationStop allocation_stop = AllocationStop::None;
+};
+
 /// @brief What the last fuse/remesh cost and produced, for the read-out.
 struct FusionStats {
   std::uint64_t frames_fused = 0;
@@ -706,6 +758,31 @@ class Fusion {
 
   FusionStats stats() const;
 
+  /// @brief How many fused frames the history holds.
+  ///
+  /// Public because a caller sizing a buffer for @ref history needs it, and a
+  /// number repeated at the call site drifts below this one and silently
+  /// truncates -- which reads as a shorter scan, not as a bug.
+  ///
+  /// ~4 s at 60 fused fps, and considerably longer at the rates this actually
+  /// runs (20-130 ms/frame measured on device), which is the range where a
+  /// spike is still findable by eye.
+  static constexpr std::size_t kHistoryCapacity = 240;
+
+  /// @brief Copy the frame history, oldest first, into @p out.
+  ///
+  /// Oldest-first because that is chart order, and doing the rotation here
+  /// keeps the ring's wrap-around out of every consumer -- including the Swift
+  /// one, where getting it wrong draws a plausible graph with a discontinuity
+  /// somewhere in the middle.
+  ///
+  /// @param out       Destination; may be null to query the count alone.
+  /// @param capacity  How many @p out holds. A smaller buffer receives the
+  ///                  **newest** that many samples, since a history is read
+  ///                  from the present backwards.
+  /// @return How many samples were written (or would be, for a null @p out).
+  std::size_t history(FrameSample* out, std::size_t capacity) const;
+
   /// @brief The frame trace's five scalars, without @ref FusionStats' string.
   ///
   /// See @ref FusionTraceStats: this exists so the per-frame consumer does not
@@ -822,6 +899,19 @@ class Fusion {
   std::uint64_t survey_at_frame_ = 0;
   bool survey_measured_ = false;
   vr::Mat4f last_pose_{1.0f};
+  // The frame history, written on the fuse thread and read under mutex_ with
+  // everything else it publishes.
+  //
+  // Fixed and non-allocating, like FrameTrace in the renderer: this is appended
+  // on every fused frame, and a container that could reallocate there would put
+  // a malloc on the hot path to serve a chart.
+  //
+  // 240 entries is ~4 s at 60 fused fps and considerably longer at the rates
+  // this actually runs (20-130 ms/frame measured on device), which is the range
+  // where a spike is still findable by eye.
+  FrameSample history_[kHistoryCapacity]{};
+  std::uint64_t history_next_ = 0;
+
   FusionStats stats_{};
 };
 
