@@ -815,44 +815,65 @@ struct RendererImpl {
   // an involution, so applying it again is the conversion back.
   glm::mat4 device_pose = vr::sensor::cv_from_gl_camera(_impl->camera_to_world);
   // ...and then round to the viewport. ARKit fixes the camera basis to the
-  // *sensor*: +X along the long axis of the device toward the front-facing
-  // camera, +Y along the short axis, +Z out of the screen (ARCamera.transform).
-  // That frame does not turn when the interface does, so in portrait the
-  // camera's +X is viewport-*up* and its +Y is viewport-left -- and the scan
-  // renders on its side, which reads as a broken reconstruction rather than a
-  // misaligned render camera.
+  // *sensor*: +X along the long axis of the device, +Y along the short axis,
+  // +Z out of the screen (ARCamera.transform). That frame does not turn when
+  // the interface does, so in portrait the camera's +X is viewport-up and its
+  // +Y viewport-left -- and the scan renders on its side, which reads as a
+  // broken reconstruction rather than a misaligned render camera.
   //
-  // Which way +X runs is the part ARCamera.transform's own documentation is
-  // contradictory about, and it is worth 180 degrees. It says the axis "points
-  // to the right when the device is in UIDeviceOrientation.landscapeRight" and,
-  // in the same sentence, that it runs "from the front-facing camera toward the
-  // Home button" -- which in that orientation, home button on the left, is
-  // viewport-*left*. This took the second reading, and so derived the turn with
-  // the wrong sign. Hardware settled it: portrait rendered upside down, and the
-  // first drag corrected it by handing the view to the turntable, which imposes
-  // world +Y as up and drops the device's roll entirely. The sensor's own image
-  // agrees with the first reading -- a back-camera buffer needs a quarter turn
-  // *clockwise* to sit upright in portrait, which puts its +u, the camera's +X,
-  // along the device's long axis toward the front camera.
+  // Which frame this turn acts in matters as much as the angle: device_pose has
+  // already been through cv_from_gl_camera above, so it is the *GL* camera --
+  // +Z out of the screen at the viewer, a positive angle turning the basis
+  // counterclockwise on screen. recon's poses are CV (+Z along the view
+  // direction), and the identical rule applied to one of those comes out with
+  // the opposite sign. This has to sit after the conversion, not before it.
   //
-  // Fusion is unaffected either way (the pose and the intrinsics are mutually
-  // consistent in the sensor frame), so the correction belongs here and nowhere
-  // else. A rotation about the camera's own +Z carries its basis onto the
-  // viewport's, and +Z points out of the screen at the viewer -- so a positive
-  // angle turns the basis counterclockwise on screen, while each quarter turn
-  // of the interface (landscape-left -> portrait -> landscape-right) carries
-  // the viewport clockwise past it. The correction is therefore *negative*:
-  // portrait needs -90 degrees, and each further quarter turn subtracts another
-  // -- which is what VolumetricViewOrientation's values count. Landscape-left
-  // is the sensor's own basis and needs none.
+  // Which way +X runs along the long axis is worth 180 degrees, and it is NOT
+  // SETTLED. Two sources disagree, and no test has separated them.
   //
-  // Note what that costs to test: the two landscape orientations need 0 and 180
-  // degrees, and a sign cannot show on either, so only the portrait cases can
-  // ever expose this one.
+  //   Apple says the Home button, self-consistently: "the x-axis points to the
+  //   right when the device is in UIDeviceOrientation.landscapeLeft
+  //   orientation -- that is, the x-axis always points along the long axis of
+  //   the device, from the front-facing camera toward the Home button".
+  //   landscapeLeft is home-button-right, so the two clauses agree. (Snapshots
+  //   through mid-2025 said landscapeRight in the first clause and so
+  //   contradicted the second; that stale wording is what the two previous
+  //   derivations of this mapping split over.) The sensor's own image agrees:
+  //   a back-camera portrait frame is EXIF orientation 6, a quarter turn
+  //   clockwise to sit upright, which lands its +u -- the camera's +X -- at
+  //   the display's bottom in portrait, the Home-button end. That puts the
+  //   zero at UIDeviceOrientationLandscapeLeft, which is the *interface's*
+  //   LandscapeRight, which is raw 2: 180 - 90*raw, not the mapping below.
+  //
+  //   The device says otherwise. Under the previous +90*raw, portrait rendered
+  //   upside down -- and the doc reading says portrait was the one orientation
+  //   that build had right. The -90*raw below is what that sighting implies.
+  //   It is one uncontrolled observation, and the first drag "correcting" it
+  //   is weaker support than it looks (see the take_over note below), but it
+  //   is the only measurement anyone has taken.
+  //
+  // NOT DEVICE-VERIFIED. The two readings differ by 180 degrees in every
+  // orientation, so any one of them falsifies -- but portrait is the
+  // orientation the sighting already covered and the one this sign was picked
+  // to satisfy, so re-checking it mostly re-tests the sighting. The
+  // independent check is landscape: under the mapping below both landscapes
+  // must look correct; under the doc reading both are upside down. Read
+  // `orient` off the status read-out while checking, because a renderer that
+  // was never told its orientation looks exactly like a wrong sign on screen.
+  // Info.plist declares Portrait, LandscapeLeft and LandscapeRight only, so
+  // raw 3 is unreachable and only three of the four values can be tested.
+  //
+  // Fusion is unaffected either way -- the pose and the intrinsics are mutually
+  // consistent in the sensor frame -- so the correction belongs here. It does
+  // not stay here, though: OrbitCamera::take_over seeds the turntable's heading
+  // from device_pose_[1], the up column this turn rewrites, whenever the aim is
+  // steeper than about 45 degrees. The turntable's steady state is roll-free
+  // because view() imposes world up, but its seed is not, so a wrong turn here
+  // is laundered into yaw_ on the first drag rather than dropped.
   if (const float quarter_turns = static_cast<float>(_impl->view_orientation)) {
-    constexpr float kHalfPi = 1.5707964f;
-    device_pose = glm::rotate(device_pose, -quarter_turns * kHalfPi,
-                              glm::vec3(0.0f, 0.0f, 1.0f));
+    device_pose =
+        glm::rotate(device_pose, -quarter_turns * glm::half_pi<float>(),
+                    glm::vec3(0.0f, 0.0f, 1.0f));
   }
   _impl->camera.set_device_pose(device_pose);
 

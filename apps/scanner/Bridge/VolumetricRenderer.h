@@ -52,18 +52,27 @@ FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 /// @brief How far the viewport is turned from the camera's own basis.
 ///
 /// ARKit fixes `ARCamera.transform` to the **sensor**, not to the interface:
-/// its x-axis runs along the long axis of the device toward the front-facing
-/// camera, y along the short axis, z out of the screen. Rotating the phone does
-/// not move that basis, so rendering it straight into a portrait drawable puts
-/// the scan on its side — which reads as a broken reconstruction rather than a
-/// misaligned render camera.
+/// "the x-axis points to the right when the device is in
+/// `UIDeviceOrientation.landscapeLeft` orientation — that is, the x-axis always
+/// points along the long axis of the device, from the front-facing camera
+/// toward the Home button", y along the short axis, z out of the screen.
+/// Rotating the phone does not move that basis, so rendering it straight into a
+/// portrait drawable puts the scan on its side — which reads as a broken
+/// reconstruction rather than a misaligned render camera.
 ///
-/// The values are **quarter turns**: the renderer rotates the device pose about
-/// the camera's own +Z by `−90° × rawValue`. Negative because +Z points out of
-/// the screen at the viewer, so as this counts up the interface turns
-/// *clockwise* past the sensor's basis. Landscape-left is that basis
-/// (`UIDeviceOrientationLandscapeRight`, where ARKit documents +x as pointing
-/// viewport-right), so it is the zero.
+/// The values are **quarter turns**: the renderer rotates the pose about the
+/// camera's +Z by `−90° × rawValue`. Note *which* pose — the turn is applied
+/// after the CV→GL conversion, where +Z points out of the screen at the viewer.
+/// recon's poses are CV (+Z along the view direction), and the same rule
+/// applied to one of those comes out with the opposite sign.
+///
+/// **Which orientation is the zero is unsettled.** The text quoted above puts
+/// it at `UIInterfaceOrientationLandscapeRight` (raw 2); the one measurement
+/// anyone has taken puts it at landscape-left (raw 0), which is what ships.
+/// The two differ by 180° in *every* orientation, and the check that separates
+/// them has not been run. The evidence on both sides, and the check, are in
+/// `-renderFrameWithDrawableSize:error:` in VolumetricRenderer.mm — read that
+/// before changing these values or the sign that consumes them.
 ///
 /// Fusion is unaffected — the pose and the intrinsics are mutually consistent
 /// in the sensor frame either way — so this is a render-camera concern only.
@@ -212,8 +221,13 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Swift owns this: `UIInterfaceOrientation` is a UIKit value that only the
 /// view controller can read, and only on the main thread. Set it at bring-up
 /// and again on every rotation; leaving it stale rotates the scan rather than
-/// the camera. Affects @ref followingDevice mode, where the view *is* the
-/// device pose — the turntable derives its own basis and is already upright.
+/// the camera. It reaches **both** cameras, not only @ref followingDevice: the
+/// turntable's steady state imposes world up, but `OrbitCamera::take_over`
+/// seeds its heading from the pose's up column — the column this turn
+/// rewrites — whenever the aim is steeper than about 45°. So the correction has
+/// to stay where it is, applied to the pose before either camera sees it.
+/// Moving it inside the follow branch keeps follow mode looking right and
+/// leaves the first drag seeding from a raw sensor pose.
 @property(nonatomic) VolumetricViewOrientation viewOrientation;
 
 /// @}
