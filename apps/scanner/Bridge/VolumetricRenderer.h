@@ -385,6 +385,26 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// against a known-good draw is worth more than the code it costs.
 @property(nonatomic) BOOL drawMesh;
 
+/// How far a vertex may sit from the current frame's depth reading and still be
+/// textured, in metres. Default 0.02.
+///
+/// The projective-texturing visibility tolerance, live: turning it while
+/// pointing at one surface is how you find the right value, which is the whole
+/// reason it is here rather than a constant. Larger textures more of what the
+/// camera can see and lets colour bleed through foreground edges; smaller is
+/// stricter and makes textured regions go patchy, worst at range where the
+/// LiDAR is noisiest.
+///
+/// It is compared against a *single* frame's depth, not against truth, so it is
+/// absorbing sensor noise and pose error as much as real occlusion --
+/// `FusionConfig::occlusion_threshold` carries the full argument.
+///
+/// **Silently ignores a negative or non-finite value**, keeping the previous
+/// one. Every comparison with NaN is false, so storing one would texture
+/// nothing at all while the read-out went on showing a texture pass that ran.
+/// Reading the property back is how a caller confirms a value was taken.
+@property(nonatomic) float textureOcclusionThreshold;
+
 #pragma mark - Camera
 
 /// @name Camera control

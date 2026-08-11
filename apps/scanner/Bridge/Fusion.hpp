@@ -191,22 +191,84 @@ struct FusionConfig {
   bool measure_stages = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
-  /// **Still off, and still load-bearing that it is.** `ProjectiveTexturer`
-  /// does not annotate the triangles it wins -- it *overwrites* their vertices'
-  /// `uv0`, replacing recon's `(-1, -1)` sentinel, and gfx's hybrid shader
-  /// reads a non-sentinel `uv0` as "sample the atlas, ignore the vertex
-  /// colour". So against the 1x1 white atlas the renderer still binds, this
-  /// would render every surface the depth camera is currently looking at flat
-  /// white and discard the colour the TSDF fused there.
+  /// **On**, and both halves it used to wait on are now built:
+  /// @ref Fusion::Published carries the keyframe alongside the mesh, and the
+  /// renderer holds a persistent ring of atlas images indexed by the same slot
+  /// as the mesh.
   ///
-  /// Neither half is built. @ref Fusion::Published carries the mesh and nothing
-  /// else -- the colour frame it would index crossed the seam under interop
-  /// seam A and does not any more -- and the consuming half, a ring of atlas
-  /// images the renderer streams into and binds per slot, was never written.
-  /// *This flag is what gates the feature on both of them.* Flip it in the
-  /// change that lands the ring, not before: on its own it renders every
-  /// surface the depth camera is looking at flat white.
-  bool texture = false;
+  /// What it does: after each remesh, `ProjectiveTexturer` projects the current
+  /// frame into the mesh and writes a real `uv0` for every vertex it can see
+  /// unoccluded, so those surfaces render at the colour camera's resolution
+  /// rather than the voxel's -- 1920x1440 against a 1 cm grid. Everything else
+  /// keeps recon's sentinel and falls back to the colour the TSDF fused.
+  ///
+  /// **The textured region tracks the camera and reverts behind it.** Every
+  /// call overwrites every `uv0`, so a surface leaving the view returns to
+  /// voxel colour. That is the live single-camera slice working as designed,
+  /// not a defect -- a persistent textured reconstruction needs the
+  /// multi-keyframe atlas, which is a later slice.
+  ///
+  /// Gated at the call site on the frame actually carrying colour, not on this
+  /// flag alone: a frame whose colour the capture refused would otherwise get
+  /// real `uv0` addressing an atlas that was never uploaded. See
+  /// @ref Fusion::remesh.
+  ///
+  /// @warning **This flag being on does not mean the pass runs.** recon's
+  ///          `ProjectiveTexturer::texture` refuses a mesh whose vertices are
+  ///          shared between triangles, and this file asks marching cubes for
+  ///          exactly that (`share_vertices`, in @ref Fusion::start -- see the
+  ///          comment there for why both are on together). The per-vertex
+  ///          dispatch that lifts the refusal is a recon change; against a
+  ///          recon that predates it, every remesh's texture call returns
+  ///          `InvalidArgument`, no keyframe is published, and the scan renders
+  ///          as fused voxel colour throughout. That is not silent -- it is
+  ///          @ref TextureState::Failed with the refusal in
+  ///          @ref FusionStats::last_error -- but it *is* what "on" looks like
+  ///          against the wrong sibling revision, so check the read-out before
+  ///          concluding the flag did nothing.
+  bool texture = true;
+
+  /// @brief How far a vertex may sit from this frame's depth reading and still
+  ///        count as seen, in metres.
+  ///
+  /// The visibility test: a vertex is textured only when
+  /// `|sampled_depth - projected_z| <= this`. Everything else about projective
+  /// texturing is geometry; this is the one number deciding what "the camera
+  /// can see it" means.
+  ///
+  /// **It is not comparing geometry against truth.** It compares the *fused*
+  /// surface against a *single* frame's raw depth, so it has to absorb the
+  /// disagreement between them: per-frame LiDAR noise (`smoothedSceneDepth`
+  /// reduces it and does not remove it), the TSDF's running average against one
+  /// observation, pose error between the frames that placed the vertex and the
+  /// one testing it, and voxel quantisation at @ref voxel_size.
+  ///
+  /// Against that, being generous costs resolution: **a depth separation
+  /// smaller than this cannot be told apart**, so an object standing this far
+  /// proud of a wall lets the wall behind it be textured with the object's
+  /// pixels. Too tight and textured regions go patchy or flicker, worst at
+  /// range; too loose and colour bleeds through foreground edges.
+  ///
+  /// **It does a second job that is easy to miss.** recon uses the same value
+  /// as the depth-discontinuity bound in its bilinear sampler: when the 2x2
+  /// taps span more than this, the sampler stops blending and takes the nearest
+  /// valid tap instead, so a vertex on a silhouette is not rejected by a
+  /// phantom mid-depth averaged from foreground and background. Tightening this
+  /// therefore narrows visibility *and* makes that fallback fire more often.
+  ///
+  /// 2 cm is recon's default and is **inherited rather than measured** -- its
+  /// header calls it "the ported default" from the prior engine, and nothing
+  /// has re-derived it against ARKit's sensor. Two voxels at @ref voxel_size
+  /// 1 cm, just under @ref trunc_dist, though it is tied to neither in code.
+  ///
+  /// @note A fixed metric threshold is arguably the wrong *shape*: LiDAR noise
+  ///       grows with range, so this is strict at 0.5 m and permissive at 4 m.
+  ///       Scaling it with the projected depth would be the principled version
+  ///       -- worth doing against a measurement rather than ahead of one, which
+  ///       is what this field being adjustable is for.
+  ///
+  /// Changeable while a scan runs; see @ref Fusion::set_occlusion_threshold.
+  float occlusion_threshold = 0.02f;
 
   /// @brief How many extracted meshes may be outstanding at once.
   ///
@@ -259,6 +321,45 @@ enum class AllocationStop : std::uint8_t {
   /// through `AllocFailures::capacity_limited`, which includes bucket-local
   /// chain exhaustion, so it can fire with occupancy far below the guard.
   BlocksDropped,
+};
+
+/// @brief What the last remesh's projective-texturing pass actually did.
+///
+/// A cause rather than a duration, for the reason @ref AllocationStop is a
+/// cause rather than a bool: `texture_ms` alone cannot tell a pass that ran
+/// from one that never ran, because both publish 0.0 when there was nothing to
+/// measure. Every state below is reachable on a healthy device, so the read-out
+/// has to name which one, and the advice differs per state.
+///
+/// @warning None of these says how *much* of the mesh was textured. recon's
+///          `ProjectiveTexturer::texture` returns a @ref vr::Status and no
+///          count, and the only way to derive one at this tier would be to read
+///          the vertex arena back and tally sentinels -- the ~45 MB round trip
+///          the device overload exists to avoid. So @ref Ran means the dispatch
+///          completed, not that any vertex came out visible: a
+///          @ref FusionConfig::occlusion_threshold too tight for the scene
+///          still reports @ref Ran. Reporting coverage needs recon to count it
+///          on-device; until then this distinguishes ran / skipped / refused
+///          and stops there rather than implying more.
+enum class TextureState : std::uint8_t {
+  /// @ref FusionConfig::texture is off. The pass is not wired into this scan at
+  /// all and every `uv0` stays at marching cubes' sentinel.
+  Off = 0,
+  /// On, but no remesh has run yet since @ref Fusion::start.
+  Pending,
+  /// On, and the last remesh ran the pass to completion.
+  Ran,
+  /// Skipped because the frame carried no colour -- `convert_color` refuses an
+  /// unsupported pixel format, HLG and PQ, so this is reachable on real
+  /// hardware rather than only at session start. Not a fault: the mesh renders
+  /// as fused voxel colour, which is what a colourless frame should look like.
+  NoColor,
+  /// The pass was attempted and refused or failed; the reason is in
+  /// @ref FusionStats::last_error. Distinct from @ref NoColor because this one
+  /// *is* a fault -- and it is the state a build against a recon that still
+  /// refuses shared-vertex meshes sits in permanently, which otherwise looks
+  /// exactly like texturing that runs and produces nothing.
+  Failed,
 };
 
 /// @brief One fused frame, kept so a chart can show what a snapshot cannot.
@@ -407,7 +508,39 @@ struct FusionStats {
   float allocate_ms = 0.0f;
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
+  /// The host span around `ProjectiveTexturer::texture`, or 0 when the pass did
+  /// not run. **Read it with @ref texture_state, never alone**: 0.0 here means
+  /// "off", "skipped" and "refused before dispatching" as well as "ran and cost
+  /// nothing", and those want different actions.
+  ///
+  /// Wider than the `texture` stage row beside it, deliberately and not
+  /// redundantly: this covers the whole call including the transient buffer
+  /// setup and the fence, while recon's row is the dispatch it wraps. The text
+  /// summary prints one or the other rather than both -- see the note where it
+  /// builds the stage table, and @ref Fusion::remesh's, for why two numbers for
+  /// one pass is the failure being avoided.
   float texture_ms = 0.0f;
+  /// What that duration means. See @ref TextureState -- and its warning about
+  /// what @ref TextureState::Ran does and does not claim.
+  TextureState texture_state = TextureState::Off;
+  /// The tolerance the last texture pass actually ran at, in metres.
+  ///
+  /// Published because @ref Fusion::set_occlusion_threshold is turnable
+  /// mid-scan: without it the read-out shows the effect of a knob whose value
+  /// is only in the caller, and the procedure
+  /// @ref FusionConfig::occlusion_threshold documents -- turn it while pointing
+  /// at one surface and watch where texturing stops -- has nothing to correlate
+  /// the watching against.
+  float occlusion_threshold = 0.0f;
+  /// The host span around the ~11 MB keyframe copy the fuse thread makes per
+  /// textured remesh, in ms.
+  ///
+  /// Measured because it is otherwise invisible: it sits outside recon's stage
+  /// spans, outside @ref extract_ms and outside @ref texture_ms, so a copy that
+  /// costs more than the ~0.06 ms the capture path prices it at would slow the
+  /// fuse loop with every published figure showing no cause. Zero on a remesh
+  /// that published no keyframe.
+  float atlas_copy_ms = 0.0f;
 
   /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
   ///        @ref stages_truncated, not grown into.
@@ -809,6 +942,38 @@ class Fusion {
     /// releases it: see @ref release_through.
     vr::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
+    /// @brief The keyframe image @ref mesh's `uv0` index into, as packed RGB
+    ///        (one `uint32` per pixel, R in the low byte) -- or null when this
+    ///        mesh was not textured.
+    ///
+    /// The atlas half of the pair this struct's own documentation describes: a
+    /// mesh and the image its `uv0` address are only meaningful together, and
+    /// drawing one against a later frame's image samples the wrong place
+    /// everywhere it was textured.
+    ///
+    /// **Valid only until the next @ref take_mesh**, which is a shorter promise
+    /// than @ref mesh carries. It points into a small ring this class owns, and
+    /// the consumer is expected to copy out of it during the same call --
+    /// which the renderer does, into the atlas image for the slot it just put
+    /// the mesh in. Two entries is enough for that discipline and is what the
+    /// ring holds: the fuse thread cannot publish again until the previous mesh
+    /// is taken, so at most one unread entry exists, and the entry being copied
+    /// is never the one being written.
+    ///
+    /// Null rather than stale whenever the texture pass did not both run and
+    /// succeed, which is two cases and not one. `convert_color` refuses an
+    /// unsupported pixel format, HLG and PQ, so a colourless frame is reachable
+    /// on a real device rather than only at session start, and @ref
+    /// Fusion::remesh skips texturing entirely on one. A pass that *was*
+    /// attempted and failed publishes nothing either: it is gated on the
+    /// returned @ref vr::Status, not on the decision to try, because a refusal
+    /// leaves `uv0` untouched and staging 11 MB against it would assert a
+    /// pairing that does not hold. Either way no coordinate points at an atlas
+    /// that was never uploaded, and @ref FusionStats::texture_state says which
+    /// of the two happened.
+    const std::uint32_t* atlas = nullptr;
+    std::uint32_t atlas_width = 0;
+    std::uint32_t atlas_height = 0;
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
@@ -843,6 +1008,34 @@ class Fusion {
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
   void note_error(const std::string& message);
+
+  /// @brief Change the projective-texturing visibility tolerance mid-scan.
+  ///
+  /// Live rather than start-only because the value it replaces was a literal at
+  /// the call site: tuning it meant a source edit and a rebuild, which is
+  /// exactly the shape @ref FusionConfig::track_dirty_blocks and
+  /// @ref FusionConfig::measure_stages are fields to avoid. A tolerance is
+  /// judged by looking at a scan, and a scan is not a thing you can hold still
+  /// across a rebuild -- the point is to turn it while pointing at the same
+  /// surface and watch where texturing stops.
+  ///
+  /// Non-finite and negative values are refused rather than stored: both make
+  /// `|d - z| <= threshold` false for every vertex (every comparison with NaN
+  /// is false), so nothing would ever be textured and the read-out would show a
+  /// working texture pass producing no coverage. Zero is *allowed* -- it means
+  /// "only an exact depth match", which is a legitimate, if useless, end of the
+  /// range and is distinguishable from the refusal.
+  ///
+  /// Thread-safe against a running fuse loop, which is the whole point: this is
+  /// called from the main thread while @ref remesh reads it on the fuse thread.
+  /// An atomic rather than the publish mutex, so a knob cannot contend with the
+  /// lock the render loop already takes several times a frame.
+  ///
+  /// @return `false` if @p metres was refused, leaving the previous value.
+  bool set_occlusion_threshold(float metres);
+
+  /// @return The tolerance @ref remesh is currently applying.
+  float occlusion_threshold() const;
 
   FusionStats stats() const;
 
@@ -932,6 +1125,32 @@ class Fusion {
   // one frame in the steady state.
   std::uint64_t published_generation_ = 0;
   bool published_taken_ = true;
+  /// @brief The keyframe images published meshes index into; see
+  ///        @ref Published::atlas.
+  ///
+  /// Two, alternating, and the argument for two rather than one is the whole
+  /// reason this is a ring at all. `take_mesh` marks the mesh taken and returns
+  /// while the consumer is still copying out of the entry it was handed, so a
+  /// single buffer would let the very next remesh overwrite the bytes being
+  /// read. Alternating means the entry being written is never the entry being
+  /// read: a third publish needs a second take first (the uncollected guard in
+  /// @ref remesh), and the consumer is single-threaded, so it has finished with
+  /// the older entry before it asks for the newer one.
+  ///
+  /// A copy rather than a borrow, because `CapturedFrame::color` points into
+  /// the capture's rotating staging buffers and is documented valid only until
+  /// its next poll -- and the poll is on this thread, so the pointer would go
+  /// stale the moment this one loops. ~11 MB at ARKit's 1920x1440, memcpy'd
+  /// once per remesh on the fuse thread.
+  std::vector<std::uint32_t> atlas_ring_[2];
+  std::uint32_t atlas_slot_ = 0;
+  /// The entry the currently-published mesh indexes into, and its dimensions;
+  /// null / 0 when the last remesh did not texture. Guarded by @ref mutex_ with
+  /// the mesh they belong to -- see @ref Published::atlas for why they are one
+  /// value.
+  const std::uint32_t* published_atlas_ = nullptr;
+  std::uint32_t atlas_width_ = 0;
+  std::uint32_t atlas_height_ = 0;
   // The consumer's high-water mark, recorded by @ref release_through and handed
   // to recon by the fuse thread at the top of the next remesh. See that method:
   // this indirection is what keeps recon's extractor single-threaded.
@@ -971,6 +1190,11 @@ class Fusion {
   // whole point: the difference between the two is what a failing stage looks
   // like. See that field for why a frame count cannot express this.
   std::atomic<std::int64_t> last_stages_ns_{0};
+  // The live projective-texturing tolerance, seeded from
+  // FusionConfig::occlusion_threshold at start(). Atomic because the main
+  // thread turns it while the fuse thread reads it once per remesh; see
+  // set_occlusion_threshold for why it is not under mutex_.
+  std::atomic<float> occlusion_threshold_{0.02f};
   // Whether any published row has ever carried a device span.
   //
   // A one-way latch, and it has to be: what it detects is a GpuTimer that
