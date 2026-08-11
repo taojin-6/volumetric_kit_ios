@@ -49,35 +49,32 @@ typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
 /// @ref VolumetricRendererErrorVulkan.
 FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 
-/// @brief How far the viewport is turned from the camera's own basis.
+/// @brief Which orientation the interface is in, as a count of quarter turns.
 ///
 /// ARKit fixes `ARCamera.transform` to the **sensor**, not to the interface:
-/// "the x-axis points to the right when the device is in
-/// `UIDeviceOrientation.landscapeLeft` orientation — that is, the x-axis always
-/// points along the long axis of the device, from the front-facing camera
-/// toward the Home button", y along the short axis, z out of the screen.
-/// Rotating the phone does not move that basis, so rendering it straight into a
-/// portrait drawable puts the scan on its side — which reads as a broken
-/// reconstruction rather than a misaligned render camera.
+/// its x-axis runs along the long axis of the device, y along the short axis, z
+/// out of the screen. Rotating the phone does not move that basis, so rendering
+/// the pose straight into a portrait drawable puts the scan on its side — which
+/// reads as a broken reconstruction rather than a misaligned render camera.
+/// This is what the renderer needs in order to correct for that.
 ///
-/// The values are **quarter turns**: the renderer rotates the pose about the
-/// camera's +Z by `−90° × rawValue`. Note *which* pose — the turn is applied
-/// after the CV→GL conversion, where +Z points out of the screen at the viewer.
-/// recon's poses are CV (+Z along the view direction), and the same rule
-/// applied to one of those comes out with the opposite sign.
+/// This type says *which way the interface is facing* and nothing else. It
+/// deliberately does **not** say which orientation needs no correction, or what
+/// angle any of them implies: that is one constant,
+/// `kSensorBasisOrientation` in VolumetricRenderer.mm, and it is the only place
+/// in the app where an orientation becomes an angle. Read it before changing
+/// anything here — the derivation, the two conflicting device sightings and the
+/// check that separates them are all recorded on it.
 ///
-/// **Which orientation is the zero is unsettled.** The text quoted above puts
-/// it at `UIInterfaceOrientationLandscapeRight` (raw 2); the one measurement
-/// anyone has taken puts it at landscape-left (raw 0), which is what ships.
-/// The two differ by 180° in *every* orientation, and the check that separates
-/// them has not been run. The evidence on both sides, and the check, are in
-/// `-renderFrameWithDrawableSize:error:` in VolumetricRenderer.mm — read that
-/// before changing these values or the sign that consumes them.
+/// The raw values are consecutive quarter turns, in the order below, and that
+/// is load-bearing: the turn is computed by subtracting two of them.
+/// VolumetricRenderer.mm static_asserts each one, so reordering this enum is a
+/// build failure rather than a silently rotated scan.
 ///
 /// Fusion is unaffected — the pose and the intrinsics are mutually consistent
-/// in the sensor frame either way — so this is a render-camera concern only.
+/// in the sensor frame whatever this says — so it is a render-camera concern
+/// only.
 typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
-  /// The sensor's own basis; no correction.
   VolumetricViewOrientationLandscapeLeft = 0,
   VolumetricViewOrientationPortrait = 1,
   VolumetricViewOrientationLandscapeRight = 2,
