@@ -32,6 +32,12 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+// `frameHistory` sizes a std::vector to hand to Fusion::history. Named here
+// rather than left to Fusion.hpp's copy, for the reason recorded above
+// <cstdio>: a transitive include is not a dependency, and reordering the
+// imports above would turn this into a hard error in a file that already
+// learned that once.
+#include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
 #include "triangle_frag.spv.hpp"
@@ -281,6 +287,27 @@ const char* allocation_stop_tag(app::AllocationStop stop) {
       return "dropped";
   }
   return "ok";
+}
+
+/// The same cause, as the Swift-facing enum.
+///
+/// Switched rather than cast, though the two enumerations are declared in the
+/// same order: a cast makes that order load-bearing across two files that no
+/// build step compares, and the failure is a sample reporting the
+/// *neighbouring* cause -- a wrong answer that looks exactly like a right one.
+/// This way a value added on one side stops the compile.
+VolumetricAllocationStop allocation_stop_value(app::AllocationStop stop) {
+  switch (stop) {
+    case app::AllocationStop::None:
+      return VolumetricAllocationStopNone;
+    case app::AllocationStop::VolumeFull:
+      return VolumetricAllocationStopVolumeFull;
+    case app::AllocationStop::OccupancyUnknown:
+      return VolumetricAllocationStopOccupancyUnknown;
+    case app::AllocationStop::BlocksDropped:
+      return VolumetricAllocationStopBlocksDropped;
+  }
+  return VolumetricAllocationStopNone;
 }
 
 // --- Frame trace -------------------------------------------------------------
@@ -546,6 +573,34 @@ struct RendererImpl {
 // @implementation -- Objective-C has no nested implementations.
 @interface VolumetricStageRow ()
 - (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row;
+@end
+
+@interface VolumetricFrameSample ()
+- (instancetype)initWithSample:(const app::FrameSample&)sample;
+@end
+
+@implementation VolumetricFrameSample
+- (instancetype)initWithSample:(const app::FrameSample&)sample {
+  if ((self = [super init])) {
+    _frame = sample.frame;
+    _hostMs = sample.host_ms;
+    _deviceMs = sample.device_ms;
+    _timestampNs = sample.timestamp_ns;
+    _deviceTimingValid = sample.device_timing_valid ? YES : NO;
+    _extractMs = sample.extract_ms;
+    _occupancy = sample.occupancy;
+    _occupancyKnown = sample.occupancy_known ? YES : NO;
+    _triangles = sample.triangles;
+    _activeBlocks = sample.active_blocks;
+    _framesSinceExtract = sample.frames_since_extract;
+    _allocationStop = allocation_stop_value(sample.allocation_stop);
+    // Derived rather than carried, so the two cannot disagree about the same
+    // frame the way two independently-assigned fields eventually do.
+    _allocationStopped =
+        sample.allocation_stop != app::AllocationStop::None ? YES : NO;
+  }
+  return self;
+}
 @end
 
 @implementation VolumetricStageRow
@@ -1291,6 +1346,38 @@ struct RendererImpl {
 
 - (float)cameraDistance {
   return _impl->camera.distance();
+}
+
++ (NSUInteger)frameHistoryCapacity {
+  return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
+}
+
+- (NSArray<VolumetricFrameSample*>*)frameHistory {
+  // Asked how many there are before allocating room for them, rather than
+  // value-initialising the full ring on every poll: for most of a scan's first
+  // seconds -- and for the whole of a short one -- that zero-filled the other
+  // 236 slots to return four. The null-buffer query is the accessor's own
+  // documented way to ask.
+  //
+  // Two lock acquisitions, so the ring may gain entries between them. That is
+  // bounded rather than racy: `history` clamps its copy to the capacity handed
+  // in, so a grown ring simply yields its newest `available` samples and the
+  // buffer cannot be overrun. The alternative -- one call holding the lock
+  // across an allocation -- is the thing the fuse thread must not wait on.
+  //
+  // Still the fusion's bound and never a number repeated here: one that drifted
+  // below the real capacity would silently truncate and read as a shorter scan.
+  const std::size_t available = _impl->fusion.history(nullptr, 0);
+  std::vector<app::FrameSample> samples(available);
+  const std::size_t count =
+      available == 0 ? 0
+                     : _impl->fusion.history(samples.data(), samples.size());
+  NSMutableArray<VolumetricFrameSample*>* out =
+      [NSMutableArray arrayWithCapacity:count];
+  for (std::size_t i = 0; i < count; ++i) {
+    [out addObject:[[VolumetricFrameSample alloc] initWithSample:samples[i]]];
+  }
+  return out;
 }
 
 - (NSArray<VolumetricStageRow*>*)stageRows {

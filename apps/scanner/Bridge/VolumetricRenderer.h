@@ -131,6 +131,109 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 @property(nonatomic, readonly) BOOL hasGpu;
 @end
 
+/// @brief Why a fused frame took no new geometry in, when it took none.
+///
+/// Mirrors `app::AllocationStop`. A cause rather than a bool because the advice
+/// a reader acts on differs per cause and one of them is actively wrong for the
+/// others: @ref VolumetricAllocationStopOccupancyUnknown is *not* a full
+/// volume, and telling someone to coarsen their voxels there sends them after a
+/// limit they have not reached.
+typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
+  /// The frame allocated normally.
+  VolumetricAllocationStopNone = 0,
+  /// Past the refuse-to-allocate guard -- the documented trade working, and the
+  /// one cause a user can act on.
+  VolumetricAllocationStopVolumeFull,
+  /// Occupancy could not be read, so the guard refused on a fabricated figure.
+  /// The fault is upstream and named in the summary's error line.
+  VolumetricAllocationStopOccupancyUnknown,
+  /// The allocate hit a capacity limit and blocks were dropped. Can fire with
+  /// occupancy far below the guard, through bucket-local chain exhaustion.
+  VolumetricAllocationStopBlocksDropped,
+};
+
+/// @brief One fused frame, for charting what a snapshot cannot show.
+///
+/// @ref VolumetricRenderer.stageRows is the *current* frame; this is the
+/// history behind it. The distinction matters because fusion runs on its own
+/// thread: polling the snapshot faster does not reveal the frames in between,
+/// so a spike is only visible if it was sampled where it happened.
+///
+/// Totals rather than per-stage rows -- see `FrameSample` for why -- so a chart
+/// answers "which frame was slow, and was it fuse or mesh, host or device".
+///
+/// @warning It does **not** answer "which stage". @ref
+///          VolumetricRenderer.stageRows holds one frame's rows and is
+///          overwritten every fused frame, so the breakdown behind a spike in
+///          this history is gone long before the spike is drawn. Only the
+///          newest sample has a retrievable breakdown, and that is never the
+///          one being investigated.
+@interface VolumetricFrameSample : NSObject
+/// No sample can be constructed from Swift: a zeroed one plots as a real idle
+/// frame at the origin, which is indistinguishable from a measurement.
+- (instancetype)init NS_UNAVAILABLE;
+/// Fused-frame index. Dense and strictly sequential, so two samples can be
+/// aligned by subtraction.
+///
+/// @warning Not a gap indicator. It advances on exactly the path that appends a
+///          sample, so a frame that never fused never took an index -- a
+///          tracking dropout draws as adjacent frames at normal spacing. Use
+///          @ref timestampNs for elapsed time.
+@property(nonatomic, readonly) uint64_t frame;
+/// Monotonic nanoseconds at which the sample was taken, from the same clock
+/// across the whole history. The only field that can show an outage.
+@property(nonatomic, readonly) uint64_t timestampNs;
+/// Summed host milliseconds, breakdown rows excluded.
+///
+/// @warning Not host-only time, and not stackable with @ref deviceMs. recon
+///          measures a compute stage as wall clock around a *blocking* submit,
+///          so this covers record, submit, fence stall and device execution --
+///          it already contains most of `deviceMs`. Stacking the two
+///          double-counts; subtracting them reports a device stall as host
+///          overhead. Overlay them, or plot this one alone.
+@property(nonatomic, readonly) double hostMs;
+/// Summed device milliseconds, breakdown rows included.
+///
+/// Meaningful only where @ref deviceTimingValid is set -- a device that reports
+/// no timestamps and a frame that dispatched nothing are both `0.0` here.
+@property(nonatomic, readonly) double deviceMs;
+/// Whether any stage this frame carried a real device measurement.
+@property(nonatomic, readonly) BOOL deviceTimingValid;
+/// Milliseconds the mesh extract took, when one ran on this frame.
+///
+/// Not included in @ref hostMs or @ref deviceMs -- the extract reports through
+/// its own timings rather than the stage rows, so neither total can see it.
+/// It is also the dominant cost in a remesh frame, and a remesh runs on every
+/// fused frame by default. A "which frame was slow" chart that omits this is
+/// missing the usual answer.
+@property(nonatomic, readonly) double extractMs;
+/// Block-table occupancy in `[0, 1]` at this frame.
+///
+/// Plot this only where @ref occupancyKnown is set: an unreadable figure is
+/// published as a fabricated `1.0`, so a series drawn from this column alone
+/// climbs to 100% at the moment the reader most needs it not to lie.
+@property(nonatomic, readonly) double occupancy;
+/// Whether @ref occupancy was read or fabricated.
+@property(nonatomic, readonly) BOOL occupancyKnown;
+/// Both stamped by the last *successful* remesh: this frame's when one ran and
+/// succeeded, an older frame's when it skipped or the extract failed. They
+/// flat-line in that case while every neighbouring series keeps moving, so read
+/// @ref framesSinceExtract before treating a plateau as a finished surface.
+@property(nonatomic, readonly) uint32_t triangles;
+@property(nonatomic, readonly) uint32_t activeBlocks;
+/// Fused frames since the extract that stamped @ref triangles and
+/// @ref activeBlocks; `0` when this frame's own remesh refreshed them.
+@property(nonatomic, readonly) uint64_t framesSinceExtract;
+/// Whether the scan took new geometry in on this frame, and if not, why.
+@property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
+/// Whether @ref allocationStop is anything but `None`.
+///
+/// The bare "did it stop" for a caller that only draws a marker. Anything that
+/// *names* the stop must read @ref allocationStop instead -- calling every stop
+/// a full volume is the misreport that field exists to prevent.
+@property(nonatomic, readonly) BOOL allocationStopped;
+@end
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -303,6 +406,29 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///       consumer that needs them to agree *exactly* should render the text
 ///       from these rows rather than read both.
 @property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stageRows;
+
+/// @brief The fused-frame history, **oldest first** -- chart order.
+///
+/// Sampled per fused frame on the fusion thread, so it carries the frames a
+/// poll of @ref stageRows steps over. Bounded; the oldest fall off.
+///
+/// Allocated per read, and sized to what the ring actually holds rather than to
+/// its capacity, so an early scan does not marshal 240 slots to return four.
+/// Affordable because the display refreshes a few times a second, not per
+/// frame: the *sampling* rate and the *display* rate are deliberately
+/// different, and this property is the seam between them. A caller polling at
+/// frame rate is using the wrong seam.
+@property(nonatomic, readonly, copy)
+    NSArray<VolumetricFrameSample*>* frameHistory;
+
+/// @brief The most entries @ref frameHistory can ever return.
+///
+/// Published because the alternative is every chart hard-coding the same
+/// number: one that drifts below the real bound silently plots the newest
+/// fraction of the ring against a full-width axis, which reads as a shorter
+/// scan rather than as a bug. The C++ constant this mirrors cannot be seen from
+/// Swift, so a bridged accessor is the only thing that actually prevents it.
+@property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
 
 /// @brief Record that the OS asked the app to free memory.
 ///
