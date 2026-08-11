@@ -1624,7 +1624,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     add(r, @"occupied",
         fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_capacity),
         tone_for(s.occupancy, 0.7, 0.85));
-    if (s.allocation_stopped) {
+    // TODO(review): `allocation_stop` names four causes and this row asserts
+    // one of them. `OccupancyUnknown` is explicitly *not* a full volume -- see
+    // its declaration, which says the advice for a full volume is actively
+    // wrong there -- and `BlocksDropped` can fire with occupancy far below the
+    // guard. Reuse `allocation_stop_note`/`allocation_stop_tag` rather than
+    // restating a cause here.
+    if (s.allocation_stop != app::AllocationStop::None) {
       add(r, @"state", @"ALLOCATION STOPPED — volume full",
           VolumetricStatToneCritical);
     }

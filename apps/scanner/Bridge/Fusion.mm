@@ -844,11 +844,12 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // so appending these in the block above published the *previous* remesh's
     // phases as this frame's, unmarked. Above, they are fresh by construction.
     //
-    // They do not report through StageMetrics -- recon wired volume/tsdf/texture
-    // and left mesh's GPU column for later -- so these come from ExtractTimings
-    // and carry `has_gpu = false`. That is honest rather than unfortunate: the
-    // rows without a device half are exactly the part of the pipeline still
-    // measured on the host alone, and a reader can see which.
+    // They do not report through StageMetrics -- recon wired
+    // volume/tsdf/texture and left mesh's GPU column for later -- so these come
+    // from ExtractTimings and carry `has_gpu = false`. That is honest rather
+    // than unfortunate: the rows without a device half are exactly the part of
+    // the pipeline still measured on the host alone, and a reader can see
+    // which.
     //
     // The literals outlive any read (StageRow borrows its label), and the
     // "  .." prefix marks a phase as a breakdown of the extract above it, which
@@ -867,9 +868,11 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     push_stage("  ..inputs", stats_.extract.input_upload_ms);
     push_stage("  ..sizing", stats_.extract.arena_alloc_ms);
     push_stage("  ..readback", stats_.extract.readback_ms);
-    if (config_.texture) {
-      push_stage("texture", stats_.texture_ms);
-    }
+    // No `texture` row pushed here: `fuse` seeds one at the top of the frame
+    // and the texture tier reports into it through `metrics`, with a device
+    // half this host-only span does not have. Pushing one as well is how the
+    // same stage ends up drawn twice -- which is what the seed comment at the
+    // top of this file warns about, in those words.
 
     // Stamped here and only here. The rows publish on this path alone, so this
     // is what the four early returns above leave standing still -- see
