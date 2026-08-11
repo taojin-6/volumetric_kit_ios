@@ -280,20 +280,32 @@ final class ScannerViewController: UIViewController {
   /// The turn the renderer is actually holding, for the read-out.
   ///
   /// Four different faults all present on screen as "the scan is rotated": a
-  /// wrong sign, a correct sign against a wrong zero, a value that went stale
-  /// across a rotation, and a renderer that was never told at all and is still
-  /// on its default. The fix differs for each, and flipping the sign is wrong
-  /// for three of them. Printing what the renderer holds separates them without
-  /// a rebuild — which matters while the zero point is still unsettled (see
-  /// `VolumetricViewOrientation` in VolumetricRenderer.h). The raw value is
-  /// printed alongside the name because the mapping is argued in raw values.
+  /// wrong zero, a wrong sign, a value that went stale across a rotation, and a
+  /// renderer that was never told at all and is still on its default. The fix
+  /// differs for each, and the first two are indistinguishable in portrait —
+  /// which is why this line exists, and why the check recorded on
+  /// `kSensorBasisOrientation` asks for a landscape orientation too. The raw
+  /// value is printed alongside the name because the mapping is argued in raw
+  /// values.
+  ///
+  /// Switched over the cases rather than indexed by `rawValue`: the parallel
+  /// array this replaces encoded the enum's ordering a second time, so
+  /// reordering the enum would have relabelled precisely the read-out whose one
+  /// job is to say which value the renderer holds — and it would have done it
+  /// silently, while VolumetricRenderer.mm's static_asserts caught the same
+  /// edit at build time. One less place for the two to disagree.
   private func orientationName(_ orientation: VolumetricViewOrientation)
     -> String
   {
-    let names = ["landscape-left", "portrait", "landscape-right", "upside-down"]
-    let raw = orientation.rawValue
-    let name = names.indices.contains(raw) ? names[raw] : "invalid"
-    return "\(name) (\(raw))"
+    let name: String
+    switch orientation {
+    case .landscapeLeft: name = "landscape-left"
+    case .portrait: name = "portrait"
+    case .landscapeRight: name = "landscape-right"
+    case .portraitUpsideDown: name = "upside-down"
+    @unknown default: name = "invalid"
+    }
+    return "\(name) (\(orientation.rawValue))"
   }
 
   private func startRendererIfNeeded() {
