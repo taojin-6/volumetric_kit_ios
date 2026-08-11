@@ -292,12 +292,16 @@ struct FusionConfig {
   /// @brief Measure incremental extraction, publishing no geometry.
   ///
   /// recon's @ref vr::mesh::MarchingCubes::extract_device_incremental re-meshes
-  /// only the blocks a fuse changed. It refuses `share_vertices` (a shared
-  /// vertex is not owned three-per-triangle, so a relocated block cannot retire
-  /// what it leaves) and refuses more than one slot (the arena has to persist
-  /// across the call, and a ring hands each extract a different one) -- neither
-  /// of which is how this class is otherwise configured, so this mode changes
-  /// both.
+  /// only the blocks a fuse changed. **Sharing stays on** -- that kernel
+  /// reserves two per-block ranges and reuses them, and retires a dead triangle
+  /// through its own index run for 12 bytes rather than 192 -- so the only
+  /// setting this mode still changes is the slot count, because the arena has
+  /// to persist across the call and a ring hands each extract a different one.
+  ///
+  /// Turning sharing off was what the first version did, and it cost 3x the
+  /// vertex arena: 4177 MB measured on an iPad Pro (M5) against 33 MB for the
+  /// same app normally. That made the number it produced unrepresentative of
+  /// anything shippable, which is the whole reason it is no longer done.
   ///
   /// It therefore **does not publish a mesh**, and that is what makes one slot
   /// safe rather than the hazard @ref mesh_slots exists to refuse: nothing
@@ -316,11 +320,10 @@ struct FusionConfig {
   /// exists to decide. At one slot the renderer would simply be shown nothing
   /// new.
   ///
-  /// @warning Turning sharing off costs roughly 3x the vertex arena, on top of
-  ///          the inflation an incremental extract carries for retired ranges
-  ///          (1.82x measured on room0, where relocation is constant). Run it
-  ///          at a coarser voxel size first; an iPad is where the arena ceiling
-  ///          is real, which is why sharing is normally on.
+  /// @warning An incremental extract still carries inflation for the ranges it
+  ///          retires -- 1.12x measured on room0 with sharing, against 1.82x
+  ///          without it. That is a working-set cost this mode pays and the
+  ///          normal path does not.
   bool incremental_benchmark = false;
 
   /// @brief The queue families that will touch the mesh buffers.

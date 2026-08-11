@@ -325,12 +325,17 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
         // from a desktop fixture. Memory is why it is on here: an iPad is where
         // the arena ceiling is real.
         //
-        // Both inverted by the benchmark mode, because recon's incremental
-        // extract refuses each: sharing, because a relocated block cannot
-        // retire vertices it does not own three-per-triangle; more than one
-        // slot, because the arena has to survive the call. `track_block_spans`
-        // is what it re-meshes against.
-        mc_config.share_vertices = !config.incremental_benchmark;
+        // Sharing stays ON in the benchmark mode too, as of recon's
+        // sharing-incremental change: that kernel reserves two per-block ranges
+        // and now reuses them, and it retires a dead triangle through its own
+        // index run for 12 bytes rather than 192. Turning it off cost 3x the
+        // vertex arena -- 4177 MB measured on this device against 33 MB in the
+        // normal configuration -- which made the first measurement
+        // unrepresentative of anything shippable. Only the slot count still
+        // moves: the arena has to survive the call, and a ring hands each
+        // extract a different one. `track_block_spans` is what it re-meshes
+        // against.
+        mc_config.share_vertices = true;
         mc_config.slot_count =
             config.incremental_benchmark ? 1u : config.mesh_slots;
         mc_config.track_block_spans = config.incremental_benchmark;
