@@ -438,12 +438,12 @@ struct FusionStats {
   /// `mesh::ExtractTimings`, a richer per-phase struct this app holds whole in
   /// @ref extract, and the appended rows are that struct flattened so a reader
   /// sees one pipeline instead of rejoining two lists. Those rows carry
-  /// `has_gpu = false` -- honestly, not unfortunately: they are exactly the part
-  /// of the pipeline still measured on the host alone.
+  /// `has_gpu = false` -- honestly, not unfortunately: they are exactly the
+  /// part of the pipeline still measured on the host alone.
   ///
-  /// They are appended **after the remesh**, which is why the publish sits below
-  /// it: @ref extract is written by `remesh`, so appending them beside @ref
-  /// frames_fused published the previous remesh's phases as this frame's.
+  /// They are appended **after the remesh**, which is why the publish sits
+  /// below it: @ref extract is written by `remesh`, so appending them beside
+  /// @ref frames_fused published the previous remesh's phases as this frame's.
   ///
   /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
   ///          from a recon tier reporting with a string literal, or from a
