@@ -212,6 +212,20 @@ struct FusionConfig {
   /// flag alone: a frame whose colour the capture refused would otherwise get
   /// real `uv0` addressing an atlas that was never uploaded. See
   /// @ref Fusion::remesh.
+  ///
+  /// @warning **This flag being on does not mean the pass runs.** recon's
+  ///          `ProjectiveTexturer::texture` refuses a mesh whose vertices are
+  ///          shared between triangles, and this file asks marching cubes for
+  ///          exactly that (`share_vertices`, in @ref Fusion::start -- see the
+  ///          comment there for why both are on together). The per-vertex
+  ///          dispatch that lifts the refusal is a recon change; against a
+  ///          recon that predates it, every remesh's texture call returns
+  ///          `InvalidArgument`, no keyframe is published, and the scan renders
+  ///          as fused voxel colour throughout. That is not silent -- it is
+  ///          @ref TextureState::Failed with the refusal in
+  ///          @ref FusionStats::last_error -- but it *is* what "on" looks like
+  ///          against the wrong sibling revision, so check the read-out before
+  ///          concluding the flag did nothing.
   bool texture = true;
 
   /// @brief How far a vertex may sit from this frame's depth reading and still
@@ -307,6 +321,45 @@ enum class AllocationStop : std::uint8_t {
   /// through `AllocFailures::capacity_limited`, which includes bucket-local
   /// chain exhaustion, so it can fire with occupancy far below the guard.
   BlocksDropped,
+};
+
+/// @brief What the last remesh's projective-texturing pass actually did.
+///
+/// A cause rather than a duration, for the reason @ref AllocationStop is a
+/// cause rather than a bool: `texture_ms` alone cannot tell a pass that ran
+/// from one that never ran, because both publish 0.0 when there was nothing to
+/// measure. Every state below is reachable on a healthy device, so the read-out
+/// has to name which one, and the advice differs per state.
+///
+/// @warning None of these says how *much* of the mesh was textured. recon's
+///          `ProjectiveTexturer::texture` returns a @ref vr::Status and no
+///          count, and the only way to derive one at this tier would be to read
+///          the vertex arena back and tally sentinels -- the ~45 MB round trip
+///          the device overload exists to avoid. So @ref Ran means the dispatch
+///          completed, not that any vertex came out visible: a
+///          @ref FusionConfig::occlusion_threshold too tight for the scene
+///          still reports @ref Ran. Reporting coverage needs recon to count it
+///          on-device; until then this distinguishes ran / skipped / refused
+///          and stops there rather than implying more.
+enum class TextureState : std::uint8_t {
+  /// @ref FusionConfig::texture is off. The pass is not wired into this scan at
+  /// all and every `uv0` stays at marching cubes' sentinel.
+  Off = 0,
+  /// On, but no remesh has run yet since @ref Fusion::start.
+  Pending,
+  /// On, and the last remesh ran the pass to completion.
+  Ran,
+  /// Skipped because the frame carried no colour -- `convert_color` refuses an
+  /// unsupported pixel format, HLG and PQ, so this is reachable on real
+  /// hardware rather than only at session start. Not a fault: the mesh renders
+  /// as fused voxel colour, which is what a colourless frame should look like.
+  NoColor,
+  /// The pass was attempted and refused or failed; the reason is in
+  /// @ref FusionStats::last_error. Distinct from @ref NoColor because this one
+  /// *is* a fault -- and it is the state a build against a recon that still
+  /// refuses shared-vertex meshes sits in permanently, which otherwise looks
+  /// exactly like texturing that runs and produces nothing.
+  Failed,
 };
 
 /// @brief One fused frame, kept so a chart can show what a snapshot cannot.
@@ -455,7 +508,39 @@ struct FusionStats {
   float allocate_ms = 0.0f;
   float integrate_ms = 0.0f;
   float extract_ms = 0.0f;
+  /// The host span around `ProjectiveTexturer::texture`, or 0 when the pass did
+  /// not run. **Read it with @ref texture_state, never alone**: 0.0 here means
+  /// "off", "skipped" and "refused before dispatching" as well as "ran and cost
+  /// nothing", and those want different actions.
+  ///
+  /// Wider than the `texture` stage row beside it, deliberately and not
+  /// redundantly: this covers the whole call including the transient buffer
+  /// setup and the fence, while recon's row is the dispatch it wraps. The text
+  /// summary prints one or the other rather than both -- see the note where it
+  /// builds the stage table, and @ref Fusion::remesh's, for why two numbers for
+  /// one pass is the failure being avoided.
   float texture_ms = 0.0f;
+  /// What that duration means. See @ref TextureState -- and its warning about
+  /// what @ref TextureState::Ran does and does not claim.
+  TextureState texture_state = TextureState::Off;
+  /// The tolerance the last texture pass actually ran at, in metres.
+  ///
+  /// Published because @ref Fusion::set_occlusion_threshold is turnable
+  /// mid-scan: without it the read-out shows the effect of a knob whose value
+  /// is only in the caller, and the procedure
+  /// @ref FusionConfig::occlusion_threshold documents -- turn it while pointing
+  /// at one surface and watch where texturing stops -- has nothing to correlate
+  /// the watching against.
+  float occlusion_threshold = 0.0f;
+  /// The host span around the ~11 MB keyframe copy the fuse thread makes per
+  /// textured remesh, in ms.
+  ///
+  /// Measured because it is otherwise invisible: it sits outside recon's stage
+  /// spans, outside @ref extract_ms and outside @ref texture_ms, so a copy that
+  /// costs more than the ~0.06 ms the capture path prices it at would slow the
+  /// fuse loop with every published figure showing no cause. Zero on a remesh
+  /// that published no keyframe.
+  float atlas_copy_ms = 0.0f;
 
   /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
   ///        @ref stages_truncated, not grown into.
@@ -875,12 +960,17 @@ class Fusion {
     /// is taken, so at most one unread entry exists, and the entry being copied
     /// is never the one being written.
     ///
-    /// Null rather than stale when the frame carried no colour. `convert_color`
-    /// refuses an unsupported pixel format, HLG and PQ, so this is reachable on
-    /// a real device rather than only at session start -- and @ref Fusion::
-    /// remesh skips texturing entirely on such a frame, leaving every `uv0` at
-    /// the sentinel, so there is no coordinate pointing at an atlas that was
-    /// never uploaded.
+    /// Null rather than stale whenever the texture pass did not both run and
+    /// succeed, which is two cases and not one. `convert_color` refuses an
+    /// unsupported pixel format, HLG and PQ, so a colourless frame is reachable
+    /// on a real device rather than only at session start, and @ref
+    /// Fusion::remesh skips texturing entirely on one. A pass that *was*
+    /// attempted and failed publishes nothing either: it is gated on the
+    /// returned @ref vr::Status, not on the decision to try, because a refusal
+    /// leaves `uv0` untouched and staging 11 MB against it would assert a
+    /// pairing that does not hold. Either way no coordinate points at an atlas
+    /// that was never uploaded, and @ref FusionStats::texture_state says which
+    /// of the two happened.
     const std::uint32_t* atlas = nullptr;
     std::uint32_t atlas_width = 0;
     std::uint32_t atlas_height = 0;

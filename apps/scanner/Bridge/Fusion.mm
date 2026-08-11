@@ -135,6 +135,25 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
         " (and the consumer's frames in flight "
         "plus one to actually pipeline).");
   }
+  // Refused here, beside the guard above and *before* anything is written.
+  // Through the setter rather than stored directly, so a config carrying a
+  // nonsense value is refused instead of reaching the kernel -- and the setter
+  // stores nothing on the path that returns false, so a refusal leaves this
+  // object exactly as it found it.
+  //
+  // That ordering is the whole point of the move. This check used to sit forty
+  // lines below, after `config_ = config` and after the locked block had wiped
+  // `stats_`, the frame history and the published keyframe: a refused config
+  // was already installed and the previous scan's read-out was already gone, so
+  // a Fusion that answered `valid()` from an earlier successful start went on
+  // describing a configuration this method had just rejected. Reachable by any
+  // caller that *computes* the tolerance rather than typing it -- a NaN out of
+  // a division is the ordinary way in. Both guards now refuse the same way: no
+  // state touched, nothing to unwind.
+  if (!set_occlusion_threshold(config.occlusion_threshold)) {
+    return vr::Status::invalid_argument(
+        "FusionConfig::occlusion_threshold must be finite and >= 0");
+  }
   config_ = config;
   // Cleared, not carried. Everything in here is about the scan that just ended,
   // and several fields are one-way latches -- `allocation_stop` and `occupancy`
@@ -145,6 +164,13 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     std::lock_guard<std::mutex> lock(mutex_);
     stats_ = FusionStats{};
     stats_.mesh_slots = config.mesh_slots;
+    // Seeded rather than left at the struct default, so the gap before the
+    // first remesh reads as "on, nothing measured yet" instead of "off". Those
+    // are the two states a reader most needs told apart while a scan is opening
+    // and no keyframe has appeared: one is waiting, the other is misconfigured.
+    stats_.texture_state =
+        config.texture ? TextureState::Pending : TextureState::Off;
+    stats_.occlusion_threshold = config.occlusion_threshold;
     // The frame history goes with them, and it is the one that reads worst if
     // it does not: `frames_fused` restarts at zero just above, so a ring left
     // full would hand a chart the last scan's 240 samples carrying *higher*
@@ -161,14 +187,43 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     published_atlas_ = nullptr;
     atlas_width_ = 0;
     atlas_height_ = 0;
-  }
-  // Seeded from the config, so the field is the declaration and the atomic is
-  // only the live copy -- not a second default that could disagree with it.
-  // Through the setter rather than stored directly, so a config carrying a
-  // nonsense value is refused here instead of reaching the kernel.
-  if (!set_occlusion_threshold(config.occlusion_threshold)) {
-    return vr::Status::invalid_argument(
-        "FusionConfig::occlusion_threshold must be finite and >= 0");
+    // ...and the mesh half with it, which is the same argument and the more
+    // dangerous omission. Clearing only the keyframe left the pair internally
+    // asymmetric: `mesh_` still named the *previous* scan's DeviceMesh, whose
+    // buffers belong to a MarchingCubes that `marching_cubes_.emplace()` below
+    // is about to replace. A renderer whose `uploaded_version` was stale would
+    // take that mesh on its next frame -- a destroyed VkBuffer under a live
+    // vkCmdDrawIndexedIndirect, which on this configuration is a device loss
+    // with no validation message.
+    //
+    // `consumer_released_` goes too, and for its own reason: it is a monotonic
+    // high-water mark over the *old* extractor's generations, and carrying it
+    // into a new one would hand recon a release covering slots the fresh
+    // extractor has not written yet on its very first remesh.
+    //
+    // `published_taken_ = true` rather than false -- it is the member's own
+    // default and it means "nothing outstanding", which is exactly the state a
+    // scan starts in. False would claim a mesh is waiting to be collected.
+    mesh_ = vr::mesh::DeviceMesh{};
+    published_generation_ = 0;
+    published_taken_ = true;
+    consumer_released_ = 0;
+    // `mesh_version_` deliberately NOT reset, and it is the one member here
+    // where resetting is worse than keeping. It is a change-detection token,
+    // not a per-scan count: `take_mesh` returns nothing when it equals the
+    // version the caller already has. Restart it at zero and the new scan's
+    // first publish can land on a number the renderer is still holding from the
+    // old one -- take_mesh then says "nothing new", and the renderer goes on
+    // drawing the previous scan's DeviceMesh, which is precisely the
+    // use-after-free the rest of this block exists to prevent. Monotonic across
+    // scans, it cannot collide.
+    //
+    // Note this block can only clear what *this* object owns. A renderer that
+    // has already taken a mesh keeps naming those buffers until its next
+    // successful take, so a genuine mid-session restart also needs the consumer
+    // to drop what it holds. Nothing wires that today because `start` is called
+    // exactly once, from -initWithLayer: -- which is a property of the caller,
+    // not of this method, and is why the rest of this is worth doing now.
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
@@ -232,12 +287,25 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
         // edge would each have emitted their own, instead of three private ones
         // per triangle. Selects recon's second sparse kernel at create().
         //
-        // Safe HERE specifically because FusionConfig::texture is off.
+        // On together with FusionConfig::texture, which is a change from what
+        // this comment used to say and is deliberate. The old pairing was:
         // ProjectiveTexturer decides visibility per *triangle* and writes uv0
-        // per *vertex*, which is well-defined only while a vertex belongs to
-        // one triangle -- and recon's texturer refuses a shared mesh outright
-        // rather than letting the write order decide. Flipping `texture` back
-        // on means turning this off, until the per-primitive camera id lands.
+        // per *vertex*, so a shared vertex has several triangles racing to
+        // write it and recon refuses the mesh outright rather than letting the
+        // write order decide. A per-vertex dispatch settles that at the source
+        // -- each thread owns one vertex and its own uv0 -- and lifts the
+        // refusal without anything changing here.
+        //
+        // **Do not "fix" a texturing failure by turning this off.** That is the
+        // instruction the previous comment gave and it is the wrong trade twice
+        // over. It does not repair anything a per-vertex recon does not already
+        // repair; and unsharing roughly triples the vertex count for the same
+        // surface, in the extractor arena, on the device the paragraph below
+        // calls the place the arena ceiling is real -- against a saving nothing
+        // has yet measured on hardware. If the texture pass is failing, read
+        // the reason: a recon that still refuses shared meshes reports exactly
+        // that in FusionStats::last_error with TextureState::Failed beside it,
+        // and the repair is the sibling revision, not this line.
         //
         // Roughly a 3x vertex reduction for the same surface; the exact figure
         // is a property of the scan, so trust this device's own read-out
@@ -329,6 +397,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stages.seed(kResizeStage);
     stages.seed(kIntegrateStage);
     stages.seed(kActiveSetStage);
+    // Seeded last of these and still not last in the published table: the
+    // texture pass runs inside `remesh`, *after* the extract, and the extract's
+    // rows are only appended at publish time. So this one is lifted out of
+    // first-seen order and re-appended after them -- see the publish block. The
+    // seed still has to happen here, before any scope opens, for the
+    // noexcept-destructor reason above; it is the *display* position that
+    // cannot be expressed by seeding.
     if (config_.texture) {
       stages.seed(kTextureStage);
     }
@@ -835,6 +910,23 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.stage_count = 0;
     stats_.stages_truncated = false;
     bool any_gpu = false;
+    // Held back and re-appended after the extract below, because that is where
+    // it belongs in the pipeline and the seed order cannot put it there.
+    //
+    // `fuse` seeds its rows at the top of the frame, before any of them has
+    // run, so that the StageScope destructors find rows rather than push_back
+    // onto them -- see the seed comment for why a growth there would be
+    // std::terminate. Rows then keep first-seen order, which put `texture`
+    // fifth, above an `extract` that is only appended down here. But the
+    // texture pass runs *inside* remesh, after the extract: the published table
+    // was drawing a ~4 ms row above the ~130 ms one that precedes it, on both
+    // the text summary and the dashboard's stage bars.
+    //
+    // That order was right while texture was a no-op printing 0.0 and nobody
+    // could see it. Reordering here rather than at either read-out keeps one
+    // source: the bridge publishes the pipeline end to end, in order, and the
+    // consumers keep drawing what they are handed.
+    const vr::StageRow* texture_row = nullptr;
     for (const vr::StageRow& row : stages.rows()) {
       if (stats_.stage_count >= FusionStats::kMaxStages) {
         // Recorded rather than dropped in silence: a full array reads exactly
@@ -844,6 +936,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         break;
       }
       any_gpu = any_gpu || row.has_gpu;
+      // By name, not by pointer identity: the row this matches was seeded from
+      // kTextureStage here but recon's own scope is what fills it, and nothing
+      // promises the label it carries back is the same pointer.
+      if (row.name != nullptr && std::strcmp(row.name, kTextureStage) == 0) {
+        texture_row = &row;
+        continue;
+      }
       stats_.stages[stats_.stage_count++] = row;
     }
     // A device half that was there and is not any more is a *retired* timer,
@@ -897,11 +996,27 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     push_stage("  ..other",
                std::max(0.0, static_cast<double>(stats_.extract_ms) -
                                  stats_.extract.total_ms()));
-    // No `texture` row pushed here: `fuse` seeds one at the top of the frame
-    // and the texture tier reports into it through `metrics`, with a device
-    // half this host-only span does not have. Pushing one as well is how the
-    // same stage ends up drawn twice -- which is what the seed comment at the
-    // top of this file warns about, in those words.
+    // ...and texture last, which is when it runs. Copied whole rather than
+    // pushed through `push_stage`: this row is the one place in the table with
+    // a real device half, and push_stage writes `has_gpu = false` because the
+    // extract phases it was written for genuinely have none. Routing it through
+    // there would drop the gpu column on the only stage that has one.
+    if (texture_row != nullptr) {
+      if (stats_.stage_count >= FusionStats::kMaxStages) {
+        stats_.stages_truncated = true;
+      } else {
+        stats_.stages[stats_.stage_count++] = *texture_row;
+      }
+    }
+    // No *new* `texture` row is pushed here -- the one above is recon's own,
+    // moved. `fuse` seeds it at the top of the frame and the texture tier
+    // reports into it through `metrics`, with a device half this host-only span
+    // does not have. Building a second from `stats_.texture_ms` is how the same
+    // stage ends up drawn twice with two different numbers, since that span
+    // also covers the transient buffer setup and the fence: the row would be
+    // the dispatch and the line beneath it the whole call, and nobody reading a
+    // column of milliseconds can tell those apart. The text summary picks one
+    // of the two rather than printing both -- see where it builds the table.
 
     // Stamped here and only here. The rows publish on this path alone, so this
     // is what the four early returns above leave standing still -- see
@@ -1157,11 +1272,25 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // host round trip between the two GPU tiers. The current frame would be the
   // atlas, i.e. the live single-camera path (recon's 2026-07-07 decision).
   //
-  // Off by default, and the reason is in FusionConfig::texture: nothing carries
-  // frame.color across this seam yet, so the renderer binds a 1x1 white atlas
-  // and every uv0 this pass writes selects white. Kept wired up rather than
-  // deleted because the missing half is the atlas upload, not this call.
+  // On now, and both halves it used to wait on are built: Published carries the
+  // keyframe beside the mesh and the renderer holds a persistent ring of atlas
+  // images indexed by the same slot. See FusionConfig::texture -- including its
+  // warning that the flag being on is not the same as the pass running.
   float texture_ms = 0.0f;
+  // The tolerance this remesh actually ran at, read once and published with the
+  // result. Read once rather than twice because it is turnable mid-scan: the
+  // main thread can move it between the call and the publish, and a read-out
+  // reporting a value the pass did not use is worse than none -- it is the
+  // number someone correlates a visible change against.
+  const float threshold = occlusion_threshold_.load(std::memory_order_relaxed);
+  // What the pass did, carried beside the duration because the duration cannot
+  // say it: 0.0 ms is "off", "skipped", "refused before dispatching" and "ran
+  // and cost nothing" all at once. See TextureState.
+  TextureState texture_state =
+      config_.texture ? TextureState::NoColor : TextureState::Off;
+  // Whether it *succeeded*, which is what the keyframe publish below is gated
+  // on -- distinct from whether it was attempted. See there.
+  bool textured_ok = false;
   // Gated on the frame actually carrying colour, not on the switch alone. A
   // frame whose colour was refused -- `convert_color` drops an unsupported
   // pixel format, an HLG or PQ transfer, a primaries set with no enumerator --
@@ -1179,9 +1308,11 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
     // on, so the table keeps its shape across the frames between remeshes --
     // and across a remesh that returns early above, which is the ordinary
     // steady state rather than a fault.
-    const vr::Status textured = texturer_->texture(
-        device_mesh.value(), frame.depth, frame.depth_camera,
-        occlusion_threshold_.load(std::memory_order_relaxed), metrics);
+    const vr::Status textured =
+        texturer_->texture(device_mesh.value(), frame.depth, frame.depth_camera,
+                           threshold, metrics);
+    textured_ok = textured.ok();
+    texture_state = textured_ok ? TextureState::Ran : TextureState::Failed;
     if (!textured) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -1207,7 +1338,25 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   const std::uint32_t* staged_atlas = nullptr;
   std::uint32_t staged_w = 0;
   std::uint32_t staged_h = 0;
-  if (do_texture) {
+  float atlas_copy_ms = 0.0f;
+  // Gated on the pass having SUCCEEDED, not on the decision to attempt it.
+  //
+  // Those are different conditions and the difference is the whole of this
+  // guard. A non-OK `texture` above bumps `stats_.errors` and falls through --
+  // it does not return -- so gating on `do_texture` alone staged 11 MB and
+  // published an atlas for a mesh whose `uv0` the failed pass never wrote. The
+  // renderer then binds a real keyframe against a mesh that is entirely
+  // sentinel, which is the pairing Published::atlas promises cannot happen, and
+  // burns 11 MB host plus 11 MB of GPU copy per remesh to do it.
+  //
+  // Not a hypothetical: recon refuses a shared-vertex mesh until its per-vertex
+  // dispatch lands, and this file asks for shared vertices (see start()), so
+  // against such a revision this is *every* remesh rather than a rare one. It
+  // is also the right answer on a partial failure, where some `uv0` are real
+  // and some are sentinel: the atlas would be honest for one half of the mesh
+  // and wrong for the other, with nothing to say which.
+  if (do_texture && textured_ok) {
+    const auto t_atlas = Clock::now();
     const std::uint32_t next = (atlas_slot_ + 1u) % 2u;
     const std::size_t pixels =
         static_cast<std::size_t>(frame.color_camera.width) *
@@ -1223,6 +1372,16 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
     staged_atlas = dst.data();
     staged_w = frame.color_camera.width;
     staged_h = frame.color_camera.height;
+    // Measured, because nothing else here covers it. `texture_ms` closed above
+    // and the extract span closed before that, and recon's StageMetrics only
+    // ever sees what recon runs -- so this copy, the one cost this tier adds to
+    // the fuse thread, was the single figure the read-out could not see. The
+    // comment above prices it at ~0.06 ms; that is a claim about warm memory
+    // and steady state, and a cold first-touch resize or an 11 MB vector being
+    // faulted back in under pressure is exactly when it stops being true. If it
+    // grows, the fuse loop slows and every published number moves with it --
+    // ms_since_fuse and the frame chart included -- so this is what says why.
+    atlas_copy_ms = ms_since(t_atlas);
   }
 
   // No host copy of the GEOMETRY. The renderer draws those very buffers --
@@ -1271,6 +1430,15 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   stats_.frames_since_extract = 0;
   stats_.extract_stale = false;
   stats_.texture_ms = texture_ms;
+  // The three published together, because `texture_ms` alone is ambiguous in
+  // both directions: 0.0 could be off, skipped, refused or instantaneous, and a
+  // healthy-looking 4 ms says nothing about what the tolerance let through. The
+  // state names which of those happened and the threshold is the knob it ran
+  // at. Neither claims coverage -- see TextureState's warning for why a count
+  // of textured vertices is not derivable at this tier.
+  stats_.texture_state = texture_state;
+  stats_.occlusion_threshold = threshold;
+  stats_.atlas_copy_ms = atlas_copy_ms;
 }
 
 std::optional<Fusion::Published> Fusion::take_mesh(

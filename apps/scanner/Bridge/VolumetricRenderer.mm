@@ -660,6 +660,23 @@ struct RendererImpl {
   // a rising vertex count next to a frozen screen.
   std::uint64_t mesh_upload_failures = 0;
   std::string mesh_upload_error;
+  // The atlas path's own counter and reason, deliberately NOT the pair above.
+  //
+  // They report opposite things and sharing one channel made them
+  // indistinguishable. `mesh_upload_failures` has exactly one other writer,
+  // which latches `mesh_unusable` first, so it fires once per process and means
+  // "the geometry can never be drawn". The atlas path does not latch -- a ring
+  // refusal is degraded rendering, not a dead one -- so on a persistent failure
+  // it counts at frame rate, and every iteration overwrote the shared message.
+  // A genuine unbindable-mesh fault arriving afterwards had its reason erased
+  // on the very next frame, and on the Alerts card, which prints the count
+  // without the message, a retryable atlas refusal and a permanently fatal
+  // mesh were the same red row.
+  //
+  // Separate counters, and the atlas one carries its reason to the panel rather
+  // than only into the text summary.
+  std::uint64_t atlas_failures = 0;
+  std::string atlas_error;
   // Memory warnings the OS pushed at us, and what the process was holding the
   // last time one arrived. See -noteMemoryWarning. Plain values rather than
   // atomics for the same reason the counter above is: UIKit delivers the
@@ -691,10 +708,16 @@ struct RendererImpl {
   // without one -- see the bring-up comment where these are filled in.
   //
   // 1x1 white, and still here: it is what a frame binds before the first
-  // textured mesh arrives, and whenever a remesh published no keyframe (a
-  // colour the capture refused). Never *selected* on those frames, because
-  // Fusion leaves every uv0 at the sentinel when it does not texture -- but the
-  // set must be non-null regardless or the frame records no draw at all.
+  // textured mesh arrives, whenever a remesh published no keyframe (a colour
+  // the capture refused, a texture pass that failed), and whenever this frame's
+  // mesh slot holds an atlas image nothing has written yet. That last case is
+  // what `atlas_slot_written` decides -- see where frame_info.atlas is chosen,
+  // because binding an unwritten slot is undefined behaviour rather than merely
+  // a wrong colour.
+  //
+  // Never *selected* by the shader on those frames, because Fusion leaves every
+  // uv0 at the sentinel when it does not texture -- but the set must be
+  // non-null regardless or the frame records no draw at all.
   vg::Texture atlas_texture;
   // optional for the same reason recon's Device is: Sampler keeps its default
   // constructor private, so it is create-only and there is no empty one to
@@ -833,6 +856,33 @@ struct RendererImpl {
 
 namespace {
 
+/// @brief Give every atlas slot a real image at the colour camera's size.
+///
+/// **All or nothing.** Everything is built into locals and moved into `impl`
+/// only once every slot has succeeded, so a refusal partway through leaves the
+/// renderer exactly as it found it and frees what it had already taken on the
+/// way out. The previous shape wrote each slot as it went and returned early on
+/// the first failure, which left up to two 11 MB images and two 11 MB mapped
+/// staging buffers owned by slots nothing would ever bind -- `atlas_ready`
+/// stays false -- and nothing would ever free, because the only writer of those
+/// slots is a later successful call. ~44 MB converted to unreachable resident
+/// memory by a transient allocation failure, on the device where MemoryBudget
+/// exists precisely because the working set is the binding constraint, and it
+/// made the *next* allocation likelier to fail for the same reason.
+///
+/// Allocates no descriptor sets. They are handed out once at bring-up, and that
+/// is what makes the retry this function's caller advertises actually possible:
+/// gfx's `DescriptorPool::create` passes no flags and its header states the kit
+/// does not free sets individually, so a set consumed by a slot built before a
+/// mid-way failure was gone for good. Against a pool sized at exactly
+/// `kMeshSlots + 1`, the second attempt then failed at `allocate` with
+/// `VK_ERROR_OUT_OF_POOL_MEMORY` -- and so did every attempt after it, for the
+/// life of the process. The white fallback stayed bound, every textured
+/// triangle sampled one white texel, and the read-out called it transient.
+///
+/// Writing the descriptors here is safe only because `atlas_ready` is false for
+/// the whole time this runs, including across a retry: no frame binds a slot
+/// set until the flag goes up, so nothing is reading what this writes.
 vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
                             std::uint32_t height) {
   if (width == 0 || height == 0) {
@@ -840,6 +890,11 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
   }
   const VkDeviceSize bytes =
       static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
+
+  // Staged here, committed below. Destroying these on an early return is the
+  // whole point -- see the note above.
+  vg::Texture textures[RendererImpl::kMeshSlots];
+  vg::Buffer stagings[RendererImpl::kMeshSlots];
 
   for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
     vg::TextureDesc tex_desc;
@@ -882,29 +937,30 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
       return staging.status();
     }
 
-    vg::Result<vg::DescriptorSet> set =
-        impl.atlas_pool.allocate(impl.mesh_pipeline->descriptor_set_layout(0));
-    if (!set) {
-      return set.status();
-    }
+    textures[i] = std::move(tex).value();
+    stagings[i] = std::move(staging).value();
+  }
 
-    impl.atlas_slots[i].texture = std::move(tex).value();
-    impl.atlas_slots[i].staging = std::move(staging).value();
-    impl.atlas_slots[i].set = std::move(set).value();
+  // --- Commit. Nothing below can fail ---------------------------------------
+  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
+    impl.atlas_slots[i].texture = std::move(textures[i]);
+    impl.atlas_slots[i].staging = std::move(stagings[i]);
     // Written once, here: the image the set points at never changes, only its
     // contents. That is what makes the per-frame path a copy rather than a
-    // descriptor update.
+    // descriptor update. The set itself was allocated at bring-up.
     impl.atlas_slots[i].set.write_combined_image_sampler(
         0, impl.atlas_slots[i].texture.view(), impl.atlas_sampler->handle(),
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Fresh images, so every slot is back in VK_IMAGE_LAYOUT_UNDEFINED and its
+    // first upload must transition from there rather than from
+    // SHADER_READ_ONLY_OPTIMAL. This is also what the *bind* consults: a slot
+    // that has not been written yet is not bindable, whatever `atlas_ready`
+    // says. See where frame_info.atlas is chosen.
     impl.atlas_slot_written[i] = false;
   }
 
   impl.atlas_width = width;
   impl.atlas_height = height;
-  // Last, so a partial failure above leaves the ring unused rather than half
-  // built: every early return here leaves `atlas_ready` false, and the frame
-  // path binds the white fallback on that.
   impl.atlas_ready = true;
   return vg::Status();
 }
@@ -1328,6 +1384,35 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       0, _impl->atlas_texture.view(), _impl->atlas_sampler->handle(),
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+  // The ring's sets, here and only here -- the images they will point at do not
+  // exist yet, and are built on the first textured mesh once ARKit has stated
+  // its colour size (see build_atlas_ring).
+  //
+  // Allocated up front because a set taken from this pool cannot be given back:
+  // gfx passes no flags to DescriptorPool::create and its header says the kit
+  // does not free sets individually. Allocating them lazily inside
+  // build_atlas_ring meant a build that failed halfway had permanently spent
+  // the sets its completed slots took, out of a pool holding exactly
+  // kMeshSlots + 1 -- so the retry that function's caller promises could never
+  // succeed, and a transient memory-pressure refusal became a flat-white
+  // reconstruction for the life of the process. Taken once here, the count is
+  // exact by construction and no later path can exhaust it.
+  //
+  // A failure here fails bring-up, which is the honest place for it: this is a
+  // fixed, small allocation made before the first frame, so it not being
+  // available is a configuration fault rather than the transient the per-frame
+  // path has to tolerate.
+  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
+    vg::Result<vg::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
+        _impl->mesh_pipeline->descriptor_set_layout(0));
+    if (!slot_set) {
+      set_error(error, slot_set.status(),
+                "atlas ring DescriptorPool::allocate");
+      return nil;
+    }
+    _impl->atlas_slots[i].set = std::move(slot_set).value();
+  }
+
   app::FusionConfig fusion_config;
   // One slot per frame in flight, plus one. The renderer draws the extractor's
   // buffers in place now, so an extract must never land on geometry a pending
@@ -1448,7 +1533,23 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // any other keyframe samples the wrong place on every textured triangle
       // -- and the result looks like a plausible photograph of somewhere else,
       // not like an error.
-      if (fresh->atlas != nullptr) {
+      // Gated on `draw_mesh` the property, which is the only half of the draw
+      // decision known this early -- `have_mesh` is being set just above, and
+      // the full `draw_mesh` is computed 120 lines below, after the camera
+      // work. That is far enough down that the whole atlas path used to run
+      // unconditionally: with drawMesh = NO, every accepted mesh still paid an
+      // 11 MB main-thread memcpy and a recorded 11 MB GPU copy for an image no
+      // frame would bind. At remesh_every = 1 and 60 Hz that is ~660 MB/s of
+      // each, on the thread holding the display-link deadline, to serve a
+      // render path deliberately switched off.
+      //
+      // Skipping is safe only together with the slot bookkeeping below: a slot
+      // left unwritten while drawing is off must not be bound when drawing
+      // comes back on, or the first frame after the switch samples a keyframe
+      // several meshes stale. `atlas_slot_written` is what carries that, and
+      // clearing it is why the else-branch exists rather than the skip being a
+      // bare `if`.
+      if (_impl->draw_mesh && fresh->atlas != nullptr) {
         // Built on the first textured mesh rather than at bring-up, because the
         // size is ARKit's to state: `imageResolution` is not known until a
         // frame has arrived, and guessing 1920x1440 would be a constant that
@@ -1460,22 +1561,28 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
           }();
           if (!built.ok()) {
             // Not fatal to the frame, and deliberately not latched: the ring is
-            // an allocation of ~kMeshSlots * 11 MB, so a refusal here is much
-            // more likely to be transient memory pressure than a permanent
-            // fault. The mesh still draws, with the white atlas bound and every
-            // textured triangle sampling white -- so the failure is visible
-            // rather than silent, and the next remesh retries.
-            ++_impl->mesh_upload_failures;
-            _impl->mesh_upload_error =
-                "atlas ring: " + std::string(built.message());
+            // an allocation of ~kMeshSlots * 11 MB of images plus as much again
+            // in mapped staging buffers, so a refusal here is much more likely
+            // to be transient memory pressure than a permanent fault. The mesh
+            // still draws, with the white atlas bound and every textured
+            // triangle sampling white -- so the failure is visible rather than
+            // silent, and the next remesh retries. The retry can now actually
+            // succeed; see build_atlas_ring for what used to stop it.
+            //
+            // Its own counter, not the mesh-upload pair: that one latches and
+            // means the geometry is undrawable forever. See `atlas_failures`.
+            ++_impl->atlas_failures;
+            _impl->atlas_error = "ring: " + std::string(built.message());
           }
         }
         // Checked, not assumed: a ring built for one colour size and handed
         // another would read past the staged image. ARKit does not change
         // `imageResolution` mid-session, which is exactly why an unchecked
         // mismatch would be a latent read overrun rather than a visible bug.
-        if (_impl->atlas_ready && fresh->atlas_width == _impl->atlas_width &&
-            fresh->atlas_height == _impl->atlas_height) {
+        const bool extent_ok = _impl->atlas_ready &&
+                               fresh->atlas_width == _impl->atlas_width &&
+                               fresh->atlas_height == _impl->atlas_height;
+        if (extent_ok) {
           RendererImpl::AtlasSlot& slot = _impl->atlas_slots[_impl->mesh_slot];
           const std::size_t bytes =
               static_cast<std::size_t>(_impl->atlas_width) *
@@ -1489,7 +1596,40 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                               _impl->atlas_height,
                               !_impl->atlas_slot_written[_impl->mesh_slot]);
           _impl->atlas_slot_written[_impl->mesh_slot] = true;
+        } else if (_impl->atlas_ready) {
+          // A textured mesh whose keyframe could not be staged. Skipping the
+          // upload alone is not enough and was the bug: `fresh->atlas` being
+          // non-null means Fusion *did* texture this mesh, so every vertex
+          // carries a real uv0 -- and the bind below would hand it whichever
+          // keyframe this slot last held, kMeshSlots meshes ago. That renders
+          // as a plausible photograph of somewhere else painted over the live
+          // scan, which is the single failure the mesh/slot pairing exists to
+          // make unrepresentable.
+          //
+          // Marking the slot unwritten is what makes it bind the white fallback
+          // instead: wrong-looking, obviously, and honestly.
+          //
+          // Deliberately not a rebuild. Re-running build_atlas_ring here would
+          // free images that frames still in flight are binding -- a
+          // use-after-free needing a queue drain to make safe, on the thread
+          // that must not stall. ARKit does not resize mid-session, so this
+          // path is defensive; if it ever fires it stays degraded for the rest
+          // of the scan, and says so rather than recovering quietly.
+          _impl->atlas_slot_written[_impl->mesh_slot] = false;
+          ++_impl->atlas_failures;
+          _impl->atlas_error =
+              "keyframe is " + std::to_string(fresh->atlas_width) + "x" +
+              std::to_string(fresh->atlas_height) + " but the ring was built " +
+              std::to_string(_impl->atlas_width) + "x" +
+              std::to_string(_impl->atlas_height) +
+              "; textured meshes render white for the rest of this scan";
         }
+      } else if (fresh->atlas != nullptr) {
+        // Drawing is off, so the upload above was skipped. The mesh in this
+        // slot still has real uv0, so the slot must not stay bindable -- see
+        // the gate's note. The next remesh reaching it while drawing is on
+        // writes it again.
+        _impl->atlas_slot_written[_impl->mesh_slot] = false;
       }
       // The message is deliberately NOT cleared here. `mesh_upload_failures` is
       // a running total like every other counter on this read-out, and clearing
@@ -1702,13 +1842,28 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // 1x1 white fallback before the ring exists. Indexed by `mesh_slot` because
     // the two are one value -- see AtlasSlot.
     //
-    // The fallback is never *selected* on a frame whose mesh was not textured:
-    // Fusion skips the texture pass on a colourless frame, so every uv0 stays
-    // at recon's sentinel and the shader takes the vertex-colour branch. But
-    // the set must be non-null either way -- HybridMeshPipeline::submit records
+    // The set must be non-null either way -- HybridMeshPipeline::submit records
     // no bind, no push constant and no draw at all on a null one, which is
     // indistinguishable from a working renderer looking at empty space.
-    frame_info.atlas = _impl->atlas_ready
+    //
+    // Gated on the slot having been WRITTEN, not on the ring existing.
+    // build_atlas_ring creates all kMeshSlots images at once and each starts in
+    // VK_IMAGE_LAYOUT_UNDEFINED, but only the slot a textured mesh lands in is
+    // ever uploaded -- so between the first textured mesh and the ring coming
+    // fully round, `atlas_ready` is true for slots that have never been
+    // written. Binding one declares SHADER_READ_ONLY_OPTIMAL for an image in
+    // UNDEFINED, and gfx's hybrid_mesh.frag samples the atlas before it
+    // branches, so the read happens unconditionally: undefined behaviour, with
+    // no validation layer on this configuration to name it. Reachable as soon
+    // as one remesh publishes no keyframe -- a colour the capture refused, a
+    // texture pass that failed -- between two that do.
+    //
+    // On those frames this is also *correct* rather than merely safe: a mesh
+    // Fusion did not texture has every uv0 at recon's sentinel, so the shader
+    // takes the vertex-colour branch and never looks at what is bound here.
+    const bool atlas_bindable =
+        _impl->atlas_ready && _impl->atlas_slot_written[_impl->mesh_slot];
+    frame_info.atlas = atlas_bindable
                            ? _impl->atlas_slots[_impl->mesh_slot].set.handle()
                            : _impl->atlas_set.handle();
     frame_info.draws = &draw;
@@ -1989,9 +2144,38 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     if (_impl->mesh_upload_failures > 0) {
+      // With the reason, not just the count. The message was reaching only the
+      // text summary, so on this panel -- the primary read-out -- a mesh that
+      // cannot be bound as geometry was an unexplained red row. It is also
+      // latched and permanent, which the row now says outright rather than
+      // leaving to be inferred from a count that never moves again.
       add(r, @"mesh upload",
-          fmt("%llu failed", (unsigned long long)_impl->mesh_upload_failures),
+          _impl->mesh_upload_error.empty()
+              ? fmt("%llu failed",
+                    (unsigned long long)_impl->mesh_upload_failures)
+              : fmt("%llu failed: %s",
+                    (unsigned long long)_impl->mesh_upload_failures,
+                    _impl->mesh_upload_error.c_str()),
           VolumetricStatToneCritical);
+    }
+    if (_impl->atlas_failures > 0) {
+      // Its own row, beside that one rather than merged into it, because the
+      // two mean opposite things: this one is retryable and leaves the scan
+      // rendering in voxel colour, that one is fatal and leaves it not
+      // rendering geometry at all. Sharing a row made a transient memory-
+      // pressure refusal look like an unbindable mesh, and -- because this path
+      // counts at frame rate while that one fires once -- let a persistent
+      // atlas failure erase a genuine mesh fault's reason on the next frame.
+      //
+      // Warn rather than Critical, matching what it costs: the geometry still
+      // draws, textured surfaces fall back to white or to fused voxel colour.
+      add(r, @"atlas",
+          _impl->atlas_error.empty()
+              ? fmt("%llu failed", (unsigned long long)_impl->atlas_failures)
+              : fmt("%llu failed: %s",
+                    (unsigned long long)_impl->atlas_failures,
+                    _impl->atlas_error.c_str()),
+          VolumetricStatToneWarn);
     }
     if (_impl->memory_warnings > 0) {
       // The footprint sampled *at* the warning, not now: this is the one
@@ -2016,6 +2200,42 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     add(r, @"remesh",
         fmt("%llu  (v%u)", (unsigned long long)s.remeshes, s.mesh_version));
     add(r, @"mesh", fmt("%u verts / %u tris", s.vertices, s.triangles));
+    // The texture pass, as a state rather than a duration -- the Pipeline
+    // section below already carries its timing, and this row exists to say
+    // which of the four things a 0.0 ms there means. See app::TextureState,
+    // and its warning about what "ran" does not claim.
+    //
+    // The tolerance travels with it because it is the knob the state is the
+    // only feedback for: FusionConfig::occlusion_threshold documents finding
+    // the value by turning it while pointing at one surface and watching where
+    // texturing stops, and until this row existed the panel showed neither the
+    // value being turned nor whether the pass was running at all.
+    switch (s.texture_state) {
+      case app::TextureState::Off:
+        add(r, @"texture", @"off");
+        break;
+      case app::TextureState::Pending:
+        add(r, @"texture", @"on, no remesh yet");
+        break;
+      case app::TextureState::NoColor:
+        add(r, @"texture", @"skipped -- no colour on this frame",
+            VolumetricStatToneWarn);
+        break;
+      case app::TextureState::Failed:
+        add(r, @"texture", @"failed", VolumetricStatToneCritical);
+        break;
+      case app::TextureState::Ran:
+        add(r, @"texture", fmt("%.3f m tolerance", s.occlusion_threshold),
+            VolumetricStatToneGood);
+        break;
+    }
+    if (s.atlas_copy_ms > 0.0f) {
+      // The fuse thread's ~11 MB keyframe copy, which appears in no stage row
+      // and inside no other total -- see FusionStats::atlas_copy_ms for why it
+      // is measured rather than assumed to stay at the ~0.06 ms it is priced
+      // at.
+      add(r, @"keyframe copy", fmt("%.2f ms", s.atlas_copy_ms));
+    }
     if (s.errors > 0) {
       add(r, @"errors",
           fmt("%llu  %s", (unsigned long long)s.errors, s.last_error.c_str()),
@@ -2233,6 +2453,15 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (_impl->mesh_upload_failures > 0) {
     upload = "\n  ! upload x" + std::to_string(_impl->mesh_upload_failures) +
              ": " + _impl->mesh_upload_error;
+  }
+  // The atlas ring's own banner, on its own counter. Separate from the line
+  // above because a ring refusal is retryable and leaves the scan rendering in
+  // voxel colour, while an upload failure is latched and leaves it with no
+  // geometry at all -- see `atlas_failures` for how sharing one channel let the
+  // frame-rate one erase the once-per-process one's reason.
+  if (_impl->atlas_failures > 0) {
+    upload += "\n  ! atlas x" + std::to_string(_impl->atlas_failures) + ": " +
+              _impl->atlas_error;
   }
   // Shown as a count with the reason, not the reason alone. `last_error` is
   // most-recent-wins and `fuse` republishes its own every fused frame, so a
@@ -2605,8 +2834,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   const auto stage_gutter = [&stage_rows](bool first) {
     stage_rows += first ? " " : "\n            ";
   };
+  // Whether the table already carries the texture pass, which decides below
+  // whether the standalone `texture` line is printed at all. See there.
+  bool have_texture_stage = false;
   for (std::uint32_t i = 0; i < s.stage_count; ++i) {
     const vr::StageRow& row = s.stages[i];
+    if (row.name != nullptr && std::strcmp(row.name, "texture") == 0) {
+      have_texture_stage = true;
+    }
     // Fixed widths for the reason the phase cells have them: this string is
     // rebuilt continuously, and a value gaining a digit would shift every
     // column to its right.
@@ -2670,6 +2905,58 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       stage_rows +=
           "\n            (device timing retired after a fence failure -- host "
           "only for the rest of this run)";
+    }
+  }
+
+  // --- The texture pass, in one line rather than two ------------------------
+  //
+  // The state leads, because the duration cannot carry it: 0.0 ms is "off",
+  // "skipped for a colourless frame", "refused before dispatching" and "ran and
+  // cost nothing" all at once, and those want different actions. It is also the
+  // only thing that distinguishes a texture pass a sibling revision refuses on
+  // every remesh from one that runs and produces nothing. See app::TextureState
+  // -- including its warning that "ran" is not a claim about how much of the
+  // mesh came out textured, which nothing at this tier can say.
+  //
+  // The wall-clock span prints ONLY when the stage table does not already carry
+  // a `texture` row. With measure_stages on it does, fed by recon's own
+  // timestamp span around the dispatch -- while `texture_ms` wraps the whole
+  // call including the transient buffer setup and the fence. Two different
+  // numbers for one pass, a few lines apart under the same word, read as a
+  // measurement fault and make anyone totalling the stage column double-count
+  // it. Fusion's publish declines to push a second row for exactly this reason;
+  // printing one unconditionally here reintroduced it at the render layer.
+  // Invisible while texture was off, because both said 0.0.
+  std::string texture_row = "  texture   ";
+  switch (s.texture_state) {
+    case app::TextureState::Off:
+      texture_row += "off";
+      break;
+    case app::TextureState::Pending:
+      texture_row += "on, no remesh yet";
+      break;
+    case app::TextureState::NoColor:
+      texture_row += "skipped -- this frame carried no colour";
+      break;
+    case app::TextureState::Failed:
+      texture_row += "FAILED -- reason in the errors line above";
+      break;
+    case app::TextureState::Ran: {
+      char cell[128];
+      std::snprintf(cell, sizeof(cell), "ran at %.3f m tolerance",
+                    static_cast<double>(s.occlusion_threshold));
+      texture_row += cell;
+      if (!have_texture_stage) {
+        std::snprintf(cell, sizeof(cell), ",  %.1f ms (whole call)",
+                      static_cast<double>(s.texture_ms));
+        texture_row += cell;
+      }
+      // The fuse thread's ~11 MB keyframe copy, which is in no stage row and no
+      // other total -- see FusionStats::atlas_copy_ms.
+      std::snprintf(cell, sizeof(cell), "\n            keyframe copy %.2f ms",
+                    static_cast<double>(s.atlas_copy_ms));
+      texture_row += cell;
+      break;
     }
   }
 
@@ -2744,7 +3031,9 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // reader has to already know is one they will miss. Built above, because
       // the figure has a branch in it and the suffix has four cases.
       "  table     %s%s\n"
-      "  texture   %.1f ms",
+      // Built above: the state decides the shape of this line, and whether the
+      // call span appears at all depends on the stage table beside it.
+      "%s",
       static_cast<unsigned long long>(s.frames_fused),
       static_cast<unsigned long long>(s.remeshes), s.mesh_version,
       errors.c_str(), upload.c_str(), memory_warnings.c_str(),
@@ -2757,7 +3046,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
           : 0.0,
       static_cast<double>(s.extract.arena_bytes) / (1024.0 * 1024.0),
       s.mesh_slots, s.extract.active_blocks, table_row.c_str(),
-      dirty_rows.c_str(), s.texture_ms);
+      dirty_rows.c_str(), texture_row.c_str());
   // Mirror the read-out to os_log, throttled.
   //
   // os_log and nothing else. stderr would be a third copy of a string that
