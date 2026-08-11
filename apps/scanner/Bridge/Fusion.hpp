@@ -409,9 +409,15 @@ struct FusionStats {
   float extract_ms = 0.0f;
   float texture_ms = 0.0f;
 
-  /// @brief Upper bound on @ref stages; rows past it are dropped, not grown
-  ///        into.
-  static constexpr std::size_t kMaxStages = 8;
+  /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
+  ///        @ref stages_truncated, not grown into.
+  ///
+  /// Sixteen because the published set is the WHOLE pipeline, not just what
+  /// reports through StageMetrics: allocate, resize and integrate and their
+  /// breakdowns come from the tiers, and extract plus its phases are appended
+  /// from @ref extract so the end-to-end sequence is one list rather than two a
+  /// reader has to rejoin.
+  static constexpr std::size_t kMaxStages = 16;
 
   /// @brief The per-stage host/device rows recon reported for the last fused
   ///        frame, or none when @ref FusionConfig::measure_stages is off.
@@ -425,13 +431,19 @@ struct FusionStats {
   /// inside that critical section -- the reason @ref FusionTraceStats exists at
   /// all.
   ///
-  /// Five rows on a healthy frame -- `allocate`, `resize`, `integrate`, its
-  /// `"  ..active set"` breakdown, and `texture` when @ref
-  /// FusionConfig::texture is on -- so eight leaves room. **The extract is not
-  /// among them:** `MarchingCubes::extract_device` reports through
-  /// `mesh::ExtractTimings`, a richer per-phase struct this app already holds
-  /// whole in @ref extract and prints beneath these. A row for it would be a
-  /// second, coarser copy of a number already on screen.
+  /// Five rows on a healthy frame come from the tiers -- `allocate`, `resize`,
+  /// `integrate`, its `"  ..active set"` breakdown, and `texture` when @ref
+  /// FusionConfig::texture is on. **The extract is appended to them rather than
+  /// reported through them:** `MarchingCubes::extract_device` reports through
+  /// `mesh::ExtractTimings`, a richer per-phase struct this app holds whole in
+  /// @ref extract, and the appended rows are that struct flattened so a reader
+  /// sees one pipeline instead of rejoining two lists. Those rows carry
+  /// `has_gpu = false` -- honestly, not unfortunately: they are exactly the
+  /// part of the pipeline still measured on the host alone.
+  ///
+  /// They are appended **after the remesh**, which is why the publish sits
+  /// below it: @ref extract is written by `remesh`, so appending them beside
+  /// @ref frames_fused published the previous remesh's phases as this frame's.
   ///
   /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
   ///          from a recon tier reporting with a string literal, or from a

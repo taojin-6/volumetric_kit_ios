@@ -835,6 +835,56 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // permanent.
     gpu_timing_seen_ = gpu_timing_seen_ || any_gpu;
     stats_.gpu_timing_retired = gpu_timing_seen_ && !any_gpu;
+
+    // Extract, appended so the published stages are the pipeline end to end --
+    // one list the panel can draw, rather than two a reader has to rejoin.
+    //
+    // Here rather than beside `frames_fused`, and that is the whole of why this
+    // publish moved below the remesh: `stats_.extract*` is written by `remesh`,
+    // so appending these in the block above published the *previous* remesh's
+    // phases as this frame's, unmarked. Above, they are fresh by construction.
+    //
+    // They do not report through StageMetrics -- recon wired
+    // volume/tsdf/texture and left mesh's GPU column for later -- so these come
+    // from ExtractTimings and carry `has_gpu = false`. That is honest rather
+    // than unfortunate: the rows without a device half are exactly the part of
+    // the pipeline still measured on the host alone, and a reader can see
+    // which.
+    //
+    // The literals outlive any read (StageRow borrows its label), and the
+    // "  .." prefix marks a phase as a breakdown of the extract above it, which
+    // is what keeps totals from counting it twice.
+    const auto push_stage = [this](const char* name, double cpu_ms) {
+      if (stats_.stage_count >= FusionStats::kMaxStages) {
+        stats_.stages_truncated = true;
+        return;
+      }
+      stats_.stages[stats_.stage_count++] =
+          vr::StageRow{name, cpu_ms, 0.0, false};
+    };
+    push_stage("extract", stats_.extract_ms);
+    push_stage("  ..meshing", stats_.extract.dispatch_ms);
+    push_stage("  ..compact", stats_.extract.compact_ms);
+    push_stage("  ..inputs", stats_.extract.input_upload_ms);
+    push_stage("  ..sizing", stats_.extract.arena_alloc_ms);
+    push_stage("  ..desc", stats_.extract.descriptor_ms);
+    push_stage("  ..readback", stats_.extract.readback_ms);
+    // The residual, published rather than left implicit -- the same seven cells
+    // the text summary carries, for the reason it gives: these phases do not
+    // sum to `extract_ms` and never did. recon's spans open after the slot
+    // claim and close before the O(active_blocks) teardown of the neighbour
+    // table, so the gap grows with the scan. That is the one direction in which
+    // an unlabelled remainder is misread as rounding, and on the panel it read
+    // as a breakdown that visibly failed to add up to the row above it.
+    push_stage("  ..other",
+               std::max(0.0, static_cast<double>(stats_.extract_ms) -
+                                 stats_.extract.total_ms()));
+    // No `texture` row pushed here: `fuse` seeds one at the top of the frame
+    // and the texture tier reports into it through `metrics`, with a device
+    // half this host-only span does not have. Pushing one as well is how the
+    // same stage ends up drawn twice -- which is what the seed comment at the
+    // top of this file warns about, in those words.
+
     // Stamped here and only here. The rows publish on this path alone, so this
     // is what the four early returns above leave standing still -- see
     // FusionStats::ms_since_stages for why a frame count cannot say it.

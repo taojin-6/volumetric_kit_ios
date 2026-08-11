@@ -102,6 +102,10 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 ///       early-returned. Nothing on this object can tell the three apart --
 ///       recon's own rule is that a caller who must know asks the device.
 @interface VolumetricStageRow : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init. A zeroed row would also plot
+/// as a real stage that measured 0.00 ms, which is the one reading this file
+/// takes trouble elsewhere to keep distinguishable from "not measured".
+- (instancetype)init NS_UNAVAILABLE;
 /// Stage label; a breakdown of the row above it is prefixed with spaces.
 ///
 /// @warning A breakdown's `cpuMs` is **contained in** the `cpuMs` of the row
@@ -229,6 +233,80 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 /// *names* the stop must read @ref allocationStop instead -- calling every stop
 /// a full volume is the misreport that field exists to prevent.
 @property(nonatomic, readonly) BOOL allocationStopped;
+@end
+
+/// @brief How a stat should read: plain, healthy, or wanting attention.
+typedef NS_ENUM(NSInteger, VolumetricStatTone) {
+  VolumetricStatToneNeutral = 0,
+  VolumetricStatToneGood,
+  VolumetricStatToneWarn,
+  VolumetricStatToneCritical,
+};
+
+/// @brief One labelled figure.
+@interface VolumetricStatRow : NSObject
+/// Unavailable for the reason @ref VolumetricRenderer's is: the properties
+/// below are `nonnull`, and a zeroed instance built from Swift would hand it a
+/// null `String` that traps at the first use rather than at the mistake.
+- (instancetype)init NS_UNAVAILABLE;
+@property(nonatomic, readonly, copy) NSString* label;
+@property(nonatomic, readonly, copy) NSString* value;
+/// Semantic, not decorative -- set only where a reader is meant to act.
+@property(nonatomic, readonly) VolumetricStatTone tone;
+@end
+
+/// @brief A named group of figures.
+///
+/// The read-out used to be one string, which meant it could only ever be laid
+/// out as one block of text: no grouping a UI could act on, no per-figure
+/// state, and everything in it competing for the same attention. Published as
+/// sections instead, so the same information can be a grid of cards -- and the
+/// log line is rendered *from* these, so the screen and the transcript cannot
+/// drift apart.
+@interface VolumetricStatSection : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init.
+- (instancetype)init NS_UNAVAILABLE;
+@property(nonatomic, readonly, copy) NSString* title;
+@property(nonatomic, readonly, copy) NSArray<VolumetricStatRow*>* rows;
+@end
+
+/// @brief Everything the dashboard draws, from **one** read of each source.
+///
+/// The panel used to assemble itself from the individual properties above, and
+/// each of those takes its own snapshot: five separate `FusionStats` copies and
+/// three `task_info` traps per tick, with the fuse thread writing between them.
+/// That is not a theoretical race. The headline meter and the Volume card are
+/// the same fraction from two instants, so one can read 84% beside the other
+/// reading 86% with allocation stopped; the pipeline bars can belong to a frame
+/// the section list does not describe.
+///
+/// So the whole panel is built here under one `FusionStats` copy and one
+/// `MemoryBudget` query, and the figures on it are consistent by construction
+/// rather than by being fast enough not to notice. The individual properties
+/// remain for callers that want one figure and do not care.
+@interface VolumetricDashboardSnapshot : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init.
+- (instancetype)init NS_UNAVAILABLE;
+/// The per-stage rows, end to end.
+@property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stages;
+/// The grouped figures, in the order they are meant to be read.
+@property(nonatomic, readonly, copy) NSArray<VolumetricStatSection*>* sections;
+/// The fused-frame history, oldest first.
+@property(nonatomic, readonly, copy) NSArray<VolumetricFrameSample*>* history;
+/// Live block-table occupancy -- the same figure the Volume section prints,
+/// from the same copy, so the headline and the card cannot disagree.
+@property(nonatomic, readonly) double occupancy;
+/// Whether @ref occupancy was read or fabricated. A fabricated 1.0 must not
+/// draw as a full volume.
+@property(nonatomic, readonly) BOOL occupancyKnown;
+@property(nonatomic, readonly) uint32_t triangles;
+/// Why the frame took no new geometry in, if it did not.
+@property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
+/// The stop rendered for a reader, or nil when nothing stopped. Carries the
+/// *cause*: the advice for a full volume is actively wrong for the others.
+@property(nonatomic, readonly, copy, nullable) NSString* allocationStopReason;
+@property(nonatomic, readonly) uint64_t memoryFootprintBytes;
+@property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
@@ -380,6 +458,21 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @}
 
 /// Fusion read-out: fused frames, remeshes, mesh size and per-stage timings.
+/// @brief Everything the read-out carries, grouped.
+///
+/// @ref fusionSummary is these joined into text for the log; this is the same
+/// content before it was flattened.
+@property(nonatomic, readonly, copy)
+    NSArray<VolumetricStatSection*>* statSections;
+
+/// @brief The whole panel, from one read of each source.
+///
+/// What a UI should call. Assembling the same panel from @ref statSections,
+/// @ref stageRows, @ref frameHistory and the memory properties takes five
+/// `FusionStats` copies and three `task_info` traps, which the fuse thread
+/// writes between -- see @ref VolumetricDashboardSnapshot.
+@property(nonatomic, readonly) VolumetricDashboardSnapshot* dashboardSnapshot;
+
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 
 /// @brief The last fused frame's stages, for charting.
@@ -426,6 +519,27 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// scan rather than as a bug. The C++ constant this mirrors cannot be seen from
 /// Swift, so a bridged accessor is the only thing that actually prevents it.
 @property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
+
+/// @brief Block-table capacity — the denominator behind
+///        @ref VolumetricFrameSample.occupancy.
+///
+/// Beside the fraction rather than folded into it: a meter reads as "85% full"
+/// while the sentence under it wants "223k of 262k". The fraction says how
+/// close; the pair says how much room the last doubling bought.
+@property(nonatomic, readonly) uint32_t blockCapacity;
+
+/// @brief What the process is charged, and the two ceilings it is charged
+///        against.
+///
+/// Two, because they are different numbers and the **smaller one binds**:
+/// @ref memoryLimitBytes is the jetsam ceiling, which on this hardware sits
+/// above installed RAM and so is not what runs out first, while
+/// @ref gpuWorkingSetBytes is Metal's recommended working set — the figure the
+/// voxel grid and the mesh arenas are really sized against. A dashboard showing
+/// only the first reports comfortable headroom that does not exist.
+@property(nonatomic, readonly) uint64_t memoryFootprintBytes;
+@property(nonatomic, readonly) uint64_t memoryLimitBytes;
+@property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
 
 /// @brief Record that the OS asked the app to free memory.
 ///

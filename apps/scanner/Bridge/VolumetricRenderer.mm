@@ -24,6 +24,7 @@
 // FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
 // fusionSummary uses std::snprintf. It compiled only because some gfx or recon
 // header happens to pull <cstdio> in transitively today.
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -291,6 +292,46 @@ const char* allocation_stop_tag(app::AllocationStop stop) {
       return "dropped";
   }
   return "ok";
+}
+
+/// The same cause, as a dashboard row and as the banner's own sentence.
+///
+/// A fourth rendering of one value, and each medium genuinely differs: the log
+/// gets a suffix on a fixed-width line, the trace gets one word in a column,
+/// the bridge gets an enum, and this gets a phrase a person reads once and acts
+/// on. What they must not differ about is *which* cause, which is why they are
+/// all exhaustive switches on the same enum and sit together.
+///
+/// `advice` is the part that made this necessary. It was one hardcoded string
+/// -- coarsen the voxels, or raise `max_buckets` -- which is the right answer
+/// for `VolumeFull` and actively wrong for the other two: `OccupancyUnknown` is
+/// a failed `load_factor` read on a volume with room left, and `BlocksDropped`
+/// fires with occupancy far below the guard. Both sent the reader after a limit
+/// they had not reached.
+struct AllocationStopText {
+  const char* headline;
+  const char* advice;
+};
+AllocationStopText allocation_stop_text(app::AllocationStop stop) {
+  switch (stop) {
+    case app::AllocationStop::None:
+      return {"", ""};
+    case app::AllocationStop::VolumeFull:
+      return {"volume full",
+              "Existing surface keeps refining, but new areas will not be "
+              "added. Finish here, or restart with a coarser voxel size."};
+    case app::AllocationStop::OccupancyUnknown:
+      return {"occupancy unreadable",
+              "The volume is not known to be full -- the table's load factor "
+              "could not be read, and allocation refused on a fabricated "
+              "figure. The cause is on the errors row."};
+    case app::AllocationStop::BlocksDropped:
+      return {"blocks dropped",
+              "The allocate hit a capacity limit and dropped this frame's "
+              "blocks. This can fire well below the occupancy guard -- at the "
+              "bucket ceiling, or with the frame's grow budget spent."};
+  }
+  return {"", ""};
 }
 
 /// The same cause, as the Swift-facing enum.
@@ -687,6 +728,143 @@ struct RendererImpl {
 - (instancetype)initWithSample:(const app::FrameSample&)sample;
 @end
 
+@interface VolumetricStatRow ()
+- (instancetype)initWithLabel:(NSString*)label
+                        value:(NSString*)value
+                         tone:(VolumetricStatTone)tone;
+@end
+
+@implementation VolumetricStatRow
+- (instancetype)initWithLabel:(NSString*)label
+                        value:(NSString*)value
+                         tone:(VolumetricStatTone)tone {
+  if ((self = [super init])) {
+    _label = [label copy];
+    _value = [value copy];
+    _tone = tone;
+  }
+  return self;
+}
+@end
+
+@interface VolumetricStatSection ()
+- (instancetype)initWithTitle:(NSString*)title
+                         rows:(NSArray<VolumetricStatRow*>*)rows;
+@end
+
+@implementation VolumetricStatSection
+- (instancetype)initWithTitle:(NSString*)title
+                         rows:(NSArray<VolumetricStatRow*>*)rows {
+  if ((self = [super init])) {
+    _title = [title copy];
+    _rows = [rows copy];
+  }
+  return self;
+}
+@end
+
+@interface VolumetricDashboardSnapshot ()
+- (instancetype)initWithStages:(NSArray<VolumetricStageRow*>*)stages
+                      sections:(NSArray<VolumetricStatSection*>*)sections
+                       history:(NSArray<VolumetricFrameSample*>*)history
+                         stats:(const app::FusionStats&)stats
+                     footprint:(std::uint64_t)footprint
+                    workingSet:(std::uint64_t)workingSet;
+@end
+
+@implementation VolumetricDashboardSnapshot
+- (instancetype)initWithStages:(NSArray<VolumetricStageRow*>*)stages
+                      sections:(NSArray<VolumetricStatSection*>*)sections
+                       history:(NSArray<VolumetricFrameSample*>*)history
+                         stats:(const app::FusionStats&)stats
+                     footprint:(std::uint64_t)footprint
+                    workingSet:(std::uint64_t)workingSet {
+  if ((self = [super init])) {
+    _stages = [stages copy];
+    _sections = [sections copy];
+    _history = [history copy];
+    // From the same `stats` the sections were built from, which is the whole
+    // point of this object: the headline meter and the Volume card are the same
+    // fraction, and reading it twice let them disagree.
+    _occupancy = stats.occupancy;
+    _occupancyKnown = stats.occupancy_known ? YES : NO;
+    _triangles = stats.triangles;
+    _allocationStop = allocation_stop_value(stats.allocation_stop);
+    _allocationStopReason =
+        stats.allocation_stop == app::AllocationStop::None
+            ? nil
+            : to_ns_string(allocation_stop_text(stats.allocation_stop).advice);
+    _memoryFootprintBytes = footprint;
+    _gpuWorkingSetBytes = workingSet;
+  }
+  return self;
+}
+@end
+
+namespace {
+
+// Small helpers so building a section reads as a list of figures rather than a
+// wall of alloc/init.
+// Measured rather than truncated, and never nil.
+//
+// Both halves were bugs. The longest value on this read-out is the error row,
+// which carries `FusionStats::last_error` -- and `Fusion::fuse` appends a ~215
+// character advisory to that on the `track_dirty_blocks` path, so a fixed 256
+// byte buffer cut it with the return value discarded. A cut lands wherever the
+// limit falls, including mid-UTF-8 in a driver or recon message, and
+// `stringWithUTF8String:` answers **nil** for the result -- which `[nil copy]`
+// then stores in a `nonnull` property, so the trap surfaces in Swift at the
+// first read rather than here. `to_ns_string` is this file's own answer to that
+// second half and simply was not being used; see its comment.
+NSString* fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
+NSString* fmt(const char* format, ...) {
+  // Sized for the common row, which is far shorter than this; the heap path is
+  // for the error row and anything else that grows without a fixed bound.
+  char stack[256];
+  va_list args;
+  va_start(args, format);
+  va_list measure;
+  va_copy(measure, args);
+  const int needed = std::vsnprintf(stack, sizeof(stack), format, measure);
+  va_end(measure);
+  if (needed < 0) {
+    // An output error rather than a length. Nothing useful to print, and a
+    // partially-filled buffer here is not NUL-terminated by any guarantee.
+    va_end(args);
+    return @"(unprintable)";
+  }
+  if (static_cast<std::size_t>(needed) < sizeof(stack)) {
+    va_end(args);
+    return to_ns_string(stack);
+  }
+  std::vector<char> heap(static_cast<std::size_t>(needed) + 1);
+  std::vsnprintf(heap.data(), heap.size(), format, args);
+  va_end(args);
+  return to_ns_string(heap.data());
+}
+
+void add(NSMutableArray<VolumetricStatRow*>* rows, NSString* label,
+         NSString* value, VolumetricStatTone tone = VolumetricStatToneNeutral) {
+  [rows addObject:[[VolumetricStatRow alloc] initWithLabel:label
+                                                     value:value
+                                                      tone:tone]];
+}
+
+VolumetricStatSection* make_section(NSString* title,
+                                    NSArray<VolumetricStatRow*>* rows) {
+  return [[VolumetricStatSection alloc] initWithTitle:title rows:rows];
+}
+
+// A fraction's tone against two thresholds, so every meter in the app agrees
+// about when a number stops being routine.
+VolumetricStatTone tone_for(double fraction, double warn, double crit) {
+  if (fraction >= crit) return VolumetricStatToneCritical;
+  if (fraction >= warn) return VolumetricStatToneWarn;
+  return VolumetricStatToneNeutral;
+}
+
+}  // namespace
+
 @implementation VolumetricFrameSample
 - (instancetype)initWithSample:(const app::FrameSample&)sample {
   if ((self = [super init])) {
@@ -733,6 +911,18 @@ struct RendererImpl {
   }
   return self;
 }
+@end
+
+@interface VolumetricRenderer ()
+// The panel's two builders, taking the snapshot rather than each fetching one.
+// This is what lets `dashboardSnapshot` assemble the whole read-out from a
+// single `FusionStats` copy and a single `query_memory_budget`, while the
+// individual properties keep working for a caller that wants one figure.
+- (NSArray<VolumetricStageRow*>*)stageRowsForStats:(const app::FusionStats&)s;
+- (NSArray<VolumetricStatSection*>*)
+    sectionsForStats:(const app::FusionStats&)s
+              budget:(const app::MemoryBudget&)budget
+          workingSet:(std::uint64_t)workingSet;
 @end
 
 @implementation VolumetricRenderer {
@@ -1427,6 +1617,26 @@ struct RendererImpl {
   return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
 }
 
+- (uint32_t)blockCapacity {
+  return _impl->fusion.stats().table_capacity;
+}
+
+- (uint64_t)memoryFootprintBytes {
+  return app::query_memory_budget().footprint_bytes;
+}
+
+- (uint64_t)memoryLimitBytes {
+  const app::MemoryBudget budget = app::query_memory_budget();
+  // 0 when the OS declined to answer or is over the limit, which the dashboard
+  // reads as "no ceiling known" rather than drawing a full bar -- see
+  // MemoryBudget::limit_known.
+  return budget.limit_known ? budget.limit_bytes : 0;
+}
+
+- (uint64_t)gpuWorkingSetBytes {
+  return gpu_working_set_bytes();
+}
+
 - (NSArray<VolumetricFrameSample*>*)frameHistory {
   // Asked how many there are before allocating room for them, rather than
   // value-initialising the full ring on every poll: for most of a scan's first
@@ -1456,7 +1666,10 @@ struct RendererImpl {
 }
 
 - (NSArray<VolumetricStageRow*>*)stageRows {
-  const app::FusionStats s = _impl->fusion.stats();
+  return [self stageRowsForStats:_impl->fusion.stats()];
+}
+
+- (NSArray<VolumetricStageRow*>*)stageRowsForStats:(const app::FusionStats&)s {
   NSMutableArray<VolumetricStageRow*>* rows =
       [NSMutableArray arrayWithCapacity:s.stage_count];
   for (std::uint32_t i = 0; i < s.stage_count; ++i) {
@@ -1467,6 +1680,273 @@ struct RendererImpl {
   // elements at a few hertz is not the cost worth keeping a live mutable array
   // to save.
   return [rows copy];
+}
+
+// TODO(scanner): fusionSummary still formats its own text with snprintf, so
+// this and the log line are two independent formatters over one set of figures
+// and can drift. Rendering the summary FROM these sections is the fix; it is
+// not done here because that string carries layout this does not (banner
+// ordering, the clipped-tail argument) and folding it in deserves its own
+// change rather than a footnote to a UI one.
+- (NSArray<VolumetricStatSection*>*)statSections {
+  return [self sectionsForStats:_impl->fusion.stats()
+                         budget:app::query_memory_budget()
+                     workingSet:gpu_working_set_bytes()];
+}
+
+- (NSArray<VolumetricStatSection*>*)
+    sectionsForStats:(const app::FusionStats&)s
+              budget:(const app::MemoryBudget&)budget
+          workingSet:(std::uint64_t)workingSet {
+  const double mb = 1024.0 * 1024.0;
+  NSMutableArray<VolumetricStatSection*>* out = [NSMutableArray array];
+
+  // --- Alerts: the two signals that are not in FusionStats at all -----------
+  //
+  // First, because `fusionSummary` puts them first and for the same reason: a
+  // mesh whose uploads are failing looks like a clean scan -- the fused and
+  // remesh counters keep climbing while the geometry on screen stops changing
+  // -- and a memory warning is the only notice the OS gives before jetsam.
+  //
+  // These live on the bridge, not on the fusion: the upload is the render
+  // thread's stage and the warning arrives on the UI thread, so neither is in
+  // the snapshot above. That is exactly why the panel was missing them.
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    if (_impl->mesh_upload_failures > 0) {
+      add(r, @"mesh upload",
+          fmt("%llu failed", (unsigned long long)_impl->mesh_upload_failures),
+          VolumetricStatToneCritical);
+    }
+    if (_impl->memory_warnings > 0) {
+      // The footprint sampled *at* the warning, not now: this is the one
+      // reading taken when the OS said it mattered, and the next poll is up to
+      // half a second later -- long enough for the allocation that provoked it
+      // to have been freed again.
+      add(r, @"memory warning",
+          _impl->memory_warning_footprint_bytes > 0
+              ? fmt("x%llu  (last at %.0f MB held)",
+                    (unsigned long long)_impl->memory_warnings,
+                    _impl->memory_warning_footprint_bytes / mb)
+              : fmt("x%llu", (unsigned long long)_impl->memory_warnings),
+          VolumetricStatToneCritical);
+    }
+    if (r.count > 0) [out addObject:make_section(@"Alerts", r)];
+  }
+
+  // --- Fusion ---------------------------------------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
+    add(r, @"remesh",
+        fmt("%llu  (v%u)", (unsigned long long)s.remeshes, s.mesh_version));
+    add(r, @"mesh", fmt("%u verts / %u tris", s.vertices, s.triangles));
+    if (s.errors > 0) {
+      add(r, @"errors",
+          fmt("%llu  %s", (unsigned long long)s.errors, s.last_error.c_str()),
+          VolumetricStatToneCritical);
+    }
+    [out addObject:make_section(@"Fusion", r)];
+  }
+
+  // --- Stages: the host/device split, per stage -----------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    for (std::uint32_t i = 0; i < s.stage_count; ++i) {
+      const vr::StageRow& row = s.stages[i];
+      NSString* value =
+          row.has_gpu ? fmt("%6.2f ms   gpu %6.2f", row.cpu_ms, row.gpu_ms)
+                      : fmt("%6.2f ms   gpu      -", row.cpu_ms);
+      // Through to_ns_string, and guarded for null, exactly as
+      // VolumetricStageRow does with the same field and for the same reasons --
+      // `label` is nonnull, and this was the one place the row name reached
+      // Swift through a bare stringWithUTF8String:.
+      add(r, to_ns_string(row.name != nullptr ? row.name : ""), value);
+    }
+    if (s.stage_count > 0) [out addObject:make_section(@"Pipeline", r)];
+  }
+
+  // --- Extract: what is left once its timings became pipeline stages -------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    add(r, @"passes", fmt("%u", s.extract.dispatches),
+        s.extract.dispatches > 1 ? VolumetricStatToneWarn
+                                 : VolumetricStatToneNeutral);
+    add(r, @"emitted",
+        fmt("%u tris / %u verts", s.extract.emitted_triangles,
+            s.extract.emitted_vertices));
+    if (s.extract_stale) {
+      add(r, @"stale",
+          fmt("%llu frames since", (unsigned long long)s.frames_since_extract),
+          VolumetricStatToneWarn);
+    }
+    [out addObject:make_section(@"Extract", r)];
+  }
+
+  // --- Volume: the ceiling that stops a scan --------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    // `occupancy_known` gates the figure rather than decorating it. When
+    // `load_factor` fails the fusion forces occupancy to 1.0 so the guard
+    // refuses, and printing that as "100.0% of N blocks" in critical red is a
+    // full volume reported on a volume that may be nearly empty.
+    if (s.occupancy_known) {
+      add(r, @"occupied",
+          fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_capacity),
+          tone_for(s.occupancy, 0.7, 0.85));
+    } else {
+      add(r, @"occupied", fmt("unreadable  (of %u blocks)", s.table_capacity),
+          VolumetricStatToneWarn);
+    }
+    // The cause, not one of the four causes. See `allocation_stop_text`: the
+    // advice for a full volume is actively wrong for the other two, and this
+    // row used to assert it for all of them.
+    if (s.allocation_stop != app::AllocationStop::None) {
+      add(r, @"state",
+          fmt("ALLOCATION STOPPED — %s",
+              allocation_stop_text(s.allocation_stop).headline),
+          VolumetricStatToneCritical);
+    }
+    add(r, @"active", fmt("%u blocks", s.extract.active_blocks));
+    if (s.survey_active_blocks > 0) {
+      // The same three markers `fusionSummary` attaches, because each makes the
+      // sample mean something other than what it looks like and the gate above
+      // is a one-way latch that cannot take a stale sample back off the screen.
+      // Without them this row showed a first window's ~100% -- which any scene
+      // produces, the map having grown from empty inside it -- and indefinitely
+      // stale samples, both presented as this frame's.
+      std::string note;
+      if (s.survey_first_window) {
+        note += "  [first window: grew from empty]";
+      }
+      if (s.survey_stale) {
+        note += "  [stale " + std::to_string(s.frames_since_survey) + "f]";
+      }
+      const VolumetricStatTone survey_tone =
+          s.survey_stale ? VolumetricStatToneWarn : VolumetricStatToneNeutral;
+      if (s.survey_changed_blocks == 0) {
+        // The steady state, not a degenerate case -- recon documents a scan
+        // revisiting converged surface at `max_weight` as marking nothing.
+        // There is no ratio to print, so the sentence is the result: this is
+        // the branch that used to read "0.0%", the best available outcome
+        // reported as no benefit at all.
+        add(r, @"dirty",
+            fmt("nothing changed in %llu frames%s",
+                (unsigned long long)s.survey_window_frames, note.c_str()),
+            survey_tone);
+      } else {
+        add(r, @"dirty",
+            fmt("%u changed -> %u remesh (%.1f%%)%s", s.survey_changed_blocks,
+                s.survey_remesh_blocks,
+                100.0 * s.survey_remesh_blocks / (double)s.survey_active_blocks,
+                note.c_str()),
+            survey_tone);
+      }
+    }
+    [out addObject:make_section(@"Volume", r)];
+  }
+
+  // --- Arena: the mesh ring -------------------------------------------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    const double fill = s.extract.triangle_capacity > 0
+                            ? (double)s.triangles / s.extract.triangle_capacity
+                            : 0.0;
+    add(r, @"fill",
+        fmt("%.1f%% of %u tris", 100.0 * fill, s.extract.triangle_capacity),
+        tone_for(fill, 0.9, 0.98));
+    add(r, @"resident",
+        fmt("%.0f MB across %u slots", s.extract.arena_bytes / mb,
+            s.mesh_slots));
+    [out addObject:make_section(@"Arena", r)];
+  }
+
+  // --- Memory: both ceilings, because the smaller one binds -----------------
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    const std::uint64_t ws = workingSet;
+    // The same four branches `fusionSummary` has, and for the same reason: with
+    // only `ws > 0` and `limit_known`, a failed `task_info` left every figure
+    // at its zero and the card rendered "0 / 4096 MB (0.0%)" in the neutral
+    // tone -- a fabricated healthy reading, printed on the same tick the log
+    // line correctly said the reading was unavailable.
+    if (!budget.valid) {
+      // The kernel's own code rather than a bare "unavailable". MemoryBudget
+      // enumerates two reasons a reading can fail and they want different
+      // responses; this row is read when something has already gone wrong.
+      add(r, @"held",
+          fmt("unavailable  [task_info kr=%d]", budget.task_info_status),
+          VolumetricStatToneWarn);
+    } else if (budget.at_limit) {
+      // The last state before jetsam. The kernel clamps the remainder to 0
+      // here, so deriving a ceiling yields limit == footprint and draws a tidy
+      // 100% under a ceiling that rose to meet the number it was measuring.
+      // This gets a banner, not a ratio.
+      add(r, @"held",
+          fmt("%.0f MB — no headroom left before jetsam",
+              budget.footprint_bytes / mb),
+          VolumetricStatToneCritical);
+    } else if (budget.limit_known) {
+      const double f = budget.footprint_bytes / (double)budget.limit_bytes;
+      add(r, @"jetsam",
+          fmt("%.0f / %.0f MB  (%.1f%%)", budget.footprint_bytes / mb,
+              budget.limit_bytes / mb, 100.0 * f),
+          tone_for(f, 0.7, 0.85));
+    } else {
+      add(r, @"held",
+          fmt("%.0f MB  (ceiling not reported)", budget.footprint_bytes / mb));
+    }
+    // Printed even when task_info refused, because it is a separate reading
+    // that did not fail -- suppressing the whole card on one sub-failure would
+    // drop figures that are still obtainable. Guarded on being non-zero for the
+    // same reason as above: a zero here is an absent reading, not 0 MB.
+    if (ws > 0) {
+      if (budget.valid) {
+        const double f = budget.footprint_bytes / (double)ws;
+        add(r, @"gpu working set",
+            fmt("%.0f / %.0f MB  (%.1f%%)", budget.footprint_bytes / mb,
+                ws / mb, 100.0 * f),
+            tone_for(f, 0.7, 0.85));
+      } else {
+        add(r, @"gpu working set", fmt("%.0f MB recommended", ws / mb));
+      }
+    }
+    // The high-water mark, which is the only part of this card that can survive
+    // the gap between polls: a resize spike lasts well under one polling
+    // interval, so the sampled footprint beside it is the steady state and
+    // reads as comfortable no matter what the scan just survived.
+    if (budget.peak_footprint_bytes > 0) {
+      add(r, @"peak", fmt("%.0f MB", budget.peak_footprint_bytes / mb));
+    }
+    if (budget.device_ram_bytes > 0) {
+      add(r, @"device RAM", fmt("%.0f MB", budget.device_ram_bytes / mb));
+    }
+    [out addObject:make_section(@"Memory", r)];
+  }
+
+  return out;
+}
+
+- (VolumetricDashboardSnapshot*)dashboardSnapshot {
+  // Three reads, once each, and everything the panel shows is derived from
+  // them. Assembling the same panel from the individual properties took five
+  // `FusionStats` copies and three `task_info` traps, with the fuse thread
+  // writing in between -- see VolumetricDashboardSnapshot for what that let the
+  // headline and the Volume card disagree about.
+  //
+  // The history is its own source and its own lock; it is read once here rather
+  // than folded in, because the ring and the stats are different structures and
+  // no single lock covers both.
+  const app::FusionStats s = _impl->fusion.stats();
+  const app::MemoryBudget budget = app::query_memory_budget();
+  const std::uint64_t ws = gpu_working_set_bytes();
+  return [[VolumetricDashboardSnapshot alloc]
+      initWithStages:[self stageRowsForStats:s]
+            sections:[self sectionsForStats:s budget:budget workingSet:ws]
+             history:self.frameHistory
+               stats:s
+           footprint:budget.footprint_bytes
+          workingSet:ws];
 }
 
 - (NSString*)fusionSummary {
