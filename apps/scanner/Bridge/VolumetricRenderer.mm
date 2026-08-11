@@ -1425,17 +1425,27 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // EXCLUSIVE buffer read by a family that does not own it is undefined with no
   // error. recon collapses the pair to EXCLUSIVE wherever they are the same
   // family, so this needs no branch on the plan.
-  // Measurement mode, off unless the run scheme asks for it: set
-  // VR_INCREMENTAL_BENCHMARK in Product -> Scheme -> Run -> Arguments ->
-  // Environment Variables.
+  // Measurement mode, and a COMPILE-TIME one: cmake
+  // -DVI_INCREMENTAL_BENCHMARK=ON.
   //
-  // An environment variable rather than a UI toggle on purpose. It reconfigures
-  // the extractor at start() -- one slot, sharing off, spans tracked -- and
-  // publishes NO geometry, so the surface stops updating while it runs. That is
-  // a build you launch to read a number, not a mode a user should be able to
-  // reach by tapping. See FusionConfig::incremental_benchmark.
-  fusion_config.incremental_benchmark =
-      std::getenv("VR_INCREMENTAL_BENCHMARK") != nullptr;
+  // It was an environment variable first, and that silently did not work. iOS
+  // resumes a running process rather than cold-starting it, so a relaunch --
+  // even `devicectl ... --terminate-existing` -- re-ran no `getenv`, and the
+  // app kept whatever mode the FIRST launch after install had picked up. Runs
+  // two through four read as benchmark mode and were measuring the full path;
+  // the only tell was `verts == 3 * tris`, i.e. that sharing was off. A toggle
+  // whose failure mode is "quietly measured the wrong thing" is worse than no
+  // toggle.
+  //
+  // A define cannot drift: the mode is in the binary, so installing it is what
+  // switches it, and there is no state for a resume to carry. It also matches
+  // what this is -- a build you launch to read a number, not something a user
+  // should reach by tapping. See FusionConfig::incremental_benchmark.
+#ifdef VI_INCREMENTAL_BENCHMARK
+  fusion_config.incremental_benchmark = true;
+#else
+  fusion_config.incremental_benchmark = false;
+#endif
 
   fusion_config.queue_families[0] = _impl->shared.compute_family();
   fusion_config.queue_families[1] = _impl->shared.graphics_family();

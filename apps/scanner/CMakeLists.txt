@@ -81,7 +81,20 @@ target_include_directories(scanner_bridge
 # conversions. Since the camera parameter blocks moved into core it links
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
 # to implement ICameraCapture; recon_tsdf and recon_texture below are what the
-# fusion spine consumes, and recon_mesh/recon_volume arrive transitively.
+# fusion spine consumes, and recon_mesh/recon_volume arrive transitively. Build
+# the scanner as a measurement binary: one mesh slot, sharing off, spans
+# tracked, and NO geometry published, so recon's incremental extract can be
+# timed at the device's own dirty fraction. Compile-time rather than runtime
+# because iOS resumes a process instead of cold-starting it, so an environment
+# variable survives exactly one launch and then lies. See
+# FusionConfig::incremental_benchmark.
+option(VI_INCREMENTAL_BENCHMARK
+       "Scanner measures incremental extraction and draws no mesh" OFF)
+if(VI_INCREMENTAL_BENCHMARK)
+  # On the bridge, which is where VolumetricRenderer.mm compiles.
+  target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
+endif()
+
 target_link_libraries(
   scanner_bridge
   PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core

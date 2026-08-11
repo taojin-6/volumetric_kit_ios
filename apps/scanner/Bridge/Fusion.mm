@@ -168,7 +168,11 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stats_ = FusionStats{};
-    stats_.mesh_slots = config.mesh_slots;
+    // What the EXTRACTOR got, not what the caller asked for. The benchmark mode
+    // overrides this on the way into MarchingCubesConfig, so reporting the
+    // request had the read-out saying "3 slots" while one was in use -- the one
+    // line that would have shown the mode was on, saying it was off.
+    stats_.mesh_slots = config.incremental_benchmark ? 1u : config.mesh_slots;
     // Seeded rather than left at the struct default, so the gap before the
     // first remesh reads as "on, nothing measured yet" instead of "off". Those
     // are the two states a reader most needs told apart while a scan is opening
