@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <string>
 
 #import "MemoryBudget.hpp"
@@ -151,6 +152,14 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     // long the app sat between scans. Only the counter needs clearing; the
     // entries themselves become unreachable once it is zero.
     history_next_ = 0;
+    // With the same reasoning: a new scan must not hand out the previous one's
+    // keyframe. The ring's storage is deliberately kept -- it is the capacity
+    // that makes the per-remesh copy a memcpy rather than a fresh 11 MB
+    // mapping -- but nothing may be published out of it until a remesh fills it
+    // again.
+    published_atlas_ = nullptr;
+    atlas_width_ = 0;
+    atlas_height_ = 0;
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
@@ -1144,7 +1153,18 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // and every uv0 this pass writes selects white. Kept wired up rather than
   // deleted because the missing half is the atlas upload, not this call.
   float texture_ms = 0.0f;
-  if (config_.texture) {
+  // Gated on the frame actually carrying colour, not on the switch alone. A
+  // frame whose colour was refused -- `convert_color` drops an unsupported
+  // pixel format, an HLG or PQ transfer, a primaries set with no enumerator --
+  // still fuses its depth and still reaches here, and texturing it would write
+  // real `uv0` addressing an atlas this remesh never uploads. The renderer
+  // would then sample whatever that slot last held: a previous keyframe's
+  // image, smeared across every surface the camera can currently see. Skipping
+  // leaves every `uv0` at marching cubes' sentinel, so the frame renders as
+  // fused voxel colour -- which is exactly what a frame with no colour should
+  // look like.
+  const bool do_texture = config_.texture && frame.has_color();
+  if (do_texture) {
     const auto t_texture = Clock::now();
     // The window reaches this tier too. `fuse` seeds the row when this flag is
     // on, so the table keeps its shape across the frames between remeshes --
@@ -1161,7 +1181,43 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
     texture_ms = ms_since(t_texture);
   }
 
-  // No host copy. The renderer draws these very buffers -- interop seam B --
+  // --- Stage the keyframe this mesh's uv0 index into -----------------------
+  //
+  // Copied rather than pointed at: `frame.color` is a view into the capture's
+  // rotating staging buffers, valid only until its next poll -- and this thread
+  // is what polls, so the pointer is stale by the time the renderer looks at
+  // it. ~11 MB memcpy at ARKit's 1920x1440, which the capture path already
+  // prices at ~0.06 ms against this device's measured unified-memory
+  // bandwidth.
+  //
+  // Written into the entry the consumer is NOT reading; see `atlas_ring_`.
+  // Outside the publish mutex deliberately: this is the largest single copy on
+  // the fuse thread, and `mutex_` is the lock the main thread takes several
+  // times per rendered frame. Safe because the entry being written is by
+  // construction the one no consumer holds.
+  const std::uint32_t* staged_atlas = nullptr;
+  std::uint32_t staged_w = 0;
+  std::uint32_t staged_h = 0;
+  if (do_texture) {
+    const std::uint32_t next = (atlas_slot_ + 1u) % 2u;
+    const std::size_t pixels =
+        static_cast<std::size_t>(frame.color_camera.width) *
+        static_cast<std::size_t>(frame.color_camera.height);
+    std::vector<std::uint32_t>& dst = atlas_ring_[next];
+    // resize() rather than assign(): the vector keeps its capacity across
+    // remeshes, so the 11 MB mapping is faulted in once per session instead of
+    // once per frame -- the same reason ARKitCapture rotates its buffers by
+    // swap rather than move-assigning fresh ones.
+    dst.resize(pixels);
+    std::memcpy(dst.data(), frame.color, pixels * sizeof(std::uint32_t));
+    atlas_slot_ = next;
+    staged_atlas = dst.data();
+    staged_w = frame.color_camera.width;
+    staged_h = frame.color_camera.height;
+  }
+
+  // No host copy of the GEOMETRY. The renderer draws those very buffers --
+  // interop seam B --
   // so the ~53 MB round trip per remesh that seam A cost is simply not here.
   // What replaces it is the release contract handled at the top of this
   // function: the slot this mesh lives in is not extracted into again until the
@@ -1171,6 +1227,13 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   mesh_ = device_mesh.value();
   published_generation_ = device_mesh.value().generation;
   published_taken_ = false;
+  // Published together, under one lock, because they are one value: `uv0` is a
+  // coordinate into *this* keyframe. Zeroed rather than left alone when this
+  // remesh did not texture, so a consumer cannot bind the previous keyframe
+  // against a mesh whose uv0 are all sentinel.
+  atlas_width_ = staged_w;
+  atlas_height_ = staged_h;
+  published_atlas_ = staged_atlas;
   ++mesh_version_;
   ++stats_.remeshes;
   stats_.vertices = mesh_.vertex_count;
@@ -1218,6 +1281,13 @@ std::optional<Fusion::Published> Fusion::take_mesh(
   Published out;
   out.mesh = mesh_;
   out.version = mesh_version_;
+  // The atlas travels with the mesh or not at all. A caller that got a mesh and
+  // had to ask separately for its keyframe could pair a mesh with the *next*
+  // remesh's image, which is the one failure this pairing exists to make
+  // unrepresentable -- every textured triangle would sample the wrong place.
+  out.atlas = published_atlas_;
+  out.atlas_width = atlas_width_;
+  out.atlas_height = atlas_height_;
   return out;
 }
 

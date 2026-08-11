@@ -191,22 +191,28 @@ struct FusionConfig {
   bool measure_stages = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
-  /// **Still off, and still load-bearing that it is.** `ProjectiveTexturer`
-  /// does not annotate the triangles it wins -- it *overwrites* their vertices'
-  /// `uv0`, replacing recon's `(-1, -1)` sentinel, and gfx's hybrid shader
-  /// reads a non-sentinel `uv0` as "sample the atlas, ignore the vertex
-  /// colour". So against the 1x1 white atlas the renderer still binds, this
-  /// would render every surface the depth camera is currently looking at flat
-  /// white and discard the colour the TSDF fused there.
+  /// **On**, and both halves it used to wait on are now built:
+  /// @ref Fusion::Published carries the keyframe alongside the mesh, and the
+  /// renderer holds a persistent ring of atlas images indexed by the same slot
+  /// as the mesh.
   ///
-  /// Neither half is built. @ref Fusion::Published carries the mesh and nothing
-  /// else -- the colour frame it would index crossed the seam under interop
-  /// seam A and does not any more -- and the consuming half, a ring of atlas
-  /// images the renderer streams into and binds per slot, was never written.
-  /// *This flag is what gates the feature on both of them.* Flip it in the
-  /// change that lands the ring, not before: on its own it renders every
-  /// surface the depth camera is looking at flat white.
-  bool texture = false;
+  /// What it does: after each remesh, `ProjectiveTexturer` projects the current
+  /// frame into the mesh and writes a real `uv0` for every vertex it can see
+  /// unoccluded, so those surfaces render at the colour camera's resolution
+  /// rather than the voxel's -- 1920x1440 against a 1 cm grid. Everything else
+  /// keeps recon's sentinel and falls back to the colour the TSDF fused.
+  ///
+  /// **The textured region tracks the camera and reverts behind it.** Every
+  /// call overwrites every `uv0`, so a surface leaving the view returns to
+  /// voxel colour. That is the live single-camera slice working as designed,
+  /// not a defect -- a persistent textured reconstruction needs the
+  /// multi-keyframe atlas, which is a later slice.
+  ///
+  /// Gated at the call site on the frame actually carrying colour, not on this
+  /// flag alone: a frame whose colour the capture refused would otherwise get
+  /// real `uv0` addressing an atlas that was never uploaded. See
+  /// @ref Fusion::remesh.
+  bool texture = true;
 
   /// @brief How many extracted meshes may be outstanding at once.
   ///
@@ -809,6 +815,33 @@ class Fusion {
     /// releases it: see @ref release_through.
     vr::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
+    /// @brief The keyframe image @ref mesh's `uv0` index into, as packed RGB
+    ///        (one `uint32` per pixel, R in the low byte) -- or null when this
+    ///        mesh was not textured.
+    ///
+    /// The atlas half of the pair this struct's own documentation describes: a
+    /// mesh and the image its `uv0` address are only meaningful together, and
+    /// drawing one against a later frame's image samples the wrong place
+    /// everywhere it was textured.
+    ///
+    /// **Valid only until the next @ref take_mesh**, which is a shorter promise
+    /// than @ref mesh carries. It points into a small ring this class owns, and
+    /// the consumer is expected to copy out of it during the same call --
+    /// which the renderer does, into the atlas image for the slot it just put
+    /// the mesh in. Two entries is enough for that discipline and is what the
+    /// ring holds: the fuse thread cannot publish again until the previous mesh
+    /// is taken, so at most one unread entry exists, and the entry being copied
+    /// is never the one being written.
+    ///
+    /// Null rather than stale when the frame carried no colour. `convert_color`
+    /// refuses an unsupported pixel format, HLG and PQ, so this is reachable on
+    /// a real device rather than only at session start -- and @ref Fusion::
+    /// remesh skips texturing entirely on such a frame, leaving every `uv0` at
+    /// the sentinel, so there is no coordinate pointing at an atlas that was
+    /// never uploaded.
+    const std::uint32_t* atlas = nullptr;
+    std::uint32_t atlas_width = 0;
+    std::uint32_t atlas_height = 0;
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
@@ -932,6 +965,32 @@ class Fusion {
   // one frame in the steady state.
   std::uint64_t published_generation_ = 0;
   bool published_taken_ = true;
+  /// @brief The keyframe images published meshes index into; see
+  ///        @ref Published::atlas.
+  ///
+  /// Two, alternating, and the argument for two rather than one is the whole
+  /// reason this is a ring at all. `take_mesh` marks the mesh taken and returns
+  /// while the consumer is still copying out of the entry it was handed, so a
+  /// single buffer would let the very next remesh overwrite the bytes being
+  /// read. Alternating means the entry being written is never the entry being
+  /// read: a third publish needs a second take first (the uncollected guard in
+  /// @ref remesh), and the consumer is single-threaded, so it has finished with
+  /// the older entry before it asks for the newer one.
+  ///
+  /// A copy rather than a borrow, because `CapturedFrame::color` points into
+  /// the capture's rotating staging buffers and is documented valid only until
+  /// its next poll -- and the poll is on this thread, so the pointer would go
+  /// stale the moment this one loops. ~11 MB at ARKit's 1920x1440, memcpy'd
+  /// once per remesh on the fuse thread.
+  std::vector<std::uint32_t> atlas_ring_[2];
+  std::uint32_t atlas_slot_ = 0;
+  /// The entry the currently-published mesh indexes into, and its dimensions;
+  /// null / 0 when the last remesh did not texture. Guarded by @ref mutex_ with
+  /// the mesh they belong to -- see @ref Published::atlas for why they are one
+  /// value.
+  const std::uint32_t* published_atlas_ = nullptr;
+  std::uint32_t atlas_width_ = 0;
+  std::uint32_t atlas_height_ = 0;
   // The consumer's high-water mark, recorded by @ref release_through and handed
   // to recon by the fuse thread at the top of the next remesh. See that method:
   // this indirection is what keeps recon's extractor single-threaded.
