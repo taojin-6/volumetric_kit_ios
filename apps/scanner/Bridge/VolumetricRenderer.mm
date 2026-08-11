@@ -1841,6 +1841,19 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   _impl->draw_mesh = drawMesh;
 }
 
+- (float)textureOcclusionThreshold {
+  return _impl->fusion.occlusion_threshold();
+}
+
+- (void)setTextureOcclusionThreshold:(float)metres {
+  // The return is deliberately dropped: an Objective-C setter cannot report,
+  // and Fusion refuses rather than clamps, so a rejected value leaves the
+  // previous one in force. Reading the property back is what tells a caller
+  // which happened -- named in the header, since a silently-ignored setter is
+  // otherwise indistinguishable from one that worked.
+  (void)_impl->fusion.set_occlusion_threshold(metres);
+}
+
 #pragma mark - Camera
 
 - (void)orbitByFractionX:(float)dx y:(float)dy {

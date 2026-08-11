@@ -214,6 +214,48 @@ struct FusionConfig {
   /// @ref Fusion::remesh.
   bool texture = true;
 
+  /// @brief How far a vertex may sit from this frame's depth reading and still
+  ///        count as seen, in metres.
+  ///
+  /// The visibility test: a vertex is textured only when
+  /// `|sampled_depth - projected_z| <= this`. Everything else about projective
+  /// texturing is geometry; this is the one number deciding what "the camera
+  /// can see it" means.
+  ///
+  /// **It is not comparing geometry against truth.** It compares the *fused*
+  /// surface against a *single* frame's raw depth, so it has to absorb the
+  /// disagreement between them: per-frame LiDAR noise (`smoothedSceneDepth`
+  /// reduces it and does not remove it), the TSDF's running average against one
+  /// observation, pose error between the frames that placed the vertex and the
+  /// one testing it, and voxel quantisation at @ref voxel_size.
+  ///
+  /// Against that, being generous costs resolution: **a depth separation
+  /// smaller than this cannot be told apart**, so an object standing this far
+  /// proud of a wall lets the wall behind it be textured with the object's
+  /// pixels. Too tight and textured regions go patchy or flicker, worst at
+  /// range; too loose and colour bleeds through foreground edges.
+  ///
+  /// **It does a second job that is easy to miss.** recon uses the same value
+  /// as the depth-discontinuity bound in its bilinear sampler: when the 2x2
+  /// taps span more than this, the sampler stops blending and takes the nearest
+  /// valid tap instead, so a vertex on a silhouette is not rejected by a
+  /// phantom mid-depth averaged from foreground and background. Tightening this
+  /// therefore narrows visibility *and* makes that fallback fire more often.
+  ///
+  /// 2 cm is recon's default and is **inherited rather than measured** -- its
+  /// header calls it "the ported default" from the prior engine, and nothing
+  /// has re-derived it against ARKit's sensor. Two voxels at @ref voxel_size
+  /// 1 cm, just under @ref trunc_dist, though it is tied to neither in code.
+  ///
+  /// @note A fixed metric threshold is arguably the wrong *shape*: LiDAR noise
+  ///       grows with range, so this is strict at 0.5 m and permissive at 4 m.
+  ///       Scaling it with the projected depth would be the principled version
+  ///       -- worth doing against a measurement rather than ahead of one, which
+  ///       is what this field being adjustable is for.
+  ///
+  /// Changeable while a scan runs; see @ref Fusion::set_occlusion_threshold.
+  float occlusion_threshold = 0.02f;
+
   /// @brief How many extracted meshes may be outstanding at once.
   ///
   /// Passed through to `MarchingCubesConfig::slot_count`, and **two is the
@@ -877,6 +919,34 @@ class Fusion {
   ///        exception guard -- so it reaches the read-out like any other.
   void note_error(const std::string& message);
 
+  /// @brief Change the projective-texturing visibility tolerance mid-scan.
+  ///
+  /// Live rather than start-only because the value it replaces was a literal at
+  /// the call site: tuning it meant a source edit and a rebuild, which is
+  /// exactly the shape @ref FusionConfig::track_dirty_blocks and
+  /// @ref FusionConfig::measure_stages are fields to avoid. A tolerance is
+  /// judged by looking at a scan, and a scan is not a thing you can hold still
+  /// across a rebuild -- the point is to turn it while pointing at the same
+  /// surface and watch where texturing stops.
+  ///
+  /// Non-finite and negative values are refused rather than stored: both make
+  /// `|d - z| <= threshold` false for every vertex (every comparison with NaN
+  /// is false), so nothing would ever be textured and the read-out would show a
+  /// working texture pass producing no coverage. Zero is *allowed* -- it means
+  /// "only an exact depth match", which is a legitimate, if useless, end of the
+  /// range and is distinguishable from the refusal.
+  ///
+  /// Thread-safe against a running fuse loop, which is the whole point: this is
+  /// called from the main thread while @ref remesh reads it on the fuse thread.
+  /// An atomic rather than the publish mutex, so a knob cannot contend with the
+  /// lock the render loop already takes several times a frame.
+  ///
+  /// @return `false` if @p metres was refused, leaving the previous value.
+  bool set_occlusion_threshold(float metres);
+
+  /// @return The tolerance @ref remesh is currently applying.
+  float occlusion_threshold() const;
+
   FusionStats stats() const;
 
   /// @brief How many fused frames the history holds.
@@ -1030,6 +1100,11 @@ class Fusion {
   // whole point: the difference between the two is what a failing stage looks
   // like. See that field for why a frame count cannot express this.
   std::atomic<std::int64_t> last_stages_ns_{0};
+  // The live projective-texturing tolerance, seeded from
+  // FusionConfig::occlusion_threshold at start(). Atomic because the main
+  // thread turns it while the fuse thread reads it once per remesh; see
+  // set_occlusion_threshold for why it is not under mutex_.
+  std::atomic<float> occlusion_threshold_{0.02f};
   // Whether any published row has ever carried a device span.
   //
   // A one-way latch, and it has to be: what it detects is a GpuTimer that

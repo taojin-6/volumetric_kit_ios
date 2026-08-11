@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -160,6 +161,14 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     published_atlas_ = nullptr;
     atlas_width_ = 0;
     atlas_height_ = 0;
+  }
+  // Seeded from the config, so the field is the declaration and the atomic is
+  // only the live copy -- not a second default that could disagree with it.
+  // Through the setter rather than stored directly, so a config carrying a
+  // nonsense value is refused here instead of reaching the kernel.
+  if (!set_occlusion_threshold(config.occlusion_threshold)) {
+    return vr::Status::invalid_argument(
+        "FusionConfig::occlusion_threshold must be finite and >= 0");
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
@@ -1170,9 +1179,9 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
     // on, so the table keeps its shape across the frames between remeshes --
     // and across a remesh that returns early above, which is the ordinary
     // steady state rather than a fault.
-    const vr::Status textured =
-        texturer_->texture(device_mesh.value(), frame.depth, frame.depth_camera,
-                           /*occlusion_threshold=*/0.02f, metrics);
+    const vr::Status textured = texturer_->texture(
+        device_mesh.value(), frame.depth, frame.depth_camera,
+        occlusion_threshold_.load(std::memory_order_relaxed), metrics);
     if (!textured) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
@@ -1305,6 +1314,23 @@ void Fusion::release_through(std::uint64_t generation) {
   // released stays released, and a value older than the newest reported is
   // ignored rather than un-releasing anything.
   consumer_released_ = std::max(consumer_released_, generation);
+}
+
+bool Fusion::set_occlusion_threshold(float metres) {
+  // Refused rather than clamped, and the difference matters for a knob: a
+  // clamp turns a nonsense value into a silent one, so a caller that computed
+  // a NaN gets a working scan and no reason to look. `!(x >= 0)` rather than
+  // `x < 0` so NaN is rejected by the comparison rather than slipping through
+  // it, which is the same shape every other guard in this file uses.
+  if (!(metres >= 0.0f) || !std::isfinite(metres)) {
+    return false;
+  }
+  occlusion_threshold_.store(metres, std::memory_order_relaxed);
+  return true;
+}
+
+float Fusion::occlusion_threshold() const {
+  return occlusion_threshold_.load(std::memory_order_relaxed);
 }
 
 void Fusion::note_error(const std::string& message) {
