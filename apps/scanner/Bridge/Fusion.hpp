@@ -272,22 +272,88 @@ enum class AllocationStop : std::uint8_t {
 ///
 /// So the sample is taken where the frame is produced, not where the UI asks.
 ///
+/// Assembled field by field, which is the opposite of the rule the fuse loop
+/// follows for @ref FusionStats::extract ("recon's struct, whole -- not a
+/// field-by-field transcription"). That rule is about *transcription*: copying
+/// a struct one member at a time so a field added upstream goes missing. This
+/// is a **reduction** -- 240 of these are resident for the whole scan, so it
+/// carries what a chart plots and deliberately not the strings, the error
+/// counters, or the four separate arena figures beside them. A field added to
+/// `FusionStats` is meant to be absent here until someone decides a chart needs
+/// it; that is the point, not an oversight. Keep it that way, and keep the
+/// footprint in mind when adding one.
+///
 /// Deliberately **totals, not per-stage rows**. A stacked-by-stage history
 /// would need the row set carried per entry, and the question a history answers
-/// -- "which frame was slow, and was it host or device" -- is answered by two
-/// numbers. The current frame's per-stage split is already published separately
-/// (@ref FusionStats::stages); a reader wanting both looks at the spike here
-/// and the breakdown there. Grow this when a question needs it to, not before.
+/// -- "which frame was slow, and was it host or device" -- is answered by three
+/// numbers.
+///
+/// @warning The per-stage split for *this* sample is generally **not**
+///          retrievable. @ref FusionStats::stages holds one frame's rows and is
+///          overwritten every fused frame, so by the time a spike is on screen
+///          its breakdown is long gone -- the only sample whose rows can still
+///          be read is the newest, which is never the one anyone opened the
+///          chart for. Read that as the deliberate limit of this type: it says
+///          *which frame, and which of three coarse phases*. Anything finer
+///          needs the row set carried per entry, which is the cost this
+///          rejected. Do not document it as a two-place lookup; that lookup
+///          does not work.
 struct FrameSample {
   /// `FusionStats::frames_fused` as of this sample.
+  ///
+  /// Sequential by construction and therefore **not** a gap indicator: the
+  /// increment and this append are on one path, so every frame that fuses gets
+  /// an index and every frame that does not never reaches here. A capture
+  /// dropout draws as adjacent indices at normal spacing. @ref timestamp_ns is
+  /// the half that can actually show it.
   std::uint64_t frame = 0;
+  /// Monotonic nanoseconds (`steady_clock`) at which this sample was taken.
+  ///
+  /// Carried because @ref frame cannot express elapsed time and the gaps worth
+  /// seeing are exactly the ones that produce no frames: an ARKit interruption
+  /// stops the fuse loop without stopping the display link, and a chart indexed
+  /// by frame number alone renders the resumption as the very next frame.
+  std::uint64_t timestamp_ns = 0;
   /// Summed host milliseconds across the frame's stages, breakdown rows
   /// excluded -- they restate time the stage above already counted.
+  ///
+  /// @warning Not a host-only measurement. recon documents `StageRow::cpu_ms`
+  ///          as wall clock around a *blocking* submit, so for a compute stage
+  ///          this covers record, submit, the fence stall and device execution
+  ///          -- an end-to-end cost. It therefore already contains most of
+  ///          @ref device_ms, and stacking the two double-counts. Draw them
+  ///          overlaid, or draw the host figure alone; a "host vs device"
+  ///          split built by subtraction reads a device stall as host time.
   float host_ms = 0.0f;
   /// Summed device milliseconds. Breakdowns ARE counted here: a device span
   /// covers one dispatch and never the compaction the stage ran first, so
   /// skipping them deletes that time rather than deduplicating it.
+  ///
+  /// Meaningful only where @ref device_timing_valid is set. A row carrying no
+  /// GPU span contributes nothing, so a queue family that reports no timestamps
+  /// and a frame whose device did no work are both a flat zero here.
   float device_ms = 0.0f;
+  /// Whether any stage this frame carried a real device measurement.
+  ///
+  /// The distinction @ref device_ms cannot make on its own, and the one the
+  /// read-out already makes in text by printing `gpu -` rather than `0.00`. A
+  /// chart that omits this draws a zero device line on a device that was never
+  /// able to measure one, which reads as "all the time is host".
+  bool device_timing_valid = false;
+  /// Milliseconds the extract took, when one ran on this frame.
+  ///
+  /// Carried separately because it is **not** in @ref host_ms or
+  /// @ref device_ms: `MarchingCubes::extract_device` reports through
+  /// `vr::mesh::ExtractTimings` rather than the stage row set, so neither total
+  /// can see it. It is also the largest cost in a remesh frame -- 132.7 ms
+  /// against ~20 ms of fuse on this device's own measurement -- and with
+  /// @ref FusionConfig::remesh_every at its default of 1 it is on every frame.
+  /// A history without it is a history that cannot show the spike this type was
+  /// built for.
+  ///
+  /// Zero when this frame ran no extract, or when one ran and failed. Use
+  /// @ref frames_since_extract to tell those from a genuinely fast one.
+  float extract_ms = 0.0f;
   /// Live block-table occupancy at this frame.
   ///
   /// Paired with @ref occupancy_known for the reason @ref FrameTrace pairs its
@@ -298,12 +364,22 @@ struct FrameSample {
   float occupancy = 0.0f;
   /// Whether @ref occupancy was read or fabricated.
   bool occupancy_known = true;
-  /// Both stamped by the last *successful* remesh, not by this frame: a sample
-  /// between remeshes repeats the previous one's figures. See @ref
-  /// FusionStats::frames_since_extract, which is the freshness half of this
-  /// pair that a single sample cannot carry.
+  /// Both stamped by the last *successful* remesh. That is this frame's when
+  /// one ran and succeeded, and an older frame's whenever it skipped (the
+  /// renderer has not collected the last mesh) or the extract failed -- so
+  /// these two series flat-line while every other one keeps moving. @ref
+  /// frames_since_extract is how far back they actually reach.
   std::uint32_t triangles = 0;
   std::uint32_t active_blocks = 0;
+  /// Fused frames since the extract that stamped @ref triangles and
+  /// @ref active_blocks; `0` when this frame's own remesh refreshed them.
+  ///
+  /// Mirrored from @ref FusionStats::frames_since_extract rather than left to
+  /// the live read-out, because a history is read long after the fact: without
+  /// it a consumer taking `samples.last.triangles` cannot tell a steady scan
+  /// from an extract that has been failing for a minute, which is exactly the
+  /// regime worth catching.
+  std::uint64_t frames_since_extract = 0;
   /// Whether the scan took new geometry in on this frame, and if not, why.
   ///
   /// The cause rather than a bool, matching @ref FrameTrace beside it: the
@@ -776,11 +852,17 @@ class Fusion {
   /// one, where getting it wrong draws a plausible graph with a discontinuity
   /// somewhere in the middle.
   ///
-  /// @param out       Destination; may be null to query the count alone.
+  /// @param out       Destination, or null to query the available count without
+  ///                  writing anything.
   /// @param capacity  How many @p out holds. A smaller buffer receives the
   ///                  **newest** that many samples, since a history is read
   ///                  from the present backwards.
-  /// @return How many samples were written (or would be, for a null @p out).
+  /// @return How many samples were written: `0` for a zero @p capacity, and for
+  ///         a null @p out the count that *would* be written into an
+  ///         unconstrained buffer. Those two are deliberately not the same
+  ///         answer -- a caller passing a real pointer is told what it may now
+  ///         read, so `history(v.data(), v.size())` on an empty vector cannot
+  ///         come back with a count it would then read past.
   std::size_t history(FrameSample* out, std::size_t capacity) const;
 
   /// @brief The frame trace's five scalars, without @ref FusionStats' string.

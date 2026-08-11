@@ -160,15 +160,53 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 /// so a spike is only visible if it was sampled where it happened.
 ///
 /// Totals rather than per-stage rows -- see `FrameSample` for why -- so a chart
-/// answers "which frame was slow, and was it host or device", and the current
-/// breakdown answers "which stage".
+/// answers "which frame was slow, and was it fuse or mesh, host or device".
+///
+/// @warning It does **not** answer "which stage". @ref
+///          VolumetricRenderer.stageRows holds one frame's rows and is
+///          overwritten every fused frame, so the breakdown behind a spike in
+///          this history is gone long before the spike is drawn. Only the
+///          newest sample has a retrievable breakdown, and that is never the
+///          one being investigated.
 @interface VolumetricFrameSample : NSObject
-/// Fused-frame index, so gaps are visible rather than smoothed over.
+/// No sample can be constructed from Swift: a zeroed one plots as a real idle
+/// frame at the origin, which is indistinguishable from a measurement.
+- (instancetype)init NS_UNAVAILABLE;
+/// Fused-frame index. Dense and strictly sequential, so two samples can be
+/// aligned by subtraction.
+///
+/// @warning Not a gap indicator. It advances on exactly the path that appends a
+///          sample, so a frame that never fused never took an index -- a
+///          tracking dropout draws as adjacent frames at normal spacing. Use
+///          @ref timestampNs for elapsed time.
 @property(nonatomic, readonly) uint64_t frame;
+/// Monotonic nanoseconds at which the sample was taken, from the same clock
+/// across the whole history. The only field that can show an outage.
+@property(nonatomic, readonly) uint64_t timestampNs;
 /// Summed host milliseconds, breakdown rows excluded.
+///
+/// @warning Not host-only time, and not stackable with @ref deviceMs. recon
+///          measures a compute stage as wall clock around a *blocking* submit,
+///          so this covers record, submit, fence stall and device execution --
+///          it already contains most of `deviceMs`. Stacking the two
+///          double-counts; subtracting them reports a device stall as host
+///          overhead. Overlay them, or plot this one alone.
 @property(nonatomic, readonly) double hostMs;
 /// Summed device milliseconds, breakdown rows included.
+///
+/// Meaningful only where @ref deviceTimingValid is set -- a device that reports
+/// no timestamps and a frame that dispatched nothing are both `0.0` here.
 @property(nonatomic, readonly) double deviceMs;
+/// Whether any stage this frame carried a real device measurement.
+@property(nonatomic, readonly) BOOL deviceTimingValid;
+/// Milliseconds the mesh extract took, when one ran on this frame.
+///
+/// Not included in @ref hostMs or @ref deviceMs -- the extract reports through
+/// its own timings rather than the stage rows, so neither total can see it.
+/// It is also the dominant cost in a remesh frame, and a remesh runs on every
+/// fused frame by default. A "which frame was slow" chart that omits this is
+/// missing the usual answer.
+@property(nonatomic, readonly) double extractMs;
 /// Block-table occupancy in `[0, 1]` at this frame.
 ///
 /// Plot this only where @ref occupancyKnown is set: an unreadable figure is
@@ -177,10 +215,15 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 @property(nonatomic, readonly) double occupancy;
 /// Whether @ref occupancy was read or fabricated.
 @property(nonatomic, readonly) BOOL occupancyKnown;
-/// Both stamped by the last *successful* remesh rather than by this frame, so
-/// they repeat between remeshes -- a staircase, not a per-frame series.
+/// Both stamped by the last *successful* remesh: this frame's when one ran and
+/// succeeded, an older frame's when it skipped or the extract failed. They
+/// flat-line in that case while every neighbouring series keeps moving, so read
+/// @ref framesSinceExtract before treating a plateau as a finished surface.
 @property(nonatomic, readonly) uint32_t triangles;
 @property(nonatomic, readonly) uint32_t activeBlocks;
+/// Fused frames since the extract that stamped @ref triangles and
+/// @ref activeBlocks; `0` when this frame's own remesh refreshed them.
+@property(nonatomic, readonly) uint64_t framesSinceExtract;
 /// Whether the scan took new geometry in on this frame, and if not, why.
 @property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
 /// Whether @ref allocationStop is anything but `None`.
@@ -369,12 +412,23 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Sampled per fused frame on the fusion thread, so it carries the frames a
 /// poll of @ref stageRows steps over. Bounded; the oldest fall off.
 ///
-/// Allocated per read like @ref stageRows, and for the same reason it is
-/// affordable: the display refreshes a few times a second, not per frame. The
-/// *sampling* rate and the *display* rate are deliberately different, and this
-/// property is the seam between them.
+/// Allocated per read, and sized to what the ring actually holds rather than to
+/// its capacity, so an early scan does not marshal 240 slots to return four.
+/// Affordable because the display refreshes a few times a second, not per
+/// frame: the *sampling* rate and the *display* rate are deliberately
+/// different, and this property is the seam between them. A caller polling at
+/// frame rate is using the wrong seam.
 @property(nonatomic, readonly, copy)
     NSArray<VolumetricFrameSample*>* frameHistory;
+
+/// @brief The most entries @ref frameHistory can ever return.
+///
+/// Published because the alternative is every chart hard-coding the same
+/// number: one that drifts below the real bound silently plots the newest
+/// fraction of the ring against a full-width axis, which reads as a shorter
+/// scan rather than as a bug. The C++ constant this mirrors cannot be seen from
+/// Swift, so a bridged accessor is the only thing that actually prevents it.
+@property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
 
 /// @brief Record that the OS asked the app to free memory.
 ///

@@ -32,6 +32,12 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+// `frameHistory` sizes a std::vector to hand to Fusion::history. Named here
+// rather than left to Fusion.hpp's copy, for the reason recorded above
+// <cstdio>: a transitive include is not a dependency, and reordering the
+// imports above would turn this into a hard error in a file that already
+// learned that once.
+#include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
 #include "triangle_frag.spv.hpp"
@@ -579,10 +585,14 @@ struct RendererImpl {
     _frame = sample.frame;
     _hostMs = sample.host_ms;
     _deviceMs = sample.device_ms;
+    _timestampNs = sample.timestamp_ns;
+    _deviceTimingValid = sample.device_timing_valid ? YES : NO;
+    _extractMs = sample.extract_ms;
     _occupancy = sample.occupancy;
     _occupancyKnown = sample.occupancy_known ? YES : NO;
     _triangles = sample.triangles;
     _activeBlocks = sample.active_blocks;
+    _framesSinceExtract = sample.frames_since_extract;
     _allocationStop = allocation_stop_value(sample.allocation_stop);
     // Derived rather than carried, so the two cannot disagree about the same
     // frame the way two independently-assigned fields eventually do.
@@ -1338,13 +1348,30 @@ struct RendererImpl {
   return _impl->camera.distance();
 }
 
++ (NSUInteger)frameHistoryCapacity {
+  return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
+}
+
 - (NSArray<VolumetricFrameSample*>*)frameHistory {
-  // Sized from the fusion's own bound rather than a number repeated here: a
-  // local constant that drifted below it would silently truncate the history
-  // and look like a shorter scan.
-  std::vector<app::FrameSample> samples(app::Fusion::kHistoryCapacity);
+  // Asked how many there are before allocating room for them, rather than
+  // value-initialising the full ring on every poll: for most of a scan's first
+  // seconds -- and for the whole of a short one -- that zero-filled the other
+  // 236 slots to return four. The null-buffer query is the accessor's own
+  // documented way to ask.
+  //
+  // Two lock acquisitions, so the ring may gain entries between them. That is
+  // bounded rather than racy: `history` clamps its copy to the capacity handed
+  // in, so a grown ring simply yields its newest `available` samples and the
+  // buffer cannot be overrun. The alternative -- one call holding the lock
+  // across an allocation -- is the thing the fuse thread must not wait on.
+  //
+  // Still the fusion's bound and never a number repeated here: one that drifted
+  // below the real capacity would silently truncate and read as a shorter scan.
+  const std::size_t available = _impl->fusion.history(nullptr, 0);
+  std::vector<app::FrameSample> samples(available);
   const std::size_t count =
-      _impl->fusion.history(samples.data(), samples.size());
+      available == 0 ? 0
+                     : _impl->fusion.history(samples.data(), samples.size());
   NSMutableArray<VolumetricFrameSample*>* out =
       [NSMutableArray arrayWithCapacity:count];
   for (std::size_t i = 0; i < count; ++i) {

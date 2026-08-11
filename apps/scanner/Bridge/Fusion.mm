@@ -143,6 +143,14 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     std::lock_guard<std::mutex> lock(mutex_);
     stats_ = FusionStats{};
     stats_.mesh_slots = config.mesh_slots;
+    // The frame history goes with them, and it is the one that reads worst if
+    // it does not: `frames_fused` restarts at zero just above, so a ring left
+    // full would hand a chart the last scan's 240 samples carrying *higher*
+    // frame indices than the live ones arriving behind them -- a series that
+    // runs backwards in the middle, with a timestamp gap the length of however
+    // long the app sat between scans. Only the counter needs clearing; the
+    // entries themselves become unreachable once it is zero.
+    history_next_ = 0;
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
@@ -844,10 +852,16 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // meshing had not been added to yet -- the spike this ring exists to catch,
   // taken just before the thing that causes it.
   //
-  // Unconditional, unlike that publish: one entry per fused frame is what makes
-  // `frame` an index a gap is visible in. With measurement off the two totals
-  // are the zero `stages` still holds, which reads the same way `stage_count`
-  // does -- no timing rather than a fast frame.
+  // Unconditional, unlike that publish: one entry per fused frame is what keeps
+  // `frame` a dense index, so a consumer can align two samples by subtracting
+  // them. It is emphatically not a gap indicator -- it is incremented on this
+  // same path and so never skips a value; `timestamp_ns` is what carries the
+  // time a stopped fuse loop spent stopped.
+  //
+  // With measurement off the stage totals are the zero `stages` still holds,
+  // which reads the same way `stage_count` does -- no timing rather than a fast
+  // frame. `extract_ms` is unaffected: it is timed by `remesh` directly and
+  // does not depend on the switch.
   //
   // Its own critical section, not a widening of either neighbour: see the note
   // above on holding this lock across an extract.
@@ -864,16 +878,44 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // re-deriving it here and getting it differently.
     //
     // Both cover allocate, resize, integrate and texture. They do *not* cover
-    // the extract, which reports through `ExtractTimings` and not the row set
-    // -- so the largest cost in a remesh frame is absent from these two
-    // figures. `FusionStats::extract_ms` is where it is.
+    // the extract, which reports through `ExtractTimings` and not the row set,
+    // so it is carried alongside as its own figure rather than left out of the
+    // history altogether -- see `sample.extract_ms` below.
     sample.host_ms = static_cast<float>(stages.total_cpu_ms());
     sample.device_ms = static_cast<float>(stages.total_gpu_ms());
+    // Whether that device figure is a measurement or an absence. `total_gpu_ms`
+    // skips every row without a span, so a queue family that reports no
+    // timestamps sums to the same 0.0 as a frame that dispatched nothing, and
+    // only this flag separates them. Same rule the read-out follows when it
+    // prints `gpu -` instead of `0.00`.
+    for (const vr::StageRow& row : stages.rows()) {
+      if (row.has_gpu) {
+        sample.device_timing_valid = true;
+        break;
+      }
+    }
+    // The extract, which neither total above can see. This is the figure the
+    // ring was built for: at `remesh_every` 1 it lands on every frame, and it
+    // is an order of magnitude larger than the fuse it sits beside.
+    //
+    // Read after the remesh, so on a frame that extracted this is that
+    // extract's own cost. `frames_since_extract` below is what says whether it
+    // is -- remesh leaves both standing when it skips or fails.
+    sample.extract_ms = stats_.extract_ms;
+    sample.frames_since_extract = stats_.frames_since_extract;
     sample.occupancy = occupancy;
     sample.occupancy_known = occupancy_known;
     sample.allocation_stop = allocation_stop;
     sample.triangles = stats_.triangles;
     sample.active_blocks = stats_.extract.active_blocks;
+    // Stamped last and under the same lock, because the gaps worth seeing are
+    // the ones that produce no frames at all and `frame` cannot show them: it
+    // is incremented on this same path, so it never skips a value however long
+    // the fuse loop was stopped.
+    sample.timestamp_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch())
+            .count());
   }
 
   // --- Dirty-block survey ---------------------------------------------------
@@ -1211,8 +1253,17 @@ std::size_t Fusion::history(FrameSample* out, std::size_t capacity) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::size_t written = static_cast<std::size_t>(
       std::min<std::uint64_t>(history_next_, kHistoryCapacity));
-  if (out == nullptr || capacity == 0) {
+  // The availability query. Separated from the zero-capacity case below rather
+  // than sharing its return, because the two ask different questions: a null
+  // pointer asks how many there are, while a real pointer is told how many it
+  // may now read. Conflating them answered `history(v.data(), v.size())` on an
+  // empty vector with a count of up to kHistoryCapacity, into a buffer nothing
+  // had been written to.
+  if (out == nullptr) {
     return written;
+  }
+  if (capacity == 0) {
+    return 0;
   }
   // A short buffer takes the NEWEST samples: a history is read from the present
   // backwards, and handing back the oldest would show a chart that stops
