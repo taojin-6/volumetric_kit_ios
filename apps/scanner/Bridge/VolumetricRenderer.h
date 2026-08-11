@@ -63,8 +63,8 @@ FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 /// angle any of them implies: that is one constant,
 /// `kSensorBasisOrientation` in VolumetricRenderer.mm, and it is the only place
 /// in the app where an orientation becomes an angle. Read it before changing
-/// anything here — the derivation, the two conflicting device sightings and the
-/// check that separates them are all recorded on it.
+/// anything here — the derivation, the two conflicting device sightings, and
+/// the pair of measurements that finally settled it are all recorded on it.
 ///
 /// The raw values are consecutive quarter turns, in the order below, and that
 /// is load-bearing: the turn is computed by subtracting two of them.

@@ -403,15 +403,35 @@ struct FrameTrace {
 /// they cannot both be describing portrait. They reconcile if the first was
 /// taken in landscape, which both readings agree the earlier build had wrong.
 ///
-/// The check that falsifies this: **portrait and at least one landscape**.
-/// Portrait alone cannot separate a wrong zero from a wrong sign -- they
-/// predict the same thing there and differ only in landscape. Under this
-/// constant every orientation is upright; under a mere sign flip portrait comes
-/// up and both landscapes stay upside down. Read `orient` off the status
-/// read-out while checking, because a renderer that was never told its
-/// orientation looks exactly like a wrong zero on screen. Info.plist declares
+/// **MEASURED**, 2026-08-10, on an iPad Pro 11-inch (M5): landscape-right and
+/// portrait both render upright, with `orient` read off the console at each to
+/// confirm the renderer held the value being tested. That is the first time any
+/// part of this mapping has been settled by anything but a reading of the
+/// documentation, and it took two orientations because one cannot do it:
+///
+///   - **Landscape-right pins the zero.** It is the orientation this constant
+///     names, so the turn applied there is 0 -- and being upright is therefore
+///     the statement that the sensor basis and the viewport genuinely coincide
+///     here. The build before this one turned 180 degrees at this orientation
+///     and was upside down, which is the same observation from the other side.
+///   - **Portrait pins the step.** It is the *only* orientation that can: the
+///     turn is +-90 x (raw - 2), and at both landscapes that lands on 0 or 180,
+///     each its own negation. So the two landscapes look identical whichever
+///     way the step runs, and a sign error there is invisible by construction.
+///     Portrait is where the two differ, and it came up upright.
+///
+/// Two points determine the line, so landscape-left (raw 0, half a turn)
+/// follows from these rather than resting on the prose above -- it is computed
+/// by the same single expression, from a zero and a step that were both
+/// measured. Worth a glance, not worth blocking on. Info.plist declares
 /// Portrait, LandscapeLeft and LandscapeRight only, so raw 3 is unreachable and
-/// only three of the four values can be tested.
+/// cannot be tested at all.
+///
+/// One caveat left standing: this was measured on an iPad. `ARCamera.transform`
+/// documents its basis without reference to the device, and the two readings
+/// above are device-independent, so there is no reason to expect an iPhone to
+/// differ -- but the sighting that sent this the wrong way in the first place
+/// may well have been taken on one, and nobody has checked.
 constexpr VolumetricViewOrientation kSensorBasisOrientation =
     VolumetricViewOrientationLandscapeRight;
 
