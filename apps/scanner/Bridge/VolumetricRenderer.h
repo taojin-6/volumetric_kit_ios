@@ -102,6 +102,10 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 ///       early-returned. Nothing on this object can tell the three apart --
 ///       recon's own rule is that a caller who must know asks the device.
 @interface VolumetricStageRow : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init. A zeroed row would also plot
+/// as a real stage that measured 0.00 ms, which is the one reading this file
+/// takes trouble elsewhere to keep distinguishable from "not measured".
+- (instancetype)init NS_UNAVAILABLE;
 /// Stage label; a breakdown of the row above it is prefixed with spaces.
 ///
 /// @warning A breakdown's `cpuMs` is **contained in** the `cpuMs` of the row
@@ -241,6 +245,10 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 
 /// @brief One labelled figure.
 @interface VolumetricStatRow : NSObject
+/// Unavailable for the reason @ref VolumetricRenderer's is: the properties
+/// below are `nonnull`, and a zeroed instance built from Swift would hand it a
+/// null `String` that traps at the first use rather than at the mistake.
+- (instancetype)init NS_UNAVAILABLE;
 @property(nonatomic, readonly, copy) NSString* label;
 @property(nonatomic, readonly, copy) NSString* value;
 /// Semantic, not decorative -- set only where a reader is meant to act.
@@ -256,8 +264,49 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 /// log line is rendered *from* these, so the screen and the transcript cannot
 /// drift apart.
 @interface VolumetricStatSection : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init.
+- (instancetype)init NS_UNAVAILABLE;
 @property(nonatomic, readonly, copy) NSString* title;
 @property(nonatomic, readonly, copy) NSArray<VolumetricStatRow*>* rows;
+@end
+
+/// @brief Everything the dashboard draws, from **one** read of each source.
+///
+/// The panel used to assemble itself from the individual properties above, and
+/// each of those takes its own snapshot: five separate `FusionStats` copies and
+/// three `task_info` traps per tick, with the fuse thread writing between them.
+/// That is not a theoretical race. The headline meter and the Volume card are
+/// the same fraction from two instants, so one can read 84% beside the other
+/// reading 86% with allocation stopped; the pipeline bars can belong to a frame
+/// the section list does not describe.
+///
+/// So the whole panel is built here under one `FusionStats` copy and one
+/// `MemoryBudget` query, and the figures on it are consistent by construction
+/// rather than by being fast enough not to notice. The individual properties
+/// remain for callers that want one figure and do not care.
+@interface VolumetricDashboardSnapshot : NSObject
+/// Unavailable; see @ref VolumetricStatRow.init.
+- (instancetype)init NS_UNAVAILABLE;
+/// The per-stage rows, end to end.
+@property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stages;
+/// The grouped figures, in the order they are meant to be read.
+@property(nonatomic, readonly, copy) NSArray<VolumetricStatSection*>* sections;
+/// The fused-frame history, oldest first.
+@property(nonatomic, readonly, copy) NSArray<VolumetricFrameSample*>* history;
+/// Live block-table occupancy -- the same figure the Volume section prints,
+/// from the same copy, so the headline and the card cannot disagree.
+@property(nonatomic, readonly) double occupancy;
+/// Whether @ref occupancy was read or fabricated. A fabricated 1.0 must not
+/// draw as a full volume.
+@property(nonatomic, readonly) BOOL occupancyKnown;
+@property(nonatomic, readonly) uint32_t triangles;
+/// Why the frame took no new geometry in, if it did not.
+@property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
+/// The stop rendered for a reader, or nil when nothing stopped. Carries the
+/// *cause*: the advice for a full volume is actively wrong for the others.
+@property(nonatomic, readonly, copy, nullable) NSString* allocationStopReason;
+@property(nonatomic, readonly) uint64_t memoryFootprintBytes;
+@property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
@@ -415,6 +464,14 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// content before it was flattened.
 @property(nonatomic, readonly, copy)
     NSArray<VolumetricStatSection*>* statSections;
+
+/// @brief The whole panel, from one read of each source.
+///
+/// What a UI should call. Assembling the same panel from @ref statSections,
+/// @ref stageRows, @ref frameHistory and the memory properties takes five
+/// `FusionStats` copies and three `task_info` traps, which the fuse thread
+/// writes between -- see @ref VolumetricDashboardSnapshot.
+@property(nonatomic, readonly) VolumetricDashboardSnapshot* dashboardSnapshot;
 
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 

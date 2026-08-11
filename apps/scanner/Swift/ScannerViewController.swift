@@ -116,10 +116,20 @@ final class ScannerViewController: UIViewController {
     // took whatever was last in it. SwiftUI re-renders only what changed and
     // sizes itself inside the safe area.
     //
-    // Pinned top-leading and deliberately NOT filling the view: the rest of the
-    // screen is the reconstruction, and the orbit/pan/zoom recognizers live on
-    // `metalView` underneath. A full-bleed host would swallow them -- the same
-    // reason a scroll view was rejected for the label it replaces.
+    // Pinned across the width and, expanded, 55% of the safe area: the rest of
+    // the screen is the reconstruction, and the orbit/pan/zoom recognizers live
+    // on `metalView` underneath.
+    //
+    // Which is the whole of what this comment used to claim, and it was not
+    // true. The host is a sibling above `metalView`, so it took every touch in
+    // its rectangle -- the camera was dead across the top half of the screen on
+    // first launch, including the double-tap that refollows. Two things make it
+    // true now: the container below claims only what SwiftUI actually
+    // hit-tests, and `DashboardView` marks its background non-interactive so
+    // there is something to fall through. Expanded, the scroll area still owns
+    // its own rect -- it is a scrolling surface and a drag there should scroll
+    // it -- so the reconstruction gets the lower 45% and, collapsed, all but
+    // the headline.
     let host = UIHostingController(
       rootView: DashboardView(model: dashboard) { [weak self] expanded in
         // The height constraint follows the toggle. Collapsed, the body is a
@@ -131,7 +141,30 @@ final class ScannerViewController: UIViewController {
     host.view.backgroundColor = .clear
     host.view.translatesAutoresizingMaskIntoConstraints = false
     addChild(host)
-    view.addSubview(host.view)
+    // Inside a passthrough container, which is what makes the sentence above
+    // true rather than merely intended.
+    //
+    // The host is a sibling of `metalView` and sits above it in z-order, so any
+    // touch it claims is one the camera recognizers never see -- and it is
+    // pinned leading AND trailing across 55% of the safe area. Orbit, pan, zoom
+    // and double-tap-to-refollow were all dead across the top half of the
+    // screen, on first launch, with the panel's own comment claiming the
+    // opposite. The container reports a touch as "inside" only where SwiftUI
+    // actually hit-tests something -- a card, a chip, the chevron, the scroll
+    // area -- so the panel's empty regions and its margins fall through to the
+    // reconstruction underneath. The material background is explicitly
+    // non-interactive in DashboardView for this to have anything to fall
+    // through from.
+    let container = PassthroughContainer()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(host.view)
+    view.addSubview(container)
+    NSLayoutConstraint.activate([
+      host.view.topAnchor.constraint(equalTo: container.topAnchor),
+      host.view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      host.view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      host.view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+    ])
     host.didMove(toParent: self)
     dashboardHost = host
     // A DEFINITE size, which the first cut did not give it.
@@ -143,14 +176,14 @@ final class ScannerViewController: UIViewController {
     // height is a fraction of the safe area, so the dashboard is as wide as the
     // screen allows and the reconstruction keeps the rest.
     NSLayoutConstraint.activate([
-      host.view.topAnchor.constraint(
+      container.topAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
-      host.view.leadingAnchor.constraint(
+      container.leadingAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 10),
-      host.view.trailingAnchor.constraint(
+      container.trailingAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
     ])
-    expandedHeight = host.view.heightAnchor.constraint(
+    expandedHeight = container.heightAnchor.constraint(
       equalTo: view.safeAreaLayoutGuide.heightAnchor,
       multiplier: dashboardHeightFraction)
     // Activated by the view's own onAppear, so the stored expanded/collapsed
@@ -407,6 +440,12 @@ final class ScannerViewController: UIViewController {
   private func adopt(_ brought: VolumetricRenderer) {
     renderer = brought
     cameraGestures?.renderer = brought
+    // Cleared, because bring-up has a documented retry path: a first layout
+    // reporting a zero dimension fails, `onDrawableSizeChange` tries again, and
+    // the second attempt succeeds. Nothing used to clear this, so the banner
+    // from the failed attempt stayed over a working dashboard for the rest of
+    // the process -- a red alert reporting a state the app had recovered from.
+    dashboard.failure = nil
     deviceSummary = """
       \(brought.deviceName)
       Vulkan \(brought.apiVersion) via MoltenVK
@@ -487,34 +526,57 @@ final class ScannerViewController: UIViewController {
       : String(
         format: "manual  %.2f m from pivot  (double-tap to follow)",
         renderer.cameraDistance)
+    // Read ONCE, here, and used for both the panel and the transcript.
+    //
+    // `ARSessionController.tracking` takes its lock per access and ARKit writes
+    // at 60 Hz on sessionQueue, so reading it for the label and again for the
+    // tone could straddle an update and render "limited (relocalizing)" in the
+    // healthy green -- exactly what TrackingReport is a value type to prevent,
+    // and its doc says so.
+    let tracking = arSession.tracking
+    let s = arSession.capture.stats
+
+    // Built as lines, once, then joined for stdout -- rather than appended to a
+    // string the panel cannot read. The `Capture` card rendered an array
+    // nothing ever assigned, so every figure below reached the transcript and
+    // nothing else; and the two ARKit fault lines collapsed into a boolean, so
+    // a device without LiDAR showed "Paused 00:00 / 0.00 M tris" indefinitely
+    // with nothing on screen saying why.
+    let renderLines = [
+      "drawable  \(Int(size.width)) x \(Int(size.height)) px",
+      "orient    \(orientationName(renderer.viewOrientation))",
+      "presented \(renderer.framesPresented)",
+      "camera    \(camera)",
+    ]
+    var captureLines: [String] = []
+
     var text = """
       \(deviceSummary)
-      drawable  \(Int(size.width)) x \(Int(size.height)) px
-      orient    \(orientationName(renderer.viewOrientation))
-      presented \(renderer.framesPresented)
-      camera    \(camera)
+      \(renderLines.joined(separator: "\n"))
       \(String(format: "%.0f", fps)) fps
 
       """
 
     if let reason = arSession.unsupportedReason {
+      captureLines.append("ARKit: \(reason)")
       text += "ARKit: \(reason)"
     } else {
       if let failure = arSession.sessionError {
         // Alongside the counters, not instead of them: a session can fail and
         // recover, and replacing the read-out meant a single transient
         // interruption hid capture for the rest of the run.
+        captureLines.append("ARKit session failed: \(failure)")
         text += "ARKit session failed: \(failure)\n\n"
       }
       // Ahead of the counters, because it is the answer to "why is the frame
       // count rising and nothing appearing": frames arriving while ARKit does
       // not trust its own pose are withheld from fusion on purpose.
-      let t = arSession.tracking
       let withheld =
-        t.framesWithheld > 0 ? "  (\(t.framesWithheld) withheld)" : ""
-      text += "tracking  \(t.description)\(withheld)\n\n"
+        tracking.framesWithheld > 0
+        ? "  (\(tracking.framesWithheld) withheld)" : ""
+      captureLines.append("tracking  \(tracking.description)\(withheld)")
+      text += "tracking  \(tracking.description)\(withheld)\n\n"
 
-      let s = arSession.capture.stats
       // Formatted up front rather than inside the literal: a `\`-continuation
       // inside a \(...) interpolation is not something the Swift parser accepts.
       let kept = String(format: "%.0f%%", s.confidence_kept * 100)
@@ -545,6 +607,15 @@ final class ScannerViewController: UIViewController {
       let counts =
         "\(s.frames_submitted) in / \(s.frames_polled) polled"
         + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
+      captureLines += [
+        "frames    \(counts)",
+        "depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)",
+        "colour    \(s.color_width) x \(s.color_height)",
+        "encoding  \(encoding)",
+        "intrinsic \(intrinsics)",
+        "position  \(position) m",
+        "convert   \(convert)",
+      ]
       text += """
         \(renderer.fusionSummary)
 
@@ -558,51 +629,78 @@ final class ScannerViewController: UIViewController {
           convert   \(convert)
         """
     }
-    // Publish what the dashboard draws. Read from the same renderer snapshot
-    // the text above was built from, so the two cannot disagree about a frame.
-    dashboard.scanning =
-      arSession.unsupportedReason == nil
-      && arSession.sessionError == nil
+    // Publish what the dashboard draws, from ONE read of each source.
+    //
+    // `dashboardSnapshot` exists for this. Building the panel from
+    // `statSections` + `stageRows` + `frameHistory` + the memory properties took
+    // five FusionStats copies and three task_info traps per tick, which the fuse
+    // thread writes between: the headline meter could read 84% beside a Volume
+    // card reading 86% with allocation stopped, and the pipeline bars could
+    // belong to a frame the sections did not describe.
+    let snapshot = renderer.dashboardSnapshot
+
+    // From this object's own state, not from ARKit's error fields. Those say
+    // whether the session is healthy; this row claims the capture + fuse + draw
+    // loop is running, and `isCapturing` is the field that means that. On a
+    // VK_ERROR_DEVICE_LOST the old form left a red recording dot and "Scanning"
+    // frozen on screen with nothing capturing, fusing or drawing; a non-fatal
+    // didFailWithError flipped it to "Paused" while fps and triangles climbed.
+    dashboard.scanning = isCapturing && !renderFailed
     dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
     dashboard.fps = fps
-    dashboard.trackingText = arSession.tracking.description
+    dashboard.trackingText = tracking.description
     // "normal" is ARKit's own word for a usable pose; anything else -- limited,
     // initializing, relocalizing -- means frames are being withheld from
     // fusion, which is exactly when this chip should stop being quiet.
-    dashboard.trackingHealthy = arSession.tracking.description == "normal"
-    dashboard.framesIn = Int(arSession.capture.stats.frames_submitted)
-    dashboard.framesDropped = Int(arSession.capture.stats.frames_dropped)
-    dashboard.memoryUsedBytes = renderer.memoryFootprintBytes
+    dashboard.trackingHealthy = tracking.description == "normal"
+    dashboard.framesIn = Int(s.frames_submitted)
+    dashboard.framesDropped = Int(s.frames_dropped)
+    dashboard.memoryUsedBytes = snapshot.memoryFootprintBytes
     // The GPU working set, not the jetsam limit: the jetsam ceiling on this
     // hardware sits above installed RAM, so showing it reports headroom that
     // does not exist. See VolumetricRenderer.gpuWorkingSetBytes.
-    dashboard.memoryCeilingBytes = renderer.gpuWorkingSetBytes
-    dashboard.stages = renderer.stageRows.map {
+    dashboard.memoryCeilingBytes = snapshot.gpuWorkingSetBytes
+    dashboard.stages = snapshot.stages.map {
       StageBar(
         id: $0.name, name: $0.name, hostMs: $0.cpuMs,
         deviceMs: $0.gpuMs, hasGPU: $0.hasGpu)
     }
-    let samples = renderer.frameHistory
-    dashboard.history = samples.map {
-      FrameSample(id: $0.frame, hostMs: $0.hostMs, deviceMs: $0.deviceMs)
+    dashboard.history = snapshot.history.map {
+      FrameSample(
+        id: $0.frame, hostMs: $0.hostMs, deviceMs: $0.deviceMs,
+        // The meshing cost, which neither total above covers. Dropping it made
+        // the chart plot the fuse alone and miss every remesh spike -- the one
+        // thing the ring was built to show.
+        extractMs: $0.extractMs, deviceTimingValid: $0.deviceTimingValid)
     }
-    if let latest = samples.last {
-      dashboard.triangles = Int(latest.triangles)
-      dashboard.occupancy = latest.occupancy
-      dashboard.allocationStopped = latest.allocationStopped
-    }
+    // From the live snapshot, NOT from `history.last`. The history is appended
+    // only by a frame that succeeds all the way through, while occupancy and
+    // the stop cause are published before the allocate- and integrate-failure
+    // returns: on a run of integrate failures the Volume card advanced and
+    // turned critical every frame while the headline meter stayed frozen at the
+    // last fused frame and the banner never appeared at all.
+    dashboard.triangles = Int(snapshot.triangles)
+    dashboard.occupancy = snapshot.occupancy
+    dashboard.occupancyKnown = snapshot.occupancyKnown
+    dashboard.allocationStopReason = snapshot.allocationStopReason
     // The grouping is the bridge's, not this file's -- the same sections the
     // log line is rendered from, so screen and transcript cannot drift.
-    dashboard.groups = renderer.statSections.map { s in
+    dashboard.groups = snapshot.sections.map { s in
       StatGroup(
         id: s.title,
         items: s.rows.map {
           StatItem(label: $0.label, value: $0.value, tone: $0.tone)
         })
     }
-    // True prose rather than figures, so these stay as lines.
-    dashboard.deviceLines = deviceSummary.components(separatedBy: "\n")
-      .filter { !$0.isEmpty }
+    // True prose rather than figures, so these stay as lines. The render state
+    // joins the device identity: the camera mode in particular earns its place
+    // because a manual camera pointed away from the scan and a scan that
+    // stopped producing geometry look identical on screen -- and the only text
+    // documenting double-tap-to-refollow lives on that line.
+    dashboard.deviceLines =
+      deviceSummary.components(separatedBy: "\n").filter { !$0.isEmpty }
+      + renderLines
+    dashboard.captureLines = captureLines
 
     // The text survives for stdout alone: `devicectl process launch --console`
     // is how every device run in this project has been read, and the dashboard
@@ -657,5 +755,33 @@ private final class DisplayLinkProxy: NSObject {
 
   @objc func tick() {
     owner?.tick()
+  }
+}
+
+/// A view that claims only the touches its content actually uses.
+///
+/// The dashboard is a sibling of `metalView`, above it in z-order and pinned
+/// across the full width and 55% of the safe area. UIKit hit-testing stops at
+/// the topmost view whose `point(inside:)` says yes, so with the default
+/// implementation every touch in that region belonged to the panel and the
+/// camera recognizers -- orbit, pan, zoom, double-tap-to-refollow -- were dead
+/// across the top half of the screen from first launch.
+///
+/// Asking the subtree instead of assuming: a point is inside only where the
+/// hosted SwiftUI hierarchy hit-tests something real. Cards, chips, the chevron
+/// and the scroll area answer yes and behave normally; the panel's margins and
+/// its empty regions answer no and the touch reaches the reconstruction. This
+/// only has anything to fall through from because `DashboardView` marks its
+/// material background `allowsHitTesting(false)` -- a full-bleed background
+/// that hit-tests is indistinguishable from the default behaviour this
+/// replaces.
+private final class PassthroughContainer: UIView {
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    for sub in subviews {
+      if sub.hitTest(convert(point, to: sub), with: event) != nil {
+        return true
+      }
+    }
+    return false
   }
 }

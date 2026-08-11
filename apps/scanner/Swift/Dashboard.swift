@@ -44,9 +44,25 @@ struct FrameSample: Identifiable {
   let id: UInt64
   let hostMs: Double
   let deviceMs: Double
-  /// The device span sits *inside* the host span, so the frame's cost is the
+  /// The meshing cost, which is **not** in either figure above.
+  ///
+  /// `hostMs`/`deviceMs` are `StageMetrics` totals, and the extract does not
+  /// report there -- it reports through `ExtractTimings`. It is also the
+  /// dominant cost of a remesh frame (~132.7 ms against ~20 ms of fuse on this
+  /// device's own measurement) and `remesh_every` defaults to 1, so leaving it
+  /// out made the chart plot roughly an eighth of the frame it claimed to
+  /// show -- and hid the exact spike the ring was built to catch.
+  let extractMs: Double
+  /// Whether `deviceMs` is a measurement or an absence. `total_gpu_ms` skips
+  /// rows without a span, so a queue family that reports no timestamps sums to
+  /// the same 0.0 as a frame that dispatched nothing.
+  let deviceTimingValid: Bool
+  /// The fuse half. The device span sits *inside* the host span, so this is the
   /// larger of the two and never their sum.
-  var totalMs: Double { max(hostMs, deviceMs) }
+  var fuseMs: Double { max(hostMs, deviceMs) }
+  /// The whole frame. The extract runs *after* the fuse and is measured
+  /// separately, so it adds rather than overlapping.
+  var totalMs: Double { fuseMs + extractMs }
 }
 
 /// A labelled figure, mirrored out of `VolumetricStatRow`.
@@ -78,7 +94,16 @@ final class DashboardModel: ObservableObject {
 
   @Published var triangles: Int = 0
   @Published var occupancy: Double = 0
-  @Published var allocationStopped = false
+  /// Whether `occupancy` is a reading rather than a fallback. The fusion forces
+  /// it to 1.0 when `load_factor` fails so the guard refuses, and drawing that
+  /// as a full meter reports a full volume on one that may be nearly empty.
+  @Published var occupancyKnown = true
+  /// Why new geometry stopped going in, phrased as what to do about it, or nil
+  /// when it has not. Carries the *cause* -- the advice for a full volume is
+  /// actively wrong for the other two the fusion distinguishes.
+  @Published var allocationStopReason: String?
+
+  var allocationStopped: Bool { allocationStopReason != nil }
 
   @Published var trackingText = ""
   @Published var trackingHealthy = true
@@ -126,12 +151,26 @@ struct DashboardView: View {
       // seeing without deciding to look.
       headline.padding(12)
 
+      // OUTSIDE the collapse, deliberately. `expanded` is @AppStorage, so it
+      // persists across launches: with the banners inside it, one collapse
+      // meant a later run could lose the renderer, set `failure`, and show a
+      // headline reading "Paused 00:00 / 0.00 M tris" with nothing red on
+      // screen and no way to learn why short of expanding a panel the reader
+      // has no reason to suspect. A banner that a saved preference can hide is
+      // not a banner. Same for the volume stop, whose only other collapsed-state
+      // signal is the occupancy meter.
+      if model.allocationStopReason != nil || model.failure != nil {
+        VStack(alignment: .leading, spacing: 8) {
+          if let reason = model.allocationStopReason { volumeStopped(reason) }
+          if let failure = model.failure { failureBanner(failure) }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+      }
+
       if expanded {
         ScrollView {
           VStack(alignment: .leading, spacing: 10) {
-            if model.allocationStopped { volumeFull }
-            if let failure = model.failure { failureBanner(failure) }
-
             LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
               Card("Timeline") { timeline }
               // One card per section, and no card built outside this loop.
@@ -164,81 +203,146 @@ struct DashboardView: View {
     }
     .onAppear { onExpandedChange(expanded) }
     .onChange(of: expanded) { onExpandedChange($0) }
-    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    // Both non-interactive, deliberately. The panel sits over the
+    // reconstruction and the orbit/pan/zoom recognizers live on the view
+    // underneath; a full-bleed background that hit-tests claims every touch in
+    // the panel's rectangle whether or not anything is there to receive it,
+    // which is what killed the camera across the top half of the screen. With
+    // these transparent to touches, PassthroughContainer can ask the subtree
+    // what it actually wants and let the rest through.
+    .background(
+      RoundedRectangle(cornerRadius: 16)
+        .fill(.ultraThinMaterial)
+        .allowsHitTesting(false)
+    )
     .overlay(
       RoundedRectangle(cornerRadius: 16)
         .strokeBorder(Color.white.opacity(0.10))
+        .allowsHitTesting(false)
     )
   }
 
   // The one line that has to be readable without looking: capturing or not,
   // how much surface, how full the volume is.
+  //
+  // Two layouts, because one does not fit. Laid out end to end at default text
+  // size these pieces want roughly 660 pt -- the status pair, a 34 pt triangle
+  // count, the meter, and a tracking chip whose longest real value is "limited
+  // (insufficient features)" -- against the ~373 pt a portrait iPhone offers.
+  // SwiftUI resolves that by compressing the most compressible child, and the
+  // meter was it: a GeometryReader accepts a zero-width proposal, so the one
+  // element carrying the 85% threshold silently became 0 pt wide while the
+  // labels merely truncated. `ViewThatFits` picks the stacked layout instead,
+  // and the meter now declares a minimum width so the wide variant honestly
+  // reports that it does not fit.
   private var headline: some View {
-    HStack(alignment: .center, spacing: 14) {
-      HStack(spacing: 7) {
-        Circle()
-          .fill(model.scanning ? Color.red : Color.secondary)
-          .frame(width: 8, height: 8)
-        Text(model.scanning ? "Scanning" : "Paused")
-          .font(.title3.weight(.semibold))
-        Text(Self.clock(model.elapsed))
-          .font(.title3.monospacedDigit())
-          .foregroundStyle(.secondary)
-      }
-
-      Divider().frame(height: 22)
-
-      HStack(alignment: .firstTextBaseline, spacing: 5) {
-        Text(Self.millions(model.triangles))
-          .font(.system(size: 34, weight: .bold, design: .rounded))
-          .monospacedDigit()
-        Text("M tris").font(.footnote).foregroundStyle(.secondary)
-      }
-
-      VStack(alignment: .leading, spacing: 3) {
-        Meter(fraction: model.occupancy, threshold: 0.85)
-        Text("volume \(Int(model.occupancy * 100))% full")
-          .font(.footnote).foregroundStyle(.secondary)
-      }
-      .frame(maxWidth: 150)
-
-      Spacer(minLength: 0)
-
-      HStack(spacing: 6) {
-        Chip(model.trackingText, tone: model.trackingHealthy ? .good : .warn)
-        Chip("\(Int(model.fps)) fps", tone: .neutral)
-        if model.dropFraction > 0.2 {
-          Chip("\(Int(model.dropFraction * 100))% dropped", tone: .warn)
+    ViewThatFits(in: .horizontal) {
+      HStack(alignment: .center, spacing: 14) {
+        status
+        Divider().frame(height: 22)
+        triangleCount
+        occupancy.frame(maxWidth: 150)
+        Spacer(minLength: 0)
+        HStack(spacing: 6) {
+          chips
+          expandButton
         }
-        Button {
-          withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
-        } label: {
-          Image(
-            systemName: expanded
-              ? "chevron.up.circle.fill"
-              : "chevron.down.circle.fill"
-          )
-          .font(.title3)
-          .symbolRenderingMode(.hierarchical)
+      }
+
+      VStack(alignment: .leading, spacing: 8) {
+        HStack(alignment: .center, spacing: 12) {
+          status
+          Spacer(minLength: 0)
+          expandButton
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
-        .accessibilityLabel(expanded ? "Hide details" : "Show details")
+        HStack(alignment: .center, spacing: 12) {
+          triangleCount
+          Spacer(minLength: 0)
+          chips
+        }
+        occupancy
       }
     }
     .padding(.horizontal, 4)
   }
 
-  // Stated as an instruction. The meter already says 85%; what a percentage
-  // cannot say is that new geometry has stopped going in, or what to do.
-  private var volumeFull: some View {
-    Banner(tint: .orange, icon: "exclamationmark.triangle.fill") {
-      Text("The volume is full.").font(.footnote.weight(.semibold))
+  private var status: some View {
+    HStack(spacing: 7) {
+      Circle()
+        .fill(model.scanning ? Color.red : Color.secondary)
+        .frame(width: 8, height: 8)
+      Text(model.scanning ? "Scanning" : "Paused")
+        .font(.title3.weight(.semibold))
+        .fixedSize()
+      Text(Self.clock(model.elapsed))
+        .font(.title3.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .fixedSize()
+    }
+  }
+
+  private var triangleCount: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 5) {
+      Text(Self.millions(model.triangles))
+        .font(.system(size: 34, weight: .bold, design: .rounded))
+        .monospacedDigit()
+      Text("M tris").font(.footnote).foregroundStyle(.secondary)
+    }
+    .fixedSize()
+  }
+
+  private var occupancy: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Meter(
+        fraction: model.occupancy, threshold: 0.85, known: model.occupancyKnown)
+      // The unknown case is a *refusal to report*, not a reading of zero. The
+      // fusion forces occupancy to 1.0 when load_factor fails so its guard
+      // refuses; printing that as "volume 100% full" is a full volume claimed
+      // on a volume nobody measured.
       Text(
-        "Existing surface keeps refining, but new areas will not be added. "
-          + "Finish here, or restart with a coarser voxel size."
+        model.occupancyKnown
+          ? "volume \(Int(model.occupancy * 100))% full"
+          : "volume unreadable"
       )
       .font(.footnote).foregroundStyle(.secondary)
+      .fixedSize()
+    }
+  }
+
+  @ViewBuilder private var chips: some View {
+    Chip(model.trackingText, tone: model.trackingHealthy ? .good : .warn)
+    Chip("\(Int(model.fps)) fps", tone: .neutral)
+    if model.dropFraction > 0.2 {
+      Chip("\(Int(model.dropFraction * 100))% dropped", tone: .warn)
+    }
+  }
+
+  private var expandButton: some View {
+    Button {
+      withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+    } label: {
+      Image(
+        systemName: expanded
+          ? "chevron.up.circle.fill"
+          : "chevron.down.circle.fill"
+      )
+      .font(.title3)
+      .symbolRenderingMode(.hierarchical)
+    }
+    .buttonStyle(.plain)
+    .foregroundStyle(.secondary)
+    .accessibilityLabel(expanded ? "Hide details" : "Show details")
+  }
+
+  // Stated as an instruction, and the instruction comes from the bridge because
+  // it depends on the cause. A full volume wants coarser voxels; an unreadable
+  // occupancy and a dropped-block failure are not full volumes at all, and the
+  // advice for one sends the reader after a limit they have not reached.
+  private func volumeStopped(_ advice: String) -> some View {
+    Banner(tint: .orange, icon: "exclamationmark.triangle.fill") {
+      Text("New geometry is not being added.")
+        .font(.footnote.weight(.semibold))
+      Text(advice).font(.footnote).foregroundStyle(.secondary)
     }
   }
 
@@ -374,11 +478,22 @@ private struct StageRowView: View {
 private struct FrameChart: View {
   let samples: [FrameSample]
 
+  /// Split rather than totalled, because the two halves answer different
+  /// questions and only one of them moves: the fuse sits near 20 ms all scan,
+  /// and the meshing is what spikes. Stacked, so the bar height is still the
+  /// whole frame -- a reader comparing bar to bar is comparing frame cost, and
+  /// the colour says which half caused the difference.
   var body: some View {
     Chart(samples) { sample in
-      BarMark(x: .value("Frame", sample.id), y: .value("ms", sample.totalMs))
-        .foregroundStyle(Color.accentColor.opacity(0.85))
+      BarMark(x: .value("Frame", sample.id), y: .value("ms", sample.fuseMs))
+        .foregroundStyle(by: .value("half", "fuse"))
+      BarMark(x: .value("Frame", sample.id), y: .value("ms", sample.extractMs))
+        .foregroundStyle(by: .value("half", "mesh"))
     }
+    .chartForegroundStyleScale([
+      "fuse": Color.accentColor.opacity(0.85), "mesh": Color.orange.opacity(0.8),
+    ])
+    .chartLegend(position: .bottom, spacing: 4)
     .chartYAxis { AxisMarks(position: .leading) }
     .chartXAxis(.hidden)
     .frame(height: 92)
@@ -425,21 +540,32 @@ private struct Chip: View {
 private struct Meter: View {
   let fraction: Double
   let threshold: Double
+  /// False when the figure could not be read. Drawn as an empty track with no
+  /// fill and no tick, because a fabricated 1.0 rendered as a full bar is the
+  /// most alarming reading on the panel produced by the absence of a reading.
+  let known: Bool
 
   var body: some View {
     GeometryReader { geo in
       ZStack(alignment: .leading) {
         Capsule().fill(.quaternary)
-        Capsule()
-          .fill(fraction >= threshold ? Color.orange : Color.accentColor)
-          .frame(width: geo.size.width * min(max(fraction, 0), 1))
-        Rectangle()
-          .fill(Color.orange.opacity(0.9))
-          .frame(width: 1.5)
-          .offset(x: geo.size.width * threshold)
+        if known {
+          Capsule()
+            .fill(fraction >= threshold ? Color.orange : Color.accentColor)
+            .frame(width: geo.size.width * min(max(fraction, 0), 1))
+          Rectangle()
+            .fill(Color.orange.opacity(0.9))
+            .frame(width: 1.5)
+            .offset(x: geo.size.width * threshold)
+        }
       }
     }
-    .frame(height: 6)
+    // A minimum, not just a height. A GeometryReader accepts a zero-width
+    // proposal without complaint, which made this the first thing SwiftUI
+    // compressed out of an overfull headline -- silently, and it is the element
+    // the headline exists to carry. With a floor, an enclosing ViewThatFits is
+    // told the row does not fit instead of being handed a 0 pt meter.
+    .frame(minWidth: 80, idealWidth: 120, minHeight: 6, maxHeight: 6)
   }
 }
 

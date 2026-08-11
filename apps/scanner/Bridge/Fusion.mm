@@ -867,7 +867,18 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     push_stage("  ..compact", stats_.extract.compact_ms);
     push_stage("  ..inputs", stats_.extract.input_upload_ms);
     push_stage("  ..sizing", stats_.extract.arena_alloc_ms);
+    push_stage("  ..desc", stats_.extract.descriptor_ms);
     push_stage("  ..readback", stats_.extract.readback_ms);
+    // The residual, published rather than left implicit -- the same seven cells
+    // the text summary carries, for the reason it gives: these phases do not
+    // sum to `extract_ms` and never did. recon's spans open after the slot
+    // claim and close before the O(active_blocks) teardown of the neighbour
+    // table, so the gap grows with the scan. That is the one direction in which
+    // an unlabelled remainder is misread as rounding, and on the panel it read
+    // as a breakdown that visibly failed to add up to the row above it.
+    push_stage("  ..other",
+               std::max(0.0, static_cast<double>(stats_.extract_ms) -
+                                 stats_.extract.total_ms()));
     // No `texture` row pushed here: `fuse` seeds one at the top of the frame
     // and the texture tier reports into it through `metrics`, with a device
     // half this host-only span does not have. Pushing one as well is how the
