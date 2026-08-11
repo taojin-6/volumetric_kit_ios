@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 // FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
 // fusionSummary uses std::snprintf. It compiled only because some gfx or recon
 // header happens to pull <cstdio> in transitively today.
@@ -1424,6 +1425,18 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // EXCLUSIVE buffer read by a family that does not own it is undefined with no
   // error. recon collapses the pair to EXCLUSIVE wherever they are the same
   // family, so this needs no branch on the plan.
+  // Measurement mode, off unless the run scheme asks for it: set
+  // VR_INCREMENTAL_BENCHMARK in Product -> Scheme -> Run -> Arguments ->
+  // Environment Variables.
+  //
+  // An environment variable rather than a UI toggle on purpose. It reconfigures
+  // the extractor at start() -- one slot, sharing off, spans tracked -- and
+  // publishes NO geometry, so the surface stops updating while it runs. That is
+  // a build you launch to read a number, not a mode a user should be able to
+  // reach by tapping. See FusionConfig::incremental_benchmark.
+  fusion_config.incremental_benchmark =
+      std::getenv("VR_INCREMENTAL_BENCHMARK") != nullptr;
+
   fusion_config.queue_families[0] = _impl->shared.compute_family();
   fusion_config.queue_families[1] = _impl->shared.graphics_family();
   fusion_config.queue_family_count = 2;

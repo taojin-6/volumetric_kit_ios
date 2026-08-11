@@ -126,7 +126,12 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   // is a destroyed VkBuffer under a live draw, which raises no Status and no
   // validation message on iOS; a start() that refuses is the only place it can
   // still be said out loud. See FusionConfig::mesh_slots.
-  if (config.mesh_slots < kMinMeshSlots) {
+  // ... except in the benchmark mode, which publishes no mesh at all. The floor
+  // exists because Published::mesh BORROWS the extractor's buffers; with
+  // nothing borrowing them, one slot is the configuration recon's incremental
+  // extract requires rather than a hazard. Gated on the mode and not on the
+  // number, so the refusal cannot be talked around by setting mesh_slots to 1.
+  if (config.mesh_slots < kMinMeshSlots && !config.incremental_benchmark) {
     return vr::Status::invalid_argument(
         "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
         ", which switches recon's slot-release contract off; Published::mesh "
@@ -267,7 +272,10 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   // it on every map grow, so a failure to get it fails the *frame*, not just
   // the diagnostic. See FusionConfig::track_dirty_blocks.
   vr::tsdf::TsdfIntegratorConfig integ_config;
-  integ_config.track_dirty_blocks = config.track_dirty_blocks;
+  // The flags the incremental extract dilates on-device ARE these, so the mode
+  // implies the tracking rather than asking the caller to remember it.
+  integ_config.track_dirty_blocks =
+      config.track_dirty_blocks || config.incremental_benchmark;
   vr::Result<vr::tsdf::TsdfIntegrator> integrator =
       vr::tsdf::TsdfIntegrator::create(device, allocator, integ_config);
   if (!integrator) {
@@ -312,8 +320,16 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
         // (`arena_bytes` against the triangle count) over any number quoted
         // from a desktop fixture. Memory is why it is on here: an iPad is where
         // the arena ceiling is real.
-        mc_config.share_vertices = true;
-        mc_config.slot_count = config.mesh_slots;
+        //
+        // Both inverted by the benchmark mode, because recon's incremental
+        // extract refuses each: sharing, because a relocated block cannot
+        // retire vertices it does not own three-per-triangle; more than one
+        // slot, because the arena has to survive the call. `track_block_spans`
+        // is what it re-meshes against.
+        mc_config.share_vertices = !config.incremental_benchmark;
+        mc_config.slot_count =
+            config.incremental_benchmark ? 1u : config.mesh_slots;
+        mc_config.track_block_spans = config.incremental_benchmark;
         // Held by value there, so copied rather than pointed at -- the config
         // outlives this lambda's temporaries.
         for (std::uint32_t i = 0; i < config.queue_family_count; ++i) {
@@ -1258,8 +1274,20 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
 
   const auto t_extract = Clock::now();
   vr::mesh::ExtractTimings extract_timings{};
+  //
+  // The incremental overload re-meshes only the blocks whose +{0,1}^3
+  // neighbourhood the fuse changed, dilating the integrator's flags on-device.
+  // It falls back to a full extract on its own whenever an incremental pass
+  // would be wrong -- the first one against this grid, a topology change, a
+  // grown arena -- so this needs no first-frame special case.
   vr::Result<vr::mesh::DeviceMesh> device_mesh =
-      marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
+      config_.incremental_benchmark
+          ? marching_cubes_->extract_device_incremental(
+                *grid_, 0.0f,
+                vr::mesh::DirtyBlocks{integrator_->dirty_flags_buffer(),
+                                      integrator_->dirty_flags_capacity()},
+                &extract_timings)
+          : marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
   if (!device_mesh) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -1392,21 +1420,40 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // consumer says it has finished with it.
   std::lock_guard<std::mutex> lock(mutex_);
 
-  mesh_ = device_mesh.value();
-  published_generation_ = device_mesh.value().generation;
-  published_taken_ = false;
-  // Published together, under one lock, because they are one value: `uv0` is a
-  // coordinate into *this* keyframe. Zeroed rather than left alone when this
-  // remesh did not texture, so a consumer cannot bind the previous keyframe
-  // against a mesh whose uv0 are all sentinel.
-  atlas_width_ = staged_w;
-  atlas_height_ = staged_h;
-  published_atlas_ = staged_atlas;
-  ++mesh_version_;
+  // The benchmark mode stops HERE, and that is the whole of what makes its one
+  // slot safe. Publishing would hand the renderer buffers the next extract
+  // overwrites in place, with no release contract to hold it off -- the exact
+  // failure kMinMeshSlots refuses, a destroyed or rewritten VkBuffer under a
+  // live draw, raising no Status and no validation message on iOS. So the mesh
+  // is measured and dropped, the renderer keeps drawing whatever it last took,
+  // and the counters below still report what the extract produced.
+  //
+  // The keyframe is inside the guard with the geometry, not beside it, for the
+  // reason the geometry is: they are one value. Publishing an atlas while the
+  // mesh stays behind would bind THIS frame's keyframe against whatever mesh
+  // the last real publish left -- a live camera image smeared across older
+  // surfaces, which is precisely the pairing Published::atlas promises cannot
+  // happen. Held together, the renderer keeps a consistent pair.
+  //
+  // The stats it does publish are the point: `extract` and its dispatch row, at
+  // the device's own dirty fraction rather than a desktop fixture's.
+  if (!config_.incremental_benchmark) {
+    mesh_ = device_mesh.value();
+    published_generation_ = device_mesh.value().generation;
+    published_taken_ = false;
+    // Published together, under one lock, because they are one value: `uv0` is
+    // a coordinate into *this* keyframe. Zeroed rather than left alone when
+    // this remesh did not texture, so a consumer cannot bind the previous
+    // keyframe against a mesh whose uv0 are all sentinel.
+    atlas_width_ = staged_w;
+    atlas_height_ = staged_h;
+    published_atlas_ = staged_atlas;
+    ++mesh_version_;
+    stats_.mesh_version = mesh_version_;
+  }
   ++stats_.remeshes;
-  stats_.vertices = mesh_.vertex_count;
-  stats_.triangles = mesh_.triangle_count;
-  stats_.mesh_version = mesh_version_;
+  stats_.vertices = device_mesh.value().vertex_count;
+  stats_.triangles = device_mesh.value().triangle_count;
   stats_.extract_ms = extract_ms;
   // recon's struct, whole -- not a field-by-field transcription. `extract_ms`
   // above is this call measured from here; this is what it decomposes into.

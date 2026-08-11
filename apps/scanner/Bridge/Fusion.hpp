@@ -289,6 +289,40 @@ struct FusionConfig {
   /// higher is not free -- see recon's `slot_count`.
   std::uint32_t mesh_slots = 2;
 
+  /// @brief Measure incremental extraction, publishing no geometry.
+  ///
+  /// recon's @ref vr::mesh::MarchingCubes::extract_device_incremental re-meshes
+  /// only the blocks a fuse changed. It refuses `share_vertices` (a shared
+  /// vertex is not owned three-per-triangle, so a relocated block cannot retire
+  /// what it leaves) and refuses more than one slot (the arena has to persist
+  /// across the call, and a ring hands each extract a different one) -- neither
+  /// of which is how this class is otherwise configured, so this mode changes
+  /// both.
+  ///
+  /// It therefore **does not publish a mesh**, and that is what makes one slot
+  /// safe rather than the hazard @ref mesh_slots exists to refuse: nothing
+  /// borrows the extractor's buffers, so nothing is drawing an arena the next
+  /// extract overwrites. The renderer shows whatever it last had.
+  ///
+  /// What it answers is the only question a desktop fixture cannot: room0
+  /// re-meshes 81.67% of its blocks per window, capping the win there at 1.22x,
+  /// while a real device walk re-meshes ~25%. The dispatch row this publishes
+  /// is that number.
+  ///
+  /// What it deliberately does **not** show is the in-place tearing. Seeing
+  /// that needs the ring intact *and* the arena de-ringed, so that a reader
+  /// holding an older generation is still drawing while a newer extract mutates
+  /// -- and de-ringing the arena is the open design question this measurement
+  /// exists to decide. At one slot the renderer would simply be shown nothing
+  /// new.
+  ///
+  /// @warning Turning sharing off costs roughly 3x the vertex arena, on top of
+  ///          the inflation an incremental extract carries for retired ranges
+  ///          (1.82x measured on room0, where relocation is constant). Run it
+  ///          at a coarser voxel size first; an iPad is where the arena ceiling
+  ///          is real, which is why sharing is normally on.
+  bool incremental_benchmark = false;
+
   /// @brief The queue families that will touch the mesh buffers.
   ///
   /// Both of them, unconditionally -- recon reduces the pair to its distinct
