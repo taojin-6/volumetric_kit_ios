@@ -89,9 +89,28 @@ target_include_directories(scanner_bridge
 # not a knob. Compile-time rather than runtime because iOS resumes a process
 # instead of cold-starting it, so an environment variable survives exactly one
 # launch and then lies. See FusionConfig::incremental_benchmark.
+#
+# A define cannot drift across a *resume*, which is the failure the environment
+# variable had. It can still drift across a CONFIGURE: option() writes a CACHE
+# entry, so -DVI_INCREMENTAL_BENCHMARK=ON latches into the build tree and every
+# later cmake in that directory keeps it -- including the plain configure line
+# in README.md, which names no such flag and so cannot clear it. That is a worse
+# failure than the one it replaced if it goes unnoticed, because it turns an
+# ordinary app build into one that publishes no geometry: a scanner that renders
+# an empty room and looks broken.
+#
+# So it announces itself. Every configure of a tree carrying it prints this, and
+# the message names the way out, because the natural repair -- re-run the
+# configure line from the README -- is exactly the one that does not work.
 option(VI_INCREMENTAL_BENCHMARK
        "Scanner measures incremental extraction and draws no mesh" OFF)
 if(VI_INCREMENTAL_BENCHMARK)
+  message(
+    WARNING
+      "VI_INCREMENTAL_BENCHMARK is ON: this scanner build MEASURES incremental "
+      "extraction and publishes NO geometry, so it renders an empty scene by "
+      "design. It is cached in this build tree and survives a plain re-configure"
+      " -- clear it with -DVI_INCREMENTAL_BENCHMARK=OFF.")
   # On the bridge, which is where VolumetricRenderer.mm compiles.
   target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
 endif()

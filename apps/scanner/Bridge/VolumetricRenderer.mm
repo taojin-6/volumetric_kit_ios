@@ -1436,10 +1436,17 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // whose failure mode is "quietly measured the wrong thing" is worse than no
   // toggle.
   //
-  // A define cannot drift: the mode is in the binary, so installing it is what
-  // switches it, and there is no state for a resume to carry. It also matches
-  // what this is -- a build you launch to read a number, not something a user
-  // should reach by tapping. See FusionConfig::incremental_benchmark.
+  // A define cannot drift across a *resume*: the mode is in the binary, so
+  // installing it is what switches it, and there is no runtime state for a
+  // resume to carry. It also matches what this is -- a build you launch to read
+  // a number, not something a user should reach by tapping.
+  //
+  // It is not stateless, though, and the remaining state is one configure up
+  // rather than one launch: `option()` caches, so an ON latches into the build
+  // tree and outlives the configure that set it. The build file warns on every
+  // configure that carries it, because the repair someone reaches for -- re-run
+  // the README's configure line -- is the one that leaves it on.
+  // See FusionConfig::incremental_benchmark.
 #ifdef VI_INCREMENTAL_BENCHMARK
   fusion_config.incremental_benchmark = true;
 #else
@@ -1733,6 +1740,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   }
   _impl->camera.set_device_pose(device_pose);
 
+  // `have_mesh` is false for the whole session under VI_INCREMENTAL_BENCHMARK:
+  // it is armed only by a successful take below, and that mode publishes
+  // nothing for a take to find. So this is not "keeps drawing the last mesh" --
+  // there is no last mesh, and the scene stays empty from launch. The stats
+  // panel says so in as many words, because an empty view is otherwise read as
+  // ARKit having lost tracking, and this mode's number depends on whoever is
+  // holding the iPad believing the scan is working and walking the room.
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
 
   // --- Retire the generations no frame in flight is reading any more --------
@@ -2218,10 +2232,35 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // --- Fusion ---------------------------------------------------------------
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    // First row in the first section, because it is the answer to the question
+    // the screen is provoking. This build publishes no geometry, so the view is
+    // empty from launch however well the scan is going -- and the operator
+    // walking the room is the one supplying the coverage being measured. Left
+    // unmarked, the natural reading is that tracking has failed and the natural
+    // response is to stop walking, which ends the measurement.
+    if (s.incremental_benchmark) {
+      add(r, @"mode", @"MEASURING -- no geometry drawn",
+          VolumetricStatToneWarn);
+    }
     add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
+    // The version is the publish counter, and under the measurement mode
+    // nothing publishes -- so it stays 0 while the remesh count climbs. Printed
+    // as "(v3)" beside "4900" that reads exactly like a wedged publish path,
+    // which is the one thing a diagnostic build must not be ambiguous about.
+    // Named instead, since "not published" is the mode working.
     add(r, @"remesh",
-        fmt("%llu  (v%u)", (unsigned long long)s.remeshes, s.mesh_version));
-    add(r, @"mesh", fmt("%u verts / %u tris", s.vertices, s.triangles));
+        s.incremental_benchmark
+            ? fmt("%llu  (not published)", (unsigned long long)s.remeshes)
+            : fmt("%llu  (v%u)", (unsigned long long)s.remeshes,
+                  s.mesh_version));
+    // Under an incremental extract these are recon's arena watermark, which
+    // still counts ranges the kernel retired in place, so they run above the
+    // live surface. Marked rather than silently compared against a normal
+    // build's. See FusionStats::spans_tracked.
+    add(r, @"mesh",
+        s.spans_tracked ? fmt("%u verts / %u tris  (incl. retired)", s.vertices,
+                              s.triangles)
+                        : fmt("%u verts / %u tris", s.vertices, s.triangles));
     // The texture pass, as a state rather than a duration -- the Pipeline
     // section below already carries its timing, and this row exists to say
     // which of the four things a 0.0 ms there means. See app::TextureState,
@@ -2292,6 +2331,44 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     add(r, @"emitted",
         fmt("%u tris / %u verts", s.extract.emitted_triangles,
             s.extract.emitted_vertices));
+    // The two rows the measurement mode exists to produce, and without which it
+    // cannot be told from the thing it is measured against. recon falls back to
+    // a full extract silently and by design -- a topology change, a grown
+    // arena, flags it will not vouch for -- so "did this call re-mesh only the
+    // changed blocks" is reported rather than inferred. `dispatches` reads 1 on
+    // both paths and cannot answer it.
+    //
+    // Shown only when the mode is on, because on the normal path `incremental`
+    // is false by construction and a permanent "full" row is noise.
+    if (s.incremental_benchmark) {
+      add(r, @"incremental",
+          s.extract.incremental ? @"yes" : @"NO -- fell back to full",
+          s.extract.incremental ? VolumetricStatToneNeutral
+                                : VolumetricStatToneWarn);
+      // The fraction the whole feature trades against. Meaningless on a full
+      // pass, which reports 0 rather than restating active_blocks -- so the
+      // fallback prints the window alone instead of a fake 0%.
+      //
+      // The window travels with it because the fraction is a function of how
+      // much fusing happened since the last extract: the same scan re-meshes
+      // twice as much of itself over two frames as over one, and a number
+      // quoted without it can be compared with anything. See
+      // FusionStats::extract_window_frames.
+      if (s.extract.incremental && s.extract.active_blocks > 0) {
+        const double frac =
+            (double)s.extract.remeshed_blocks / (double)s.extract.active_blocks;
+        add(r, @"re-meshed",
+            fmt("%.1f%% of %u blocks  (%llu fused frame%s)", 100.0 * frac,
+                s.extract.active_blocks,
+                (unsigned long long)s.extract_window_frames,
+                s.extract_window_frames == 1 ? "" : "s"));
+      } else {
+        add(r, @"re-meshed",
+            fmt("- (%llu fused frame%s)",
+                (unsigned long long)s.extract_window_frames,
+                s.extract_window_frames == 1 ? "" : "s"));
+      }
+    }
     if (s.extract_stale) {
       add(r, @"stale",
           fmt("%llu frames since", (unsigned long long)s.frames_since_extract),
@@ -2369,12 +2446,30 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     const double fill = s.extract.triangle_capacity > 0
                             ? (double)s.triangles / s.extract.triangle_capacity
                             : 0.0;
+    // OCCUPANCY, not live-surface fill, and the distinction is the whole of
+    // this row under an incremental extract. `s.triangles` is recon's arena
+    // watermark, which still counts triangles the kernel retired in place, so
+    // the ratio runs above the live surface by however much the arena has not
+    // compacted away -- recon's own occupancy ceiling is what eventually forces
+    // a full pass to compact it. Left driving the tone, because the resident
+    // bytes are genuinely held either way, but named so a warn colour is not
+    // read as "the live surface is about to overflow".
     add(r, @"fill",
-        fmt("%.1f%% of %u tris", 100.0 * fill, s.extract.triangle_capacity),
+        s.spans_tracked ? fmt("%.1f%% of %u tris  (incl. retired)",
+                              100.0 * fill, s.extract.triangle_capacity)
+                        : fmt("%.1f%% of %u tris", 100.0 * fill,
+                              s.extract.triangle_capacity),
         tone_for(fill, 0.9, 0.98));
+    // recon folds the per-block span table into `arena_bytes` -- grid-sized,
+    // and doubling on every VoxelHashMap::resize -- so this figure is not
+    // comparable with a normal build's. The table is the measurement's own
+    // cost, which makes saying so part of reporting the measurement.
     add(r, @"resident",
-        fmt("%.0f MB across %u slots", s.extract.arena_bytes / mb,
-            s.mesh_slots));
+        s.spans_tracked ? fmt("%.0f MB across %u slot%s  (incl. span table)",
+                              s.extract.arena_bytes / mb, s.mesh_slots,
+                              s.mesh_slots == 1 ? "" : "s")
+                        : fmt("%.0f MB across %u slots",
+                              s.extract.arena_bytes / mb, s.mesh_slots));
     [out addObject:make_section(@"Arena", r)];
   }
 
@@ -2581,6 +2676,40 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // so when that is no longer this frame. Without it a breakdown frozen by a
     // failing extract reads as current.
     extract_note += "  [stale " + std::to_string(s.frames_since_extract) + "f]";
+  }
+  // The publish counter, or the reason there is not one. See the format string.
+  const std::string version_cell = s.incremental_benchmark
+                                       ? std::string("(not published)")
+                                       : "v" + std::to_string(s.mesh_version);
+
+  // The measurement mode's own row, and the log is the copy that matters for it
+  // -- `devicectl ... --console` is what a reading is actually taken from, and
+  // the panel is the thing being cross-checked. Says the mode is on, whether
+  // recon took the incremental path (it falls back silently, and a run that
+  // measured the fallback is worthless), and the fraction with the window it
+  // accumulated over. Empty on the normal path, so the transcript is unchanged
+  // there.
+  std::string bench_row;
+  if (s.incremental_benchmark) {
+    char cell[192];
+    if (s.extract.incremental && s.extract.active_blocks > 0) {
+      std::snprintf(
+          cell, sizeof(cell),
+          "  measuring incremental extraction -- NO geometry published\n"
+          "            re-meshed %.1f%% of %u blocks over %llu fused "
+          "frame(s)\n",
+          100.0 * static_cast<double>(s.extract.remeshed_blocks) /
+              static_cast<double>(s.extract.active_blocks),
+          s.extract.active_blocks,
+          static_cast<unsigned long long>(s.extract_window_frames));
+    } else {
+      std::snprintf(
+          cell, sizeof(cell),
+          "  measuring incremental extraction -- NO geometry published\n"
+          "            FELL BACK to a full extract (%llu fused frame(s))\n",
+          static_cast<unsigned long long>(s.extract_window_frames));
+    }
+    bench_row = cell;
   }
 
   // The `table` row's figure and its suffix, built here rather than as four
@@ -3004,7 +3133,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // an overlay that already runs past the safe area on a landscape iPhone
       // -- so they were the first things clipped. Nothing below them is worth
       // more screen than they are.
-      "fused %llu / remesh %llu  v%u%s%s%s\n"
+      // `%s` for the version rather than `v%u`: the measurement mode publishes
+      // nothing, so the counter stays 0 while remeshes climb, and "v0" beside a
+      // five-figure remesh count reads as a wedged publish path in the one copy
+      // of the read-out that has a device history. Built above.
+      "fused %llu / remesh %llu  %s%s%s%s\n"
+      // The measurement banner, directly under the counts it reframes. Empty
+      // string on the normal path.
+      "%s"
       // Directly under the banners, and above every capacity row, because this
       // is the only quantity on the read-out whose ceiling is enforced by
       // something outside the app and the only one whose breach takes the
@@ -3057,11 +3193,11 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // call span appears at all depends on the stage table beside it.
       "%s",
       static_cast<unsigned long long>(s.frames_fused),
-      static_cast<unsigned long long>(s.remeshes), s.mesh_version,
+      static_cast<unsigned long long>(s.remeshes), version_cell.c_str(),
       errors.c_str(), upload.c_str(), memory_warnings.c_str(),
-      memory_rows.c_str(), s.vertices, s.triangles, stage_rows.c_str(),
-      s.extract_ms, extract_note.c_str(), phase_rows.c_str(),
-      s.extract.triangle_capacity,
+      bench_row.c_str(), memory_rows.c_str(), s.vertices, s.triangles,
+      stage_rows.c_str(), s.extract_ms, extract_note.c_str(),
+      phase_rows.c_str(), s.extract.triangle_capacity,
       s.extract.triangle_capacity > 0
           ? 100.0 * static_cast<double>(s.triangles) /
                 static_cast<double>(s.extract.triangle_capacity)

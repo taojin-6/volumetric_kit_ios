@@ -47,6 +47,25 @@ To build against a local checkout of a sibling instead of the pinned remote:
 -DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON=/path/to/volumetric_kit_recon
 ```
 
+### The measurement build
+
+`-DVI_INCREMENTAL_BENCHMARK=ON` builds the scanner as an instrument for recon's
+incremental mesh extraction rather than as an app: it runs one mesh slot, keeps
+the per-block span table, and **publishes no geometry**, so the scan renders an
+empty scene by design. Read the result off the `Extract` panel section or the
+`--console` transcript — `incremental` says whether recon took the fast path
+(it falls back silently, and a run that measured the fallback is worthless) and
+`re-meshed` gives the fraction with the window it covers.
+
+It is a **cached** option, so it survives a plain re-configure of the same build
+tree — including the line above, which does not mention it. Every configure that
+carries it prints a warning naming it. To get an ordinary app build back, clear
+it explicitly or use a fresh build directory:
+
+```sh
+cmake -S . -B build-ios -DVI_INCREMENTAL_BENCHMARK=OFF
+```
+
 ### Install and run
 
 ```sh
