@@ -28,7 +28,7 @@ repos:
         # Pin the clang-format binary so formatting is identical locally and in
         # CI; pre-commit installs it, so contributors need not install it too.
         # Same pin as the sibling repos.
-        additional_dependencies: ['clang-format==22.1.5']
+        additional_dependencies: ['clang-format==22.1.8']
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13
