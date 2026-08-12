@@ -21,7 +21,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 // FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
 // fusionSummary uses std::snprintf. It compiled only because some gfx or recon
 // header happens to pull <cstdio> in transitively today.

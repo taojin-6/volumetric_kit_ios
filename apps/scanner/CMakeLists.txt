@@ -82,12 +82,13 @@ target_include_directories(scanner_bridge
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
 # to implement ICameraCapture; recon_tsdf and recon_texture below are what the
 # fusion spine consumes, and recon_mesh/recon_volume arrive transitively. Build
-# the scanner as a measurement binary: one mesh slot, sharing off, spans
-# tracked, and NO geometry published, so recon's incremental extract can be
-# timed at the device's own dirty fraction. Compile-time rather than runtime
-# because iOS resumes a process instead of cold-starting it, so an environment
-# variable survives exactly one launch and then lies. See
-# FusionConfig::incremental_benchmark.
+# the scanner as a measurement binary: one mesh slot, spans tracked, and NO
+# geometry published, so recon's incremental extract can be timed at the
+# device's own dirty fraction. Vertex sharing stays ON -- unsharing is what the
+# first version did and it cost 3x the vertex arena, which is a settled revert,
+# not a knob. Compile-time rather than runtime because iOS resumes a process
+# instead of cold-starting it, so an environment variable survives exactly one
+# launch and then lies. See FusionConfig::incremental_benchmark.
 option(VI_INCREMENTAL_BENCHMARK
        "Scanner measures incremental extraction and draws no mesh" OFF)
 if(VI_INCREMENTAL_BENCHMARK)

@@ -1289,12 +1289,22 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // It falls back to a full extract on its own whenever an incremental pass
   // would be wrong -- the first one against this grid, a topology change, a
   // grown arena -- so this needs no first-frame special case.
+  //
+  // All THREE fields, and the epoch is the one that is easy to lose: recon
+  // added `DirtyBlocks::epoch` after this branch was written (7aed36d), and a
+  // brace-init that omits it still compiles -- the missing member simply
+  // value-initializes to 0. But `topology_epoch()` is 0 only on a moved-from
+  // map, so a zero epoch matches no live grid, recon's guard refuses the
+  // incremental pass, and every extract silently falls back to the full one
+  // this mode exists to measure against. Read from the integrator that
+  // accumulated the flags, because that is what the token has to agree with.
   vr::Result<vr::mesh::DeviceMesh> device_mesh =
       config_.incremental_benchmark
           ? marching_cubes_->extract_device_incremental(
                 *grid_, 0.0f,
                 vr::mesh::DirtyBlocks{integrator_->dirty_flags_buffer(),
-                                      integrator_->dirty_flags_capacity()},
+                                      integrator_->dirty_flags_capacity(),
+                                      integrator_->dirty_epoch()},
                 &extract_timings)
           : marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
   if (!device_mesh) {
