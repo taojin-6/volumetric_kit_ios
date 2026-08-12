@@ -697,16 +697,18 @@ final class ScannerViewController: UIViewController {
     dashboard.memoryLimitBytes = snapshot.memoryLimitBytes
     dashboard.memoryPeakBytes = snapshot.memoryPeakBytes
     dashboard.memoryValid = snapshot.memoryValid
-    dashboard.memoryAtLimit = snapshot.memoryAtLimit
     dashboard.stages = snapshot.stages.map {
       StageBar(
         id: $0.name, name: $0.name, hostMs: $0.cpuMs,
         deviceMs: $0.gpuMs, hasGPU: $0.hasGpu)
     }
-    // What the bars do not cover, and how far they can be trusted.
-    dashboard.stageResidualMs = snapshot.extractResidualMs
+    // What the bars do not cover, and how far they can be trusted. The age is
+    // two figures because it is a comparison: `msSinceStages` alone cannot tell
+    // a stalled pipeline from a paused camera.
     dashboard.atlasCopyMs = snapshot.atlasCopyMs
+    dashboard.framesFused = snapshot.framesFused
     dashboard.msSinceStages = snapshot.msSinceStages
+    dashboard.msSinceFuse = snapshot.msSinceFuse
     dashboard.stagesTruncated = snapshot.stagesTruncated
     dashboard.gpuTimingRetired = snapshot.gpuTimingRetired
     dashboard.history = snapshot.history.map {
@@ -726,11 +728,18 @@ final class ScannerViewController: UIViewController {
     dashboard.triangles = Int(snapshot.triangles)
     dashboard.vertices = Int(snapshot.vertices)
     dashboard.triangleCapacity = Int(snapshot.triangleCapacity)
+    // Travels with the capacity it qualifies. Both halves of the arena fill are
+    // stamped only by a successful remesh, so without this the gauge freezes
+    // and goes on reporting a fill for a surface that has kept growing.
+    dashboard.extractStale = snapshot.extractStale
     dashboard.occupancy = snapshot.occupancy
     dashboard.occupancyKnown = snapshot.occupancyKnown
     dashboard.allocationStopReason = snapshot.allocationStopReason
-    // The grouping is the bridge's, not this file's -- the same sections the
-    // log line is rendered from, so screen and transcript cannot drift.
+    // The grouping is the bridge's, not this file's. That keeps the panel from
+    // inventing a grouping of its own; it is **not** a guarantee against drift,
+    // which is what this note used to claim. The log line formats its own text
+    // from the same stats (see the TODO on `-statSections`), and the two had in
+    // fact drifted -- see the note at the top of Dashboard.swift.
     dashboard.groups = snapshot.sections.map { s in
       StatGroup(
         id: s.title,

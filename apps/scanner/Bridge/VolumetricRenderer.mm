@@ -1059,13 +1059,20 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
     _activeBlocks = stats.extract.active_blocks;
     _extractStale = stats.extract_stale ? YES : NO;
 
-    // Floored at zero rather than trusted: the two are measured by different
-    // clocks around nested scopes, so a small negative is a rounding artefact
-    // and drawing it as a bar going the other way is not.
-    _extractResidualMs = std::max(
-        0.0, static_cast<double>(stats.extract_ms) - stats.extract.total_ms());
+    // No extract residual here. `max(0, extract_ms - extract.total_ms())` was
+    // computed on this line and published as its own figure, but recon already
+    // pushes that exact expression as the `"  ..other"` stage row -- so the
+    // panel drew it as a bar and then listed it again underneath a heading
+    // reading "not in the bars above". One measurement, one publication: the
+    // bar. See Fusion.mm's push_stage("  ..other", ...).
     _atlasCopyMs = stats.atlas_copy_ms;
+    _framesFused = stats.frames_fused;
     _msSinceStages = stats.ms_since_stages;
+    // Published beside `ms_since_stages` because it is the only thing that one
+    // means anything against -- see the property docs. Sending the first
+    // without the second is what left the panel unable to make the comparison
+    // the transcript makes three hundred lines away in this same file.
+    _msSinceFuse = stats.ms_since_fuse;
     _stagesTruncated = stats.stages_truncated ? YES : NO;
     _gpuTimingRetired = stats.gpu_timing_retired ? YES : NO;
 
@@ -1101,6 +1108,18 @@ namespace {
 // then stores in a `nonnull` property, so the trap surfaces in Swift at the
 // first read rather than here. `to_ns_string` is this file's own answer to that
 // second half and simply was not being used; see its comment.
+// How many fused frames a survey may be missing for before the read-out calls
+// it a failure rather than a first window.
+//
+// A window and a half, the same margin `Fusion` uses to stop presenting a
+// *published* sample as current: the first survey is due at
+// `kSurveyEveryFrames`, and naming a fault the moment that frame goes by would
+// name one on the frame the sample is being taken. Derived from Fusion's own
+// constant rather than restated, because a second 60 here is a number that
+// drifts the first time the real one moves.
+constexpr std::uint64_t kSurveyFirstWindowFrames =
+    app::kSurveyEveryFrames + app::kSurveyEveryFrames / 2;
+
 NSString* fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
 NSString* fmt(const char* format, ...) {
   // Sized for the common row, which is far shorter than this; the heap path is
@@ -2269,13 +2288,20 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // sides of the panel: the bridge's failures here, the fusion's four cards
     // away. A fault is a fault whichever thread noticed it.
     if (s.errors > 0) {
-      // The count with the reason, not the reason alone. `last_error` is
-      // most-recent-wins and `fuse` republishes every fused frame, so a
-      // repeating failure surfaced for under 16 ms at a time; the count is what
-      // holds still long enough to be read.
+      // The count with the reason *when there is one*, not the count with a
+      // dangling separator. `last_error` is most-recent-wins and `fuse` assigns
+      // it on every fused frame from outside the failure guard (Fusion.mm's
+      // `stats_.last_error = frame_error;`), so a clean frame after a failure
+      // blanks the message while the counter -- the half that does not get
+      // overwritten -- keeps standing. Unguarded, one survey refusal at default
+      // config grew a permanent critical card reading "fusion  1 errors  " with
+      // nothing after it, for the life of the process. `fusionSummary` has
+      // guarded this same case all along.
       add(r, @"fusion",
-          fmt("%llu errors  %s", (unsigned long long)s.errors,
-              s.last_error.c_str()),
+          s.last_error.empty()
+              ? fmt("%llu errors", (unsigned long long)s.errors)
+              : fmt("%llu errors: %s", (unsigned long long)s.errors,
+                    s.last_error.c_str()),
           VolumetricStatToneCritical);
     }
     if (r.count > 0) [out addObject:make_section(@"Alerts", r)];
@@ -2350,11 +2376,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // build must not be ambiguous about. Named instead, since "not published"
     // is the mode working.
     add(r, @"version",
-        s.incremental_benchmark
-            ? fmt("not published, after %llu remeshes",
-                  (unsigned long long)s.remeshes)
-            : fmt("v%u after %llu remeshes", s.mesh_version,
-                  (unsigned long long)s.remeshes));
+        s.incremental_benchmark ? fmt("not published, after %llu remeshes",
+                                      (unsigned long long)s.remeshes)
+                                : fmt("v%u after %llu remeshes", s.mesh_version,
+                                      (unsigned long long)s.remeshes));
     // `pass` rather than `dispatch`: the number is how many times the surface
     // was meshed, and `dispatch` is a duration on the latency bars. Read it as
     // cost, not as a verdict on the capacity planner -- the refit triggers
@@ -2493,9 +2518,20 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // `occupied` above moves every fused frame, this one only when a remesh
     // succeeds. Saying which instant each belongs to is what stops a reader
     // subtracting them.
-    add(r, @"active",
-        fmt("%u of %u blocks at last remesh", s.extract.active_blocks,
-            s.table_capacity));
+    //
+    // The denominator is guarded for the same reason `occupied`'s is, one row
+    // up: `table_capacity` is stamped only on a fully-successful remesh and is
+    // 0 until the first one lands, so printing it unconditionally reproduced
+    // `0 of 0 blocks` here -- the identical artefact this card was rewritten to
+    // remove -- from launch, and for the whole session on a device whose
+    // extract keeps failing.
+    if (s.table_capacity > 0) {
+      add(r, @"active",
+          fmt("%u of %u blocks at last remesh", s.extract.active_blocks,
+              s.table_capacity));
+    } else {
+      add(r, @"active", @"no remesh yet");
+    }
     [out addObject:make_section(@"Block table", r)];
   }
 
@@ -2509,11 +2545,29 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     if (s.survey_active_blocks == 0) {
-      // A row rather than a missing card. The gate is a one-way latch, so an
-      // absent section here means "no survey yet" on the first window and
-      // "surveys are failing" ever after -- and a card that simply is not there
-      // reflows the grid the moment one lands.
-      add(r, @"survey", @"no sample yet");
+      // A row rather than a missing card -- a card that simply is not there
+      // reflows the grid the moment one lands. But *which* row, because the
+      // gate is a one-way latch and a single neutral "no sample yet" was the
+      // sole output for three states that want three different responses.
+      //
+      // Under the measurement mode the survey never runs at all: the block
+      // below is gated on `!incremental_benchmark`, so nothing is failing and
+      // nothing is coming. After the first window has had time to land and has
+      // not, the surveys are failing -- reachable at default config, and
+      // reachable indefinitely with `track_dirty_blocks` off, which the survey
+      // block is *not* gated on: it still pays for a compaction, a fence and a
+      // full readback every window, and `dirty_remesh_blocks` then refuses.
+      // That case used to read as the neutral first-window state forever.
+      if (s.incremental_benchmark) {
+        add(r, @"survey", @"not run under the measurement mode");
+      } else if (s.frames_fused < kSurveyFirstWindowFrames) {
+        add(r, @"survey", @"no sample yet");
+      } else {
+        add(r, @"survey",
+            fmt("failing — %llu fused frames, no sample",
+                (unsigned long long)s.frames_fused),
+            VolumetricStatToneWarn);
+      }
     } else {
       // The same three markers `fusionSummary` attaches, because each makes the
       // sample mean something other than what it looks like and the gate above
@@ -2521,44 +2575,68 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // Without them this row showed a first window's ~100% -- which any scene
       // produces, the map having grown from empty inside it -- and indefinitely
       // stale samples, both presented as this frame's.
+      //
+      // On their own row, and the tone on every row they qualify. They used to
+      // ride on `changed` alone, which was fine while the whole sample was one
+      // sentence and wrong the moment it became four rows: the denominator and
+      // the window are equally first-window artefacts and equally frozen by a
+      // stale sample, and they rendered neutral and unmarked beside a `changed`
+      // that carried both caveats.
       std::string note;
       if (s.survey_first_window) {
-        note += "  [first window: grew from empty]";
+        note += "first window: grew from empty";
       }
       if (s.survey_stale) {
-        note += "  [stale " + std::to_string(s.frames_since_survey) + "f]";
+        if (!note.empty()) note += ", ";
+        note += "stale " + std::to_string(s.frames_since_survey) + "f";
       }
       const VolumetricStatTone survey_tone =
           s.survey_stale ? VolumetricStatToneWarn : VolumetricStatToneNeutral;
+      if (!note.empty()) {
+        add(r, @"sample", fmt("%s", note.c_str()), survey_tone);
+      }
       if (s.survey_changed_blocks == 0) {
         // The steady state, not a degenerate case -- recon documents a scan
         // revisiting converged surface at `max_weight` as marking nothing.
         // There is no ratio to print, so the sentence is the result: this is
         // the branch that used to read "0.0%", the best available outcome
         // reported as no benefit at all.
-        add(r, @"changed", fmt("nothing%s", note.c_str()), survey_tone);
+        add(r, @"changed", @"nothing", survey_tone);
       } else {
         add(r, @"changed",
-            fmt("%u -> %u remesh (%.1f%%)%s", s.survey_changed_blocks,
+            fmt("%u -> %u remesh (%.1f%%)", s.survey_changed_blocks,
                 s.survey_remesh_blocks,
-                100.0 * s.survey_remesh_blocks / (double)s.survey_active_blocks,
-                note.c_str()),
+                100.0 * s.survey_remesh_blocks /
+                    (double)s.survey_active_blocks),
             survey_tone);
       }
       // The denominator, on its own row and named as the survey's own. It was
       // only ever inside the percentage above, which meant the one figure that
       // says what the fraction is *of* could not be read off the panel at all.
-      add(r, @"active", fmt("%u blocks surveyed", s.survey_active_blocks));
+      add(r, @"active", fmt("%u blocks surveyed", s.survey_active_blocks),
+          survey_tone);
       // Published rather than assumed equal to the survey cadence: a frame that
       // takes one of `fuse`'s error early-returns never reaches the survey, and
       // the window runs on into the next one. Without it, a double-length union
       // reports through an identical-looking line.
       add(r, @"window",
-          fmt("%llu fused frames", (unsigned long long)s.survey_window_frames));
+          fmt("%llu fused frames", (unsigned long long)s.survey_window_frames),
+          survey_tone);
       // What the survey cost. Measured because nothing else measures it, and on
       // this card rather than among the latency bars because it runs on one
       // frame in the window rather than on every frame they describe.
-      add(r, @"cost", fmt("%.2f ms", s.survey_ms));
+      //
+      // The one figure on this card that is NOT from the sample above it.
+      // `survey_ms` is published on every attempt, including the failed ones --
+      // deliberately, since a failure still paid for the compaction -- while
+      // the three rows above refresh only when one succeeds. Unlabelled, a
+      // failing survey's partial time (the compaction alone; the O(num_blocks)
+      // host scan and the dilation walk never ran) sat under three rows
+      // describing a sample from four seconds earlier and read as its cost.
+      add(r, @"cost",
+          s.survey_stale ? fmt("%.2f ms  (last attempt)", s.survey_ms)
+                         : fmt("%.2f ms", s.survey_ms),
+          survey_tone);
     }
     [out addObject:make_section(@"Dirty", r)];
   }
@@ -2605,18 +2683,42 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       add(r, @"held",
           fmt("%.0f MB  (ceiling not reported)", budget.footprint_bytes / mb));
     }
-    // Reported even when task_info refused, because it is a separate reading
-    // that did not fail -- suppressing it on another reading's fault would drop
-    // a figure that is still obtainable, and it is the *lower* of the two
-    // ceilings on this hardware. The gauge draws it whenever the footprint
-    // beside it is real; this row is what is left when it is not.
-    if (ws > 0 && !budget.valid) {
+    // Whether the panel will draw any bar on this card at all, which is what
+    // decides how much of the reading has to be carried as text.
+    //
+    // A gauge needs a real numerator -- the footprint, so `valid` -- and a real
+    // denominator. `memoryLimitBytes` is already published as 0 both when the
+    // kernel cannot report the ceiling and when the process is at it, so it is
+    // the whole test for the jetsam bar; the working set is an independent
+    // Metal reading and stands or falls on its own.
+    const bool jetsam_gauge = budget.valid && budget.limit_known;
+    const bool gpu_gauge = budget.valid && ws > 0;
+    // Reported when no bar will carry it, because it is a separate reading that
+    // did not fail -- suppressing it on another reading's fault drops a figure
+    // that is still obtainable, and it is the *lower* of the two ceilings on
+    // this hardware. This used to be gated on `!budget.valid` alone, which held
+    // only while the gauge beside it was suppressed at the limit as well: in
+    // the `valid && at_limit` state both vanished and the card fell back to a
+    // sentence about jetsam and the device's RAM, with the ceiling that
+    // actually binds nowhere on it.
+    if (ws > 0 && !gpu_gauge) {
       add(r, @"gpu working set", fmt("%.0f MB recommended", ws / mb));
     }
-    // No `peak` row. The high-water mark is on the snapshot as a figure and the
-    // panel ticks it onto both gauges, which is the one place it means
-    // something: a bare "peak 1620 MB" beside a fill the reader cannot compare
-    // it to is the number without the comparison that makes it worth keeping.
+    // Likewise the high-water mark. The panel ticks it onto whichever bars it
+    // draws, which is the one place it means something -- a bare "peak 1620 MB"
+    // beside a fill a reader cannot compare it to is the number without the
+    // comparison that makes it worth keeping. But with no bar drawn there is no
+    // tick, and this is the only figure on the card that survives the gap
+    // between polls: a `resize` doubling spikes for well under one 2 Hz
+    // interval, and the states with no gauge -- a refused `task_info`, and the
+    // last window before jetsam -- are exactly the ones where having seen the
+    // spike matters most. It went missing there, while `fusionSummary` kept
+    // printing it, so panel and transcript disagreed in the pre-jetsam window.
+    if (budget.peak_footprint_bytes > 0 && !jetsam_gauge && !gpu_gauge) {
+      add(r, @"peak", fmt("%.0f MB", budget.peak_footprint_bytes / mb),
+          budget.at_limit ? VolumetricStatToneCritical
+                          : VolumetricStatToneNeutral);
+    }
     if (budget.device_ram_bytes > 0) {
       add(r, @"device RAM", fmt("%.0f MB", budget.device_ram_bytes / mb));
     }

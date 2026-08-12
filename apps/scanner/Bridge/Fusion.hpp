@@ -44,6 +44,25 @@ namespace volumetric_kit::ios_app {
 
 namespace vr = volumetric_kit::recon;
 
+/// @brief How many *fused* frames between dirty-block surveys.
+///
+/// Fused rather than captured, which is the unit the window is reported in and
+/// the one @ref FusionConfig::fuse_every does not distort: keying the survey
+/// off the capture counter made the real period 60/gcd(60, fuse_every) fused
+/// frames, so every value sharing a factor with 60 shortened the window
+/// silently and `fuse_every == 60` collapsed it to *every* fused frame -- a
+/// full compaction, fence and readback per fuse, on the knob someone reaches
+/// for precisely to buy frame budget back.
+///
+/// Public because the read-out needs it to tell a survey that has not happened
+/// yet from one that is failing. Both leave @ref
+/// FusionStats::survey_active_blocks at 0 and the gate on it is a one-way
+/// latch, so the *only* thing separating them is whether enough fused frames
+/// have gone by for a sample to have been due -- and a panel that hardcoded its
+/// own 60 to find that out would be the second copy of this number, drifting
+/// the first time it moved.
+constexpr std::uint64_t kSurveyEveryFrames = 60;
+
 /// @brief Per-scan tuning. Defaults target *first light* rather than room
 ///        coverage: a small map that fills quickly and grows through
 ///        `VoxelHashMap::resize` beats one sized for a whole room that takes
