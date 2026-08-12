@@ -300,13 +300,123 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 /// draw as a full volume.
 @property(nonatomic, readonly) BOOL occupancyKnown;
 @property(nonatomic, readonly) uint32_t triangles;
+/// The other half of the polycount, beside @ref triangles rather than derived
+/// from it: the extract emits an indexed mesh, so the ratio is a property of
+/// the surface and not a constant a reader can assume.
+@property(nonatomic, readonly) uint32_t vertices;
 /// Why the frame took no new geometry in, if it did not.
 @property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
 /// The stop rendered for a reader, or nil when nothing stopped. Carries the
 /// *cause*: the advice for a full volume is actively wrong for the others.
 @property(nonatomic, readonly, copy, nullable) NSString* allocationStopReason;
+
+/// @name Figures a gauge is drawn from
+///
+/// Typed rather than pre-formatted, and that is the whole distinction between
+/// these and @ref sections. A row is a sentence and a meter is a ratio; a panel
+/// that wants to draw the 85% tick, or fill a bar to the fraction it measured,
+/// cannot recover either from `"84.6% of 32768 blocks"`.
+///
+/// Most of these are *also* in a section somewhere as text, because the gauge
+/// shows the position and the row shows the quantity and a reader acting on the
+/// number needs the second. It is not a rule, and stating it as one was wrong:
+/// @ref framesFused, @ref msSinceFuse, @ref stagesTruncated,
+/// @ref gpuTimingRetired and @ref extractStale exist precisely because the
+/// panel has to say something no row says -- and where a figure *is* in a
+/// section, the two must not be drawn on the same card twice, which is what put
+/// the same memory fraction on one card as a bar and a sentence.
+/// @{
+
+/// Triangles the last extract planned room for, in the one slot it wrote.
+///
+/// The denominator of the arena fill gauge. Not @ref VolumetricRenderer's arena
+/// byte total, which is recon's sum across the whole ring -- see
+/// `FusionStats::extract`.
+@property(nonatomic, readonly) uint32_t triangleCapacity;
+/// The capacity @ref occupancy is a fraction of, sampled in the same breath as
+/// it.
+///
+/// **Not** the capacity that pairs with @ref activeBlocks. The two are stamped
+/// at different cadences on purpose (see `FusionStats::table_blocks`), and a
+/// panel that divides one by the other builds a ratio out of two instants --
+/// which reads as a halved occupancy on exactly the frame after a doubling.
+@property(nonatomic, readonly) uint32_t tableBlocks;
+/// Active blocks as of the last successful remesh, with @ref extractStale
+/// saying whether that is this frame.
+@property(nonatomic, readonly) uint32_t activeBlocks;
+/// Whether @ref activeBlocks and @ref triangleCapacity come from a remesh older
+/// than this frame.
+@property(nonatomic, readonly) BOOL extractStale;
+
+/// The fuse thread's per-textured-remesh keyframe copy, which sits inside no
+/// stage row and no other total. Zero when no keyframe was published.
+///
+/// The extract's unaccounted remainder is deliberately **not** here beside it.
+/// It looks like the same kind of figure and is not: recon publishes it as the
+/// `"  ..other"` stage row, so it is already one of the bars, and a second copy
+/// on the snapshot only ever produced a panel that drew it twice and then said
+/// it was in neither bar. This one really is outside every span there is.
+@property(nonatomic, readonly) double atlasCopyMs;
+/// Fused frames so far, as the panel's own answer to "has anything completed
+/// yet".
+///
+/// The distinction @ref msSinceStages cannot make and a zero stage count does
+/// not carry: before the first frame fuses all the way through there are no
+/// stage rows *and* no measurement switch turned off, and a card that reports
+/// the second on the strength of the first sends a reader after a config flag
+/// instead of the fault in front of them.
+@property(nonatomic, readonly) uint64_t framesFused;
+/// Milliseconds since the stage rows were published, or 0 when none ever were.
+///
+/// The staleness half the bars otherwise lack. A frame count cannot carry it:
+/// the rows publish on the same path that increments the fused counter, so the
+/// frames that leave them behind are exactly the ones that never reach it.
+///
+/// Read **against @ref msSinceFuse**, never against a threshold of its own.
+@property(nonatomic, readonly) double msSinceStages;
+/// Milliseconds since the last fused frame, and the only thing
+/// @ref msSinceStages means anything against.
+///
+/// The pair is the reading; neither half is one alone. An ARKit interruption
+/// stops both clocks together, and a panel comparing the first to a fixed
+/// second announces stale timings for the duration of a phone call -- blaming
+/// the fusion for the camera. The *difference* isolates the case that is
+/// actually a fault: frames arriving, none completing.
+@property(nonatomic, readonly) double msSinceFuse;
+/// Whether recon reported more stages than the snapshot could hold, making the
+/// bars an under-report rather than a short pipeline.
+@property(nonatomic, readonly) BOOL stagesTruncated;
+/// Whether device timing measured once and has since retired itself, which is a
+/// fault -- as distinct from a queue family that never reported timestamps,
+/// which is a hardware verdict. Both leave every device bar absent.
+@property(nonatomic, readonly) BOOL gpuTimingRetired;
+
 @property(nonatomic, readonly) uint64_t memoryFootprintBytes;
 @property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
+/// The jetsam ceiling, or 0 when it is not known -- which is not the same as
+/// zero headroom.
+///
+/// **`> 0` is the whole test for drawing a ratio against it**, together with
+/// @ref memoryValid for the numerator. The at-limit case is already folded in
+/// here: the kernel clamps the remainder there, so the derived ceiling
+/// collapses onto the footprint and a bar drawn from the two would read as a
+/// tidy 100% in precisely the pre-jetsam window it exists to catch -- which is
+/// why this publishes 0 rather than that number. Re-testing @ref memoryAtLimit
+/// beside it is a duplicate of that fold, and a consumer that lets it gate more
+/// than this one ratio blanks the readings that are still good: the working set
+/// is an independent measurement, and the peak is the only figure on the card
+/// that survives the gap between polls at all.
+@property(nonatomic, readonly) uint64_t memoryLimitBytes;
+/// High-water footprint over the process's life, or 0 when the kernel did not
+/// supply it. The only figure here that survives the gap between polls, and so
+/// the only one that can show a `resize` spike at all.
+@property(nonatomic, readonly) uint64_t memoryPeakBytes;
+/// Whether the kernel answered. The byte fields above are meaningless if not,
+/// and a bar drawn from their zeroes is a fabricated healthy reading.
+@property(nonatomic, readonly) BOOL memoryValid;
+/// Whether the kernel reports no headroom left: the last state before jetsam.
+@property(nonatomic, readonly) BOOL memoryAtLimit;
+/// @}
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
@@ -540,12 +650,22 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Swift, so a bridged accessor is the only thing that actually prevents it.
 @property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
 
-/// @brief Block-table capacity — the denominator behind
-///        @ref VolumetricFrameSample.occupancy.
+/// @brief Block-table capacity as of the last successful remesh — the partner
+///        of @ref VolumetricDashboardSnapshot.activeBlocks, and of nothing
+///        else.
 ///
-/// Beside the fraction rather than folded into it: a meter reads as "85% full"
-/// while the sentence under it wants "223k of 262k". The fraction says how
-/// close; the pair says how much room the last doubling bought.
+/// **Not the denominator behind @ref VolumetricFrameSample.occupancy**, which
+/// is what this said and what made it a trap. `occupancy` is read from
+/// `load_factor` on every fused frame; this is stamped beside the active-block
+/// count when a remesh succeeds. Dividing one by the other builds a ratio out
+/// of two different instants: it reads `4.3% of 0 blocks` before the first
+/// extract, halves on the frame after a doubling whose remesh skips, and then
+/// freezes for the rest of the session under a persistent extract failure while
+/// the map keeps growing underneath it.
+///
+/// For a figure to print beside the occupancy meter -- the "223k of 262k" under
+/// an "85% full" -- use @ref VolumetricDashboardSnapshot.tableBlocks, which is
+/// sampled in the same breath as the fraction it belongs to.
 @property(nonatomic, readonly) uint32_t blockCapacity;
 
 /// @brief What the process is charged, and the two ceilings it is charged

@@ -121,17 +121,6 @@ constexpr std::uint32_t effective_mesh_slots(const FusionConfig& config) {
   return config.incremental_benchmark ? 1u : config.mesh_slots;
 }
 
-/// How many *fused* frames between dirty-block surveys.
-///
-/// Fused rather than captured, which is the unit the window is reported in and
-/// the one `FusionConfig::fuse_every` does not distort: keying the survey off
-/// the capture counter made the real period 60/gcd(60, fuse_every) fused
-/// frames, so every value sharing a factor with 60 shortened the window
-/// silently and `fuse_every == 60` collapsed it to *every* fused frame -- a
-/// full compaction, fence and readback per fuse, on the knob someone reaches
-/// for precisely to buy frame budget back.
-constexpr std::uint64_t kSurveyEveryFrames = 60;
-
 /// How far past its own cadence a survey reading may fall before the read-out
 /// stops presenting it as current.
 ///

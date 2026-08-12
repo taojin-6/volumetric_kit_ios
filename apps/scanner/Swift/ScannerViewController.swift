@@ -446,8 +446,14 @@ final class ScannerViewController: UIViewController {
     // from the failed attempt stayed over a working dashboard for the rest of
     // the process -- a red alert reporting a state the app had recovered from.
     dashboard.failure = nil
+    // The GPU as MoltenVK names it, above the machine it is part of. Vulkan
+    // reports the *GPU* -- "Apple M5 GPU" -- which is not the same as knowing
+    // which iPad this is: the model identifier is what a measurement in this
+    // project's notes is attributed to, and every figure on the panel beneath
+    // it is only meaningful against a named device.
     deviceSummary = """
       \(brought.deviceName)
+      \(Self.hardwareSummary())
       Vulkan \(brought.apiVersion) via MoltenVK
       device    \(brought.sharedDeviceSummary)
       shared    \(brought.sharesOneDevice ? "yes - recon and gfx hold one VkDevice" : "NO - separate devices")
@@ -455,6 +461,30 @@ final class ScannerViewController: UIViewController {
     // The view may have appeared, or been backgrounded, or both, while bring-up
     // was in flight. `resume` is what reconciles that rather than assuming.
     resume()
+  }
+
+  /// The SoC side of the device identity: the model identifier and its core
+  /// count.
+  ///
+  /// `utsname.machine` rather than `UIDevice.model`, which answers "iPad" on
+  /// every iPad ever made. This one distinguishes the hardware a timing was
+  /// taken on, which is the only form in which a timing means anything -- the
+  /// extract cost this project quotes is a specific device's number.
+  ///
+  /// Installed RAM is deliberately absent: the Memory card already reports it,
+  /// from the kernel reading that the gauges beside it come from, and putting a
+  /// second copy here from a second source is how the two come to disagree.
+  private static func hardwareSummary() -> String {
+    var system = utsname()
+    uname(&system)
+    // NUL-terminated by uname, and read through the raw bytes because the field
+    // arrives in Swift as a 256-tuple of CChar rather than as an array.
+    let machine = withUnsafeBytes(of: &system.machine) { raw -> String in
+      guard let base = raw.baseAddress else { return "unknown" }
+      return String(cString: base.assumingMemoryBound(to: CChar.self))
+    }
+    let cores = ProcessInfo.processInfo.processorCount
+    return "\(machine)  \(cores) cores"
   }
 
   private func startDisplayLink() {
@@ -655,16 +685,32 @@ final class ScannerViewController: UIViewController {
     dashboard.trackingHealthy = tracking.description == "normal"
     dashboard.framesIn = Int(s.frames_submitted)
     dashboard.framesDropped = Int(s.frames_dropped)
+    // Both ceilings, not one. The earlier note here picked the working set on
+    // the grounds that the jetsam ceiling sits above installed RAM and so
+    // reports headroom that does not exist -- true, and an argument for drawing
+    // the working set *first*, not for discarding the other. They can bind in
+    // either order, and the one that kills the process is the jetsam limit.
+    // Neither was ever drawn anyway: these two properties were assigned every
+    // tick to a view that rendered no gauge at all.
     dashboard.memoryUsedBytes = snapshot.memoryFootprintBytes
-    // The GPU working set, not the jetsam limit: the jetsam ceiling on this
-    // hardware sits above installed RAM, so showing it reports headroom that
-    // does not exist. See VolumetricRenderer.gpuWorkingSetBytes.
-    dashboard.memoryCeilingBytes = snapshot.gpuWorkingSetBytes
+    dashboard.memoryWorkingSetBytes = snapshot.gpuWorkingSetBytes
+    dashboard.memoryLimitBytes = snapshot.memoryLimitBytes
+    dashboard.memoryPeakBytes = snapshot.memoryPeakBytes
+    dashboard.memoryValid = snapshot.memoryValid
     dashboard.stages = snapshot.stages.map {
       StageBar(
         id: $0.name, name: $0.name, hostMs: $0.cpuMs,
         deviceMs: $0.gpuMs, hasGPU: $0.hasGpu)
     }
+    // What the bars do not cover, and how far they can be trusted. The age is
+    // two figures because it is a comparison: `msSinceStages` alone cannot tell
+    // a stalled pipeline from a paused camera.
+    dashboard.atlasCopyMs = snapshot.atlasCopyMs
+    dashboard.framesFused = snapshot.framesFused
+    dashboard.msSinceStages = snapshot.msSinceStages
+    dashboard.msSinceFuse = snapshot.msSinceFuse
+    dashboard.stagesTruncated = snapshot.stagesTruncated
+    dashboard.gpuTimingRetired = snapshot.gpuTimingRetired
     dashboard.history = snapshot.history.map {
       FrameSample(
         id: $0.frame, hostMs: $0.hostMs, deviceMs: $0.deviceMs,
@@ -680,11 +726,20 @@ final class ScannerViewController: UIViewController {
     // turned critical every frame while the headline meter stayed frozen at the
     // last fused frame and the banner never appeared at all.
     dashboard.triangles = Int(snapshot.triangles)
+    dashboard.vertices = Int(snapshot.vertices)
+    dashboard.triangleCapacity = Int(snapshot.triangleCapacity)
+    // Travels with the capacity it qualifies. Both halves of the arena fill are
+    // stamped only by a successful remesh, so without this the gauge freezes
+    // and goes on reporting a fill for a surface that has kept growing.
+    dashboard.extractStale = snapshot.extractStale
     dashboard.occupancy = snapshot.occupancy
     dashboard.occupancyKnown = snapshot.occupancyKnown
     dashboard.allocationStopReason = snapshot.allocationStopReason
-    // The grouping is the bridge's, not this file's -- the same sections the
-    // log line is rendered from, so screen and transcript cannot drift.
+    // The grouping is the bridge's, not this file's. That keeps the panel from
+    // inventing a grouping of its own; it is **not** a guarantee against drift,
+    // which is what this note used to claim. The log line formats its own text
+    // from the same stats (see the TODO on `-statSections`), and the two had in
+    // fact drifted -- see the note at the top of Dashboard.swift.
     dashboard.groups = snapshot.sections.map { s in
       StatGroup(
         id: s.title,
@@ -692,14 +747,17 @@ final class ScannerViewController: UIViewController {
           StatItem(label: $0.label, value: $0.value, tone: $0.tone)
         })
     }
-    // True prose rather than figures, so these stay as lines. The render state
-    // joins the device identity: the camera mode in particular earns its place
-    // because a manual camera pointed away from the scan and a scan that
-    // stopped producing geometry look identical on screen -- and the only text
-    // documenting double-tap-to-refollow lives on that line.
+    // True prose rather than figures, so these stay as lines -- but as three
+    // cards rather than one. The render state used to be appended onto the
+    // device identity, which put a drawable size, a camera mode and a presented
+    // count under a heading that says "Device": four lines that change every
+    // frame beneath four that are fixed for the life of the process. The camera
+    // mode in particular is worth finding, because a manual camera pointed away
+    // from the scan and a scan that stopped producing geometry look identical
+    // on screen, and the only text documenting double-tap-to-refollow is on it.
     dashboard.deviceLines =
       deviceSummary.components(separatedBy: "\n").filter { !$0.isEmpty }
-      + renderLines
+    dashboard.renderLines = renderLines
     dashboard.captureLines = captureLines
 
     // The text survives for stdout alone: `devicectl process launch --console`
