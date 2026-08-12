@@ -81,7 +81,40 @@ target_include_directories(scanner_bridge
 # conversions. Since the camera parameter blocks moved into core it links
 # recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
 # to implement ICameraCapture; recon_tsdf and recon_texture below are what the
-# fusion spine consumes, and recon_mesh/recon_volume arrive transitively.
+# fusion spine consumes, and recon_mesh/recon_volume arrive transitively. Build
+# the scanner as a measurement binary: one mesh slot, spans tracked, and NO
+# geometry published, so recon's incremental extract can be timed at the
+# device's own dirty fraction. Vertex sharing stays ON -- unsharing is what the
+# first version did and it cost 3x the vertex arena, which is a settled revert,
+# not a knob. Compile-time rather than runtime because iOS resumes a process
+# instead of cold-starting it, so an environment variable survives exactly one
+# launch and then lies. See FusionConfig::incremental_benchmark.
+#
+# A define cannot drift across a *resume*, which is the failure the environment
+# variable had. It can still drift across a CONFIGURE: option() writes a CACHE
+# entry, so -DVI_INCREMENTAL_BENCHMARK=ON latches into the build tree and every
+# later cmake in that directory keeps it -- including the plain configure line
+# in README.md, which names no such flag and so cannot clear it. That is a worse
+# failure than the one it replaced if it goes unnoticed, because it turns an
+# ordinary app build into one that publishes no geometry: a scanner that renders
+# an empty room and looks broken.
+#
+# So it announces itself. Every configure of a tree carrying it prints this, and
+# the message names the way out, because the natural repair -- re-run the
+# configure line from the README -- is exactly the one that does not work.
+option(VI_INCREMENTAL_BENCHMARK
+       "Scanner measures incremental extraction and draws no mesh" OFF)
+if(VI_INCREMENTAL_BENCHMARK)
+  message(
+    WARNING
+      "VI_INCREMENTAL_BENCHMARK is ON: this scanner build MEASURES incremental "
+      "extraction and publishes NO geometry, so it renders an empty scene by "
+      "design. It is cached in this build tree and survives a plain re-configure"
+      " -- clear it with -DVI_INCREMENTAL_BENCHMARK=OFF.")
+  # On the bridge, which is where VolumetricRenderer.mm compiles.
+  target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
+endif()
+
 target_link_libraries(
   scanner_bridge
   PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core

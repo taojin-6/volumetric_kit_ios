@@ -126,3 +126,26 @@ jobs:
             exit 1
           fi
           echo "${found} app bundle(s) verified as iOS arm64."
+
+      # The measurement build, compiled but not shipped.
+      #
+      # VI_INCREMENTAL_BENCHMARK gates a `#ifdef` branch in VolumetricRenderer.mm
+      # and a different extractor configuration behind it, and the gate above
+      # passes only the toolchain file -- so without this nothing in CI ever
+      # compiles that branch. It would then break in whichever direction main
+      # drifted, silently, and be discovered by the one person configuring it on
+      # the day they were trying to take a reading.
+      #
+      # A separate build tree, because the flag is cached and setting it in the
+      # shipping one would latch it there for every later step. scanner_bridge
+      # only: it is the sole target the define reaches, and a whole second app
+      # build for one translation unit's worth of coverage is not worth the
+      # minutes. _deps is already populated and shared through the cache above,
+      # so this configure re-fetches nothing.
+      - name: Configure + build the measurement mode (compile coverage)
+        run: |
+          cmake -S . -B build-bench -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
+            -DVI_INCREMENTAL_BENCHMARK=ON
+          cmake --build build-bench --config Debug --target scanner_bridge -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
