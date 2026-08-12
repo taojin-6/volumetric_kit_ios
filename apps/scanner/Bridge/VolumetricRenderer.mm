@@ -1013,11 +1013,16 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
 @end
 
 @interface VolumetricDashboardSnapshot ()
+// The budget whole, not the one field the panel used to draw. The gauges need
+// the ceiling, the peak and both refusal flags, and passing them individually
+// would be five more parameters that can be threaded in the wrong order --
+// while the struct is already a single coherent reading from one `task_info`
+// call, which is the property the whole snapshot exists to preserve.
 - (instancetype)initWithStages:(NSArray<VolumetricStageRow*>*)stages
                       sections:(NSArray<VolumetricStatSection*>*)sections
                        history:(NSArray<VolumetricFrameSample*>*)history
                          stats:(const app::FusionStats&)stats
-                     footprint:(std::uint64_t)footprint
+                        budget:(const app::MemoryBudget&)budget
                     workingSet:(std::uint64_t)workingSet;
 @end
 
@@ -1026,7 +1031,7 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
                       sections:(NSArray<VolumetricStatSection*>*)sections
                        history:(NSArray<VolumetricFrameSample*>*)history
                          stats:(const app::FusionStats&)stats
-                     footprint:(std::uint64_t)footprint
+                        budget:(const app::MemoryBudget&)budget
                     workingSet:(std::uint64_t)workingSet {
   if ((self = [super init])) {
     _stages = [stages copy];
@@ -1038,13 +1043,44 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
     _occupancy = stats.occupancy;
     _occupancyKnown = stats.occupancy_known ? YES : NO;
     _triangles = stats.triangles;
+    _vertices = stats.vertices;
     _allocationStop = allocation_stop_value(stats.allocation_stop);
     _allocationStopReason =
         stats.allocation_stop == app::AllocationStop::None
             ? nil
             : to_ns_string(allocation_stop_text(stats.allocation_stop).advice);
-    _memoryFootprintBytes = footprint;
+
+    // The gauge figures. `table_blocks` rather than `table_capacity` beside the
+    // occupancy, and `table_capacity` only beside `active_blocks` -- the two
+    // pairs are stamped at different cadences and each is coherent only with
+    // its own partner. See FusionStats::table_blocks.
+    _triangleCapacity = stats.extract.triangle_capacity;
+    _tableBlocks = stats.table_blocks;
+    _activeBlocks = stats.extract.active_blocks;
+    _extractStale = stats.extract_stale ? YES : NO;
+
+    // Floored at zero rather than trusted: the two are measured by different
+    // clocks around nested scopes, so a small negative is a rounding artefact
+    // and drawing it as a bar going the other way is not.
+    _extractResidualMs = std::max(
+        0.0, static_cast<double>(stats.extract_ms) - stats.extract.total_ms());
+    _atlasCopyMs = stats.atlas_copy_ms;
+    _msSinceStages = stats.ms_since_stages;
+    _stagesTruncated = stats.stages_truncated ? YES : NO;
+    _gpuTimingRetired = stats.gpu_timing_retired ? YES : NO;
+
+    _memoryFootprintBytes = budget.footprint_bytes;
     _gpuWorkingSetBytes = workingSet;
+    // Zero when the ceiling is not a real one. `limit_known` is false both for
+    // a kernel too old to report the remainder and for a process already at the
+    // limit, and in the second case `limit_bytes` is a live number that means
+    // the opposite of what it looks like -- it has collapsed onto the
+    // footprint. Publishing 0 makes a consumer that forgets to check draw
+    // nothing rather than draw 100%.
+    _memoryLimitBytes = budget.limit_known ? budget.limit_bytes : 0;
+    _memoryPeakBytes = budget.peak_footprint_bytes;
+    _memoryValid = budget.valid ? YES : NO;
+    _memoryAtLimit = budget.at_limit ? YES : NO;
   }
   return self;
 }
@@ -2226,13 +2262,38 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
               : fmt("x%llu", (unsigned long long)_impl->memory_warnings),
           VolumetricStatToneCritical);
     }
+    // The fusion's own error counter, here rather than on the section that
+    // describes the geometry. It was a row on `Fusion` -- beside the frame and
+    // vertex counts, in a card a reader consults for scale rather than for
+    // health -- which put the two halves of "something is wrong" on opposite
+    // sides of the panel: the bridge's failures here, the fusion's four cards
+    // away. A fault is a fault whichever thread noticed it.
+    if (s.errors > 0) {
+      // The count with the reason, not the reason alone. `last_error` is
+      // most-recent-wins and `fuse` republishes every fused frame, so a
+      // repeating failure surfaced for under 16 ms at a time; the count is what
+      // holds still long enough to be read.
+      add(r, @"fusion",
+          fmt("%llu errors  %s", (unsigned long long)s.errors,
+              s.last_error.c_str()),
+          VolumetricStatToneCritical);
+    }
     if (r.count > 0) [out addObject:make_section(@"Alerts", r)];
   }
 
-  // --- Fusion ---------------------------------------------------------------
+  // --- Scene: the geometry, and the arena holding it -------------------------
+  //
+  // One section where there were three. `Fusion` carried `%u verts / %u tris`,
+  // `Extract` carried the same pair back as `emitted`, and `Arena` carried the
+  // triangle count a third time as the numerator of its fill ratio -- with the
+  // headline's `M tris` above them making four. They are one quantity measured
+  // once: `stats_.vertices` and `stats_.triangles` are assigned from the mesh
+  // the extract just wrote. The only case in which the two differed was an
+  // extract too stale to have written it, which is a *staleness* fact and now
+  // reads as one.
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    // First row in the first section, because it is the answer to the question
+    // First row on the first card, because it is the answer to the question
     // the screen is provoking. This build publishes no geometry, so the view is
     // empty from launch however well the scan is going -- and the operator
     // walking the room is the one supplying the coverage being measured. Left
@@ -2242,17 +2303,6 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       add(r, @"mode", @"MEASURING -- no geometry drawn",
           VolumetricStatToneWarn);
     }
-    add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
-    // The version is the publish counter, and under the measurement mode
-    // nothing publishes -- so it stays 0 while the remesh count climbs. Printed
-    // as "(v3)" beside "4900" that reads exactly like a wedged publish path,
-    // which is the one thing a diagnostic build must not be ambiguous about.
-    // Named instead, since "not published" is the mode working.
-    add(r, @"remesh",
-        s.incremental_benchmark
-            ? fmt("%llu  (not published)", (unsigned long long)s.remeshes)
-            : fmt("%llu  (v%u)", (unsigned long long)s.remeshes,
-                  s.mesh_version));
     // Under an incremental extract these are recon's arena watermark, which
     // still counts ranges the kernel retired in place, so they run above the
     // live surface. Marked rather than silently compared against a normal
@@ -2261,82 +2311,75 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         s.spans_tracked ? fmt("%u verts / %u tris  (incl. retired)", s.vertices,
                               s.triangles)
                         : fmt("%u verts / %u tris", s.vertices, s.triangles));
-    // The texture pass, as a state rather than a duration -- the Pipeline
-    // section below already carries its timing, and this row exists to say
-    // which of the four things a 0.0 ms there means. See app::TextureState,
-    // and its warning about what "ran" does not claim.
+    // The arena's fill against the plan for the slot this extract wrote. Its
+    // own row rather than folded into the mesh line above: the numerator is the
+    // same triangle count, but the question is whether the next remesh has room
+    // rather than how much surface there is.
     //
-    // The tolerance travels with it because it is the knob the state is the
-    // only feedback for: FusionConfig::occlusion_threshold documents finding
-    // the value by turning it while pointing at one surface and watching where
-    // texturing stops, and until this row existed the panel showed neither the
-    // value being turned nor whether the pass was running at all.
-    switch (s.texture_state) {
-      case app::TextureState::Off:
-        add(r, @"texture", @"off");
-        break;
-      case app::TextureState::Pending:
-        add(r, @"texture", @"on, no remesh yet");
-        break;
-      case app::TextureState::NoColor:
-        add(r, @"texture", @"skipped -- no colour on this frame",
-            VolumetricStatToneWarn);
-        break;
-      case app::TextureState::Failed:
-        add(r, @"texture", @"failed", VolumetricStatToneCritical);
-        break;
-      case app::TextureState::Ran:
-        add(r, @"texture", fmt("%.3f m tolerance", s.occlusion_threshold),
-            VolumetricStatToneGood);
-        break;
-    }
-    if (s.atlas_copy_ms > 0.0f) {
-      // The fuse thread's ~11 MB keyframe copy, which appears in no stage row
-      // and inside no other total -- see FusionStats::atlas_copy_ms for why it
-      // is measured rather than assumed to stay at the ~0.06 ms it is priced
-      // at.
-      add(r, @"keyframe copy", fmt("%.2f ms", s.atlas_copy_ms));
-    }
-    if (s.errors > 0) {
-      add(r, @"errors",
-          fmt("%llu  %s", (unsigned long long)s.errors, s.last_error.c_str()),
-          VolumetricStatToneCritical);
-    }
-    [out addObject:make_section(@"Fusion", r)];
-  }
-
-  // --- Stages: the host/device split, per stage -----------------------------
-  {
-    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    for (std::uint32_t i = 0; i < s.stage_count; ++i) {
-      const vr::StageRow& row = s.stages[i];
-      NSString* value =
-          row.has_gpu ? fmt("%6.2f ms   gpu %6.2f", row.cpu_ms, row.gpu_ms)
-                      : fmt("%6.2f ms   gpu      -", row.cpu_ms);
-      // Through to_ns_string, and guarded for null, exactly as
-      // VolumetricStageRow does with the same field and for the same reasons --
-      // `label` is nonnull, and this was the one place the row name reached
-      // Swift through a bare stringWithUTF8String:.
-      add(r, to_ns_string(row.name != nullptr ? row.name : ""), value);
-    }
-    if (s.stage_count > 0) [out addObject:make_section(@"Pipeline", r)];
-  }
-
-  // --- Extract: what is left once its timings became pipeline stages -------
-  {
-    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    add(r, @"passes", fmt("%u", s.extract.dispatches),
-        s.extract.dispatches > 1 ? VolumetricStatToneWarn
-                                 : VolumetricStatToneNeutral);
-    add(r, @"emitted",
-        fmt("%u tris / %u verts", s.extract.emitted_triangles,
-            s.extract.emitted_vertices));
+    // OCCUPANCY, not live-surface fill, and the distinction is the whole of
+    // this row under an incremental extract. `s.triangles` is recon's arena
+    // watermark, which still counts triangles the kernel retired in place, so
+    // the ratio runs above the live surface by however much the arena has not
+    // compacted away -- recon's own occupancy ceiling is what eventually forces
+    // a full pass to compact it. Left driving the tone, because the resident
+    // bytes are genuinely held either way, but named so a warn colour is not
+    // read as "the live surface is about to overflow".
+    const double fill = s.extract.triangle_capacity > 0
+                            ? (double)s.triangles / s.extract.triangle_capacity
+                            : 0.0;
+    add(r, @"arena",
+        s.spans_tracked ? fmt("%.1f%% of %u tris  (incl. retired)",
+                              100.0 * fill, s.extract.triangle_capacity)
+                        : fmt("%.1f%% of %u tris", 100.0 * fill,
+                              s.extract.triangle_capacity),
+        tone_for(fill, 0.9, 0.98));
+    // recon folds the per-block span table into `arena_bytes` -- grid-sized,
+    // and doubling on every VoxelHashMap::resize -- so this figure is not
+    // comparable with a normal build's. The table is the measurement's own
+    // cost, which makes saying so part of reporting the measurement.
+    add(r, @"resident",
+        s.spans_tracked ? fmt("%.0f MB across %u slot%s  (incl. span table)",
+                              s.extract.arena_bytes / mb, s.mesh_slots,
+                              s.mesh_slots == 1 ? "" : "s")
+                        : fmt("%.0f MB across %u slots",
+                              s.extract.arena_bytes / mb, s.mesh_slots));
+    // The publish counter, or the reason there is not one. Under the
+    // measurement mode nothing publishes, so the version stays 0 while the
+    // remesh count climbs; printed as "v0 after 4900 remeshes" that reads
+    // exactly like a wedged publish path, which is the one thing a diagnostic
+    // build must not be ambiguous about. Named instead, since "not published"
+    // is the mode working.
+    add(r, @"version",
+        s.incremental_benchmark
+            ? fmt("not published, after %llu remeshes",
+                  (unsigned long long)s.remeshes)
+            : fmt("v%u after %llu remeshes", s.mesh_version,
+                  (unsigned long long)s.remeshes));
+    // `pass` rather than `dispatch`: the number is how many times the surface
+    // was meshed, and `dispatch` is a duration on the latency bars. Read it as
+    // cost, not as a verdict on the capacity planner -- the refit triggers
+    // against the slot's retained grow-only arena, so a plan that undershoots
+    // still reports one pass whenever an earlier peak left room to absorb it.
+    //
+    // The staleness marker rides on this row rather than on its own, because
+    // this is the row it invalidates: everything in `s.extract` above --
+    // capacity, arena bytes, and the mesh counts the extract stamped -- comes
+    // from the last *successful* remesh, and a breakdown frozen by a failing
+    // extract otherwise reads as current.
+    add(r, @"extract",
+        s.extract_stale
+            ? fmt("%u pass  [stale %llu frames]", s.extract.dispatches,
+                  (unsigned long long)s.frames_since_extract)
+            : fmt("%u pass", s.extract.dispatches),
+        s.extract_stale || s.extract.dispatches > 1
+            ? VolumetricStatToneWarn
+            : VolumetricStatToneNeutral);
     // The two rows the measurement mode exists to produce, and without which it
     // cannot be told from the thing it is measured against. recon falls back to
     // a full extract silently and by design -- a topology change, a grown
     // arena, flags it will not vouch for -- so "did this call re-mesh only the
-    // changed blocks" is reported rather than inferred. `dispatches` reads 1 on
-    // both paths and cannot answer it.
+    // changed blocks" is reported rather than inferred. `dispatches` on the row
+    // above reads 1 on both paths and cannot answer it.
     //
     // Shown only when the mode is on, because on the normal path `incremental`
     // is false by construction and a permanent "full" row is noise.
@@ -2369,27 +2412,71 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                 s.extract_window_frames == 1 ? "" : "s"));
       }
     }
-    if (s.extract_stale) {
-      add(r, @"stale",
-          fmt("%llu frames since", (unsigned long long)s.frames_since_extract),
-          VolumetricStatToneWarn);
+    add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
+    // The texture pass, as a state rather than a duration -- the latency bars
+    // already carry its timing, and this row exists to say which of the four
+    // things a 0.0 ms there means. See app::TextureState, and its warning about
+    // what "ran" does not claim.
+    //
+    // The tolerance travels with it because it is the knob the state is the
+    // only feedback for: FusionConfig::occlusion_threshold documents finding
+    // the value by turning it while pointing at one surface and watching where
+    // texturing stops, and until this row existed the panel showed neither the
+    // value being turned nor whether the pass was running at all.
+    switch (s.texture_state) {
+      case app::TextureState::Off:
+        add(r, @"texture", @"off");
+        break;
+      case app::TextureState::Pending:
+        add(r, @"texture", @"on, no remesh yet");
+        break;
+      case app::TextureState::NoColor:
+        add(r, @"texture", @"skipped -- no colour on this frame",
+            VolumetricStatToneWarn);
+        break;
+      case app::TextureState::Failed:
+        add(r, @"texture", @"failed", VolumetricStatToneCritical);
+        break;
+      case app::TextureState::Ran:
+        add(r, @"texture", fmt("%.3f m tolerance", s.occlusion_threshold),
+            VolumetricStatToneGood);
+        break;
     }
-    [out addObject:make_section(@"Extract", r)];
+    [out addObject:make_section(@"Scene", r)];
   }
 
-  // --- Volume: the ceiling that stops a scan --------------------------------
+  // --- The stage rows are NOT a section --------------------------------------
+  //
+  // They used to be. `Pipeline` formatted every stage into `"%6.2f ms   gpu
+  // %6.2f"` here, at a few hertz, and the panel then threw the whole section
+  // away -- `DashboardView` special-cased the title and drew bars from
+  // `stageRows` instead. Two formatters over one set of figures, one of them
+  // feeding nothing, and a title match holding them together. The bars are the
+  // only rendering, so `stageRows` is the only publication.
+
+  // --- Block table: the hash map, and the ceiling that stops a scan ----------
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     // `occupancy_known` gates the figure rather than decorating it. When
     // `load_factor` fails the fusion forces occupancy to 1.0 so the guard
     // refuses, and printing that as "100.0% of N blocks" in critical red is a
     // full volume reported on a volume that may be nearly empty.
+    //
+    // `table_blocks`, NOT `table_capacity`. Both are block-table capacities and
+    // the wrong one was here: `occupancy` is read from `load_factor` every
+    // fused frame, while `table_capacity` is stamped beside
+    // `extract.active_blocks` on a successful remesh, so the row divided a
+    // per-frame numerator by a per-remesh denominator -- the pairing
+    // FusionStats::table_blocks exists to prevent and names outright. It reads
+    // `4.3% of 0 blocks` before the first extract, halves after a doubling
+    // whose next remesh skips, and freezes for the session under a persistent
+    // extract failure while the map doubles beneath it.
     if (s.occupancy_known) {
       add(r, @"occupied",
-          fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_capacity),
+          fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_blocks),
           tone_for(s.occupancy, 0.7, 0.85));
     } else {
-      add(r, @"occupied", fmt("unreadable  (of %u blocks)", s.table_capacity),
+      add(r, @"occupied", fmt("unreadable  (of %u blocks)", s.table_blocks),
           VolumetricStatToneWarn);
     }
     // The cause, not one of the four causes. See `allocation_stop_text`: the
@@ -2401,8 +2488,33 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
               allocation_stop_text(s.allocation_stop).headline),
           VolumetricStatToneCritical);
     }
-    add(r, @"active", fmt("%u blocks", s.extract.active_blocks));
-    if (s.survey_active_blocks > 0) {
+    // The other capacity, with its own partner and its own cadence stated. Two
+    // block counts sat on this card reading as one quantity measured twice --
+    // `occupied` above moves every fused frame, this one only when a remesh
+    // succeeds. Saying which instant each belongs to is what stops a reader
+    // subtracting them.
+    add(r, @"active",
+        fmt("%u of %u blocks at last remesh", s.extract.active_blocks,
+            s.table_capacity));
+    [out addObject:make_section(@"Block table", r)];
+  }
+
+  // --- Dirty: the survey, off the card whose cadence it does not share -------
+  //
+  // It was the last row of `Volume`, under an `active` row it does not share a
+  // denominator with: `survey_active_blocks` is the whole active set as of the
+  // last survey, `extract.active_blocks` is the set as of the last remesh, and
+  // the two cadences differ by ~60x. Adjacent and near-identically labelled,
+  // they read as the same number disagreeing with itself.
+  {
+    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+    if (s.survey_active_blocks == 0) {
+      // A row rather than a missing card. The gate is a one-way latch, so an
+      // absent section here means "no survey yet" on the first window and
+      // "surveys are failing" ever after -- and a card that simply is not there
+      // reflows the grid the moment one lands.
+      add(r, @"survey", @"no sample yet");
+    } else {
       // The same three markers `fusionSummary` attaches, because each makes the
       // sample mean something other than what it looks like and the gate above
       // is a one-way latch that cannot take a stale sample back off the screen.
@@ -2424,64 +2536,52 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // There is no ratio to print, so the sentence is the result: this is
         // the branch that used to read "0.0%", the best available outcome
         // reported as no benefit at all.
-        add(r, @"dirty",
-            fmt("nothing changed in %llu frames%s",
-                (unsigned long long)s.survey_window_frames, note.c_str()),
-            survey_tone);
+        add(r, @"changed", fmt("nothing%s", note.c_str()), survey_tone);
       } else {
-        add(r, @"dirty",
-            fmt("%u changed -> %u remesh (%.1f%%)%s", s.survey_changed_blocks,
+        add(r, @"changed",
+            fmt("%u -> %u remesh (%.1f%%)%s", s.survey_changed_blocks,
                 s.survey_remesh_blocks,
                 100.0 * s.survey_remesh_blocks / (double)s.survey_active_blocks,
                 note.c_str()),
             survey_tone);
       }
+      // The denominator, on its own row and named as the survey's own. It was
+      // only ever inside the percentage above, which meant the one figure that
+      // says what the fraction is *of* could not be read off the panel at all.
+      add(r, @"active", fmt("%u blocks surveyed", s.survey_active_blocks));
+      // Published rather than assumed equal to the survey cadence: a frame that
+      // takes one of `fuse`'s error early-returns never reaches the survey, and
+      // the window runs on into the next one. Without it, a double-length union
+      // reports through an identical-looking line.
+      add(r, @"window",
+          fmt("%llu fused frames", (unsigned long long)s.survey_window_frames));
+      // What the survey cost. Measured because nothing else measures it, and on
+      // this card rather than among the latency bars because it runs on one
+      // frame in the window rather than on every frame they describe.
+      add(r, @"cost", fmt("%.2f ms", s.survey_ms));
     }
-    [out addObject:make_section(@"Volume", r)];
+    [out addObject:make_section(@"Dirty", r)];
   }
 
-  // --- Arena: the mesh ring -------------------------------------------------
-  {
-    NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    const double fill = s.extract.triangle_capacity > 0
-                            ? (double)s.triangles / s.extract.triangle_capacity
-                            : 0.0;
-    // OCCUPANCY, not live-surface fill, and the distinction is the whole of
-    // this row under an incremental extract. `s.triangles` is recon's arena
-    // watermark, which still counts triangles the kernel retired in place, so
-    // the ratio runs above the live surface by however much the arena has not
-    // compacted away -- recon's own occupancy ceiling is what eventually forces
-    // a full pass to compact it. Left driving the tone, because the resident
-    // bytes are genuinely held either way, but named so a warn colour is not
-    // read as "the live surface is about to overflow".
-    add(r, @"fill",
-        s.spans_tracked ? fmt("%.1f%% of %u tris  (incl. retired)",
-                              100.0 * fill, s.extract.triangle_capacity)
-                        : fmt("%.1f%% of %u tris", 100.0 * fill,
-                              s.extract.triangle_capacity),
-        tone_for(fill, 0.9, 0.98));
-    // recon folds the per-block span table into `arena_bytes` -- grid-sized,
-    // and doubling on every VoxelHashMap::resize -- so this figure is not
-    // comparable with a normal build's. The table is the measurement's own
-    // cost, which makes saying so part of reporting the measurement.
-    add(r, @"resident",
-        s.spans_tracked ? fmt("%.0f MB across %u slot%s  (incl. span table)",
-                              s.extract.arena_bytes / mb, s.mesh_slots,
-                              s.mesh_slots == 1 ? "" : "s")
-                        : fmt("%.0f MB across %u slots",
-                              s.extract.arena_bytes / mb, s.mesh_slots));
-    [out addObject:make_section(@"Arena", r)];
-  }
-
-  // --- Memory: both ceilings, because the smaller one binds -----------------
+  // --- Memory: what the two gauges beside these rows cannot draw -------------
+  //
+  // The `jetsam` and `gpu working set` ratios are gone from here, and only
+  // those: the panel now draws each as a filled bar from the typed fields on
+  // the snapshot, with its own numerator and ceiling written beneath it.
+  // Keeping the rows as well would have put the same two fractions on one card
+  // twice, which is the pattern this whole change is about. What stays is
+  // everything a bar cannot carry -- a reading that failed, a ceiling that is
+  // not a ceiling, and the two figures that are not ratios at all.
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     const std::uint64_t ws = workingSet;
-    // The same four branches `fusionSummary` has, and for the same reason: with
-    // only `ws > 0` and `limit_known`, a failed `task_info` left every figure
-    // at its zero and the card rendered "0 / 4096 MB (0.0%)" in the neutral
-    // tone -- a fabricated healthy reading, printed on the same tick the log
-    // line correctly said the reading was unavailable.
+    // The refusal branches `fusionSummary` also has, and for the same reason:
+    // with only `ws > 0` and `limit_known`, a failed `task_info` left every
+    // figure at its zero and the card rendered "0 / 4096 MB (0.0%)" in the
+    // neutral tone -- a fabricated healthy reading, printed on the same tick
+    // the log line correctly said the reading was unavailable. The gauges
+    // refuse to draw in both of these states, so the row is the only thing on
+    // the card that can say what happened.
     if (!budget.valid) {
       // The kernel's own code rather than a bare "unavailable". MemoryBudget
       // enumerates two reasons a reading can fail and they want different
@@ -2493,43 +2593,30 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // The last state before jetsam. The kernel clamps the remainder to 0
       // here, so deriving a ceiling yields limit == footprint and draws a tidy
       // 100% under a ceiling that rose to meet the number it was measuring.
-      // This gets a banner, not a ratio.
+      // This gets a sentence, not a ratio.
       add(r, @"held",
           fmt("%.0f MB — no headroom left before jetsam",
               budget.footprint_bytes / mb),
           VolumetricStatToneCritical);
-    } else if (budget.limit_known) {
-      const double f = budget.footprint_bytes / (double)budget.limit_bytes;
-      add(r, @"jetsam",
-          fmt("%.0f / %.0f MB  (%.1f%%)", budget.footprint_bytes / mb,
-              budget.limit_bytes / mb, 100.0 * f),
-          tone_for(f, 0.7, 0.85));
-    } else {
+    } else if (!budget.limit_known) {
+      // Valid, under the limit, and the ceiling still unreported: a kernel too
+      // old to carry `limit_bytes_remaining`. The footprint is real and the
+      // jetsam gauge has no denominator, so the figure comes through here.
       add(r, @"held",
           fmt("%.0f MB  (ceiling not reported)", budget.footprint_bytes / mb));
     }
-    // Printed even when task_info refused, because it is a separate reading
-    // that did not fail -- suppressing the whole card on one sub-failure would
-    // drop figures that are still obtainable. Guarded on being non-zero for the
-    // same reason as above: a zero here is an absent reading, not 0 MB.
-    if (ws > 0) {
-      if (budget.valid) {
-        const double f = budget.footprint_bytes / (double)ws;
-        add(r, @"gpu working set",
-            fmt("%.0f / %.0f MB  (%.1f%%)", budget.footprint_bytes / mb,
-                ws / mb, 100.0 * f),
-            tone_for(f, 0.7, 0.85));
-      } else {
-        add(r, @"gpu working set", fmt("%.0f MB recommended", ws / mb));
-      }
+    // Reported even when task_info refused, because it is a separate reading
+    // that did not fail -- suppressing it on another reading's fault would drop
+    // a figure that is still obtainable, and it is the *lower* of the two
+    // ceilings on this hardware. The gauge draws it whenever the footprint
+    // beside it is real; this row is what is left when it is not.
+    if (ws > 0 && !budget.valid) {
+      add(r, @"gpu working set", fmt("%.0f MB recommended", ws / mb));
     }
-    // The high-water mark, which is the only part of this card that can survive
-    // the gap between polls: a resize spike lasts well under one polling
-    // interval, so the sampled footprint beside it is the steady state and
-    // reads as comfortable no matter what the scan just survived.
-    if (budget.peak_footprint_bytes > 0) {
-      add(r, @"peak", fmt("%.0f MB", budget.peak_footprint_bytes / mb));
-    }
+    // No `peak` row. The high-water mark is on the snapshot as a figure and the
+    // panel ticks it onto both gauges, which is the one place it means
+    // something: a bare "peak 1620 MB" beside a fill the reader cannot compare
+    // it to is the number without the comparison that makes it worth keeping.
     if (budget.device_ram_bytes > 0) {
       add(r, @"device RAM", fmt("%.0f MB", budget.device_ram_bytes / mb));
     }
@@ -2557,7 +2644,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
             sections:[self sectionsForStats:s budget:budget workingSet:ws]
              history:self.frameHistory
                stats:s
-           footprint:budget.footprint_bytes
+              budget:budget
           workingSet:ws];
 }
 

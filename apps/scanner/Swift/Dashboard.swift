@@ -18,9 +18,23 @@
 /// *grouped*, and that the figures a reader has to act on carry visual state
 /// instead of waiting to be noticed in a column of digits.
 ///
-/// The grouping comes from the bridge (`statSections`), not from this file --
-/// the same sections the log line is rendered from, so the screen and the
-/// transcript cannot drift apart.
+/// **Each figure appears once.** The panel grew a card per source rather than a
+/// card per question, and the same quantity ended up on four of them: the
+/// triangle count was in the headline, in `Fusion`, again in `Extract` as
+/// `emitted`, and a fourth time as the numerator of `Arena`'s fill. Sections are
+/// grouped by what a reader is trying to find out now -- the geometry, the hash
+/// map, the survey, the memory position -- and a figure lives on exactly one of
+/// them.
+///
+/// The grouping and the figures come from the bridge (`statSections`); the
+/// *order* they are read in and the gauges drawn over them come from this file.
+/// That split is deliberate: the bridge knows which numbers are coherent with
+/// each other, and only a view knows what fits on a screen. It is not a
+/// guarantee against drift, and was never quite the one the previous note here
+/// claimed -- the log line formats its own text (see the TODO on
+/// `-statSections`), and the two had in fact drifted: the panel divided live
+/// occupancy by a remesh-cadence capacity while the transcript, three hundred
+/// lines away in the same file, divided it by the right one.
 
 import Charts
 import SwiftUI
@@ -93,6 +107,9 @@ final class DashboardModel: ObservableObject {
   @Published var fps: Double = 0
 
   @Published var triangles: Int = 0
+  /// Beside `triangles` rather than derived from it: the extract emits an
+  /// indexed mesh, so the ratio is a property of the surface being scanned.
+  @Published var vertices: Int = 0
   @Published var occupancy: Double = 0
   /// Whether `occupancy` is a reading rather than a fallback. The fusion forces
   /// it to 1.0 when `load_factor` fails so the guard refuses, and drawing that
@@ -110,15 +127,56 @@ final class DashboardModel: ObservableObject {
   @Published var framesIn = 0
   @Published var framesDropped = 0
 
+  /// The memory position, as figures rather than as sentences.
+  ///
+  /// These were published and drawn nowhere. Two of them existed on this model
+  /// through the whole life of the panel while the card beside them rendered
+  /// pre-formatted text from the bridge, so the app paid for the reading every
+  /// tick and showed a gauge of it never. They are what the two meters are
+  /// filled from now.
+  ///
+  /// `limit` and `workingSet` are two different ceilings and the *smaller* one
+  /// binds -- on this hardware that is the working set, which is why both are
+  /// drawn rather than whichever is larger. Zero means "not known", which is
+  /// never zero bytes: `valid` and `atLimit` are what say a bar must not be
+  /// drawn at all.
   @Published var memoryUsedBytes: UInt64 = 0
-  @Published var memoryCeilingBytes: UInt64 = 0
+  @Published var memoryLimitBytes: UInt64 = 0
+  @Published var memoryWorkingSetBytes: UInt64 = 0
+  @Published var memoryPeakBytes: UInt64 = 0
+  @Published var memoryValid = true
+  @Published var memoryAtLimit = false
+
+  /// Triangles the last extract planned room for, and the fill against it.
+  @Published var triangleCapacity: Int = 0
 
   @Published var stages: [StageBar] = []
+  /// The costs of a fused frame that no stage bar covers -- the extract's
+  /// unaccounted remainder and the keyframe copy. Named so the latency card can
+  /// say the bars are not the whole frame instead of implying they are.
+  @Published var stageResidualMs: Double = 0
+  @Published var atlasCopyMs: Double = 0
+  /// How old the bars are, and the two ways they can be less than they seem.
+  @Published var msSinceStages: Double = 0
+  @Published var stagesTruncated = false
+  @Published var gpuTimingRetired = false
+
   @Published var history: [FrameSample] = []
   @Published var groups: [StatGroup] = []
-  /// Device, API and capture lines: true prose, so they stay text.
+  /// True prose, so these stay text. Split three ways because they answer three
+  /// questions and were concatenated into one block: what hardware this is,
+  /// what the renderer is doing with it, and what ARKit is feeding it.
   @Published var deviceLines: [String] = []
+  @Published var renderLines: [String] = []
   @Published var captureLines: [String] = []
+
+  /// Whether the arena fill gauge has a denominator to divide by. Before the
+  /// first successful extract the capacity is 0, and a bar drawn from that
+  /// reports a full arena on one that holds nothing.
+  var arenaFillKnown: Bool { triangleCapacity > 0 }
+  var arenaFill: Double {
+    triangleCapacity > 0 ? Double(triangles) / Double(triangleCapacity) : 0
+  }
 
   /// A failure worth interrupting for. Distinct from the volume being full,
   /// which is the documented trade working and gets a calmer banner.
@@ -173,26 +231,29 @@ struct DashboardView: View {
           VStack(alignment: .leading, spacing: 10) {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
               Card("Timeline") { timeline }
-              // One card per section, and no card built outside this loop.
-              // A separate "Pipeline" card used to be added here while the
-              // bridge also published the same figures as a section, so every
-              // stage appeared twice -- once as a bar and once as a row. The
-              // stage group is rendered as bars *in place* instead, which keeps
-              // one source and one card.
-              ForEach(model.groups) { group in
+              // The stage bars, built here from `stages` and from no section.
+              // The bridge used to publish the same figures twice -- as bars
+              // and as a `Pipeline` section this loop then had to recognise by
+              // title and throw away. One source, one card, no title match.
+              Card("Latency") { latency }
+              // Sections in the order a reader works through them, not in the
+              // order the bridge appends them. See `sectionOrder`.
+              ForEach(orderedGroups) { group in
                 Card(group.id) {
-                  if group.id == "Pipeline" {
-                    stageBars
-                  } else {
+                  VStack(alignment: .leading, spacing: 7) {
+                    gauges(for: group.id)
                     rows(group.items)
                   }
                 }
               }
-              if !model.captureLines.isEmpty {
-                Card("Capture") { lines(model.captureLines) }
-              }
               if !model.deviceLines.isEmpty {
                 Card("Device") { lines(model.deviceLines) }
+              }
+              if !model.renderLines.isEmpty {
+                Card("Render") { lines(model.renderLines) }
+              }
+              if !model.captureLines.isEmpty {
+                Card("Capture") { lines(model.captureLines) }
               }
             }
           }
@@ -370,16 +431,168 @@ struct DashboardView: View {
     }
   }
 
-  private var stageBars: some View {
-    VStack(alignment: .leading, spacing: 3) {
-      ForEach(model.stages) { stage in
-        StageRowView(stage: stage, scale: stageScale)
+  /// The end-to-end breakdown: every stage recon reported, then what it did not
+  /// report, then how much of either to believe.
+  ///
+  /// The three parts are separate because they are separately wrong when they
+  /// are wrong. The bars are a measurement; the rows beneath them are costs
+  /// that sit inside no bar and would make the column silently under-report the
+  /// frame; the markers say the whole card describes an older frame than the
+  /// one on screen.
+  private var latency: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      if model.stages.isEmpty {
+        // Not an error. `FusionConfig::measure_stages` turns the rows off, and
+        // a blank card would read as a pipeline that costs nothing.
+        Text("stage timing off").font(.footnote).foregroundStyle(.secondary)
+      } else {
+        ForEach(model.stages) { stage in
+          StageRowView(stage: stage, scale: stageScale)
+        }
+        HStack(spacing: 10) {
+          LegendSwatch(color: .secondary, text: "host")
+          LegendSwatch(color: .accentColor, text: "device")
+        }
+        .font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
       }
-      HStack(spacing: 10) {
-        LegendSwatch(color: .secondary, text: "host")
-        LegendSwatch(color: .accentColor, text: "device")
+      outsideTheBars
+      staleness
+    }
+  }
+
+  /// Costs of the same fused frame that no bar above covers.
+  ///
+  /// Both were measured and published and neither was ever on this panel. The
+  /// extract's phase spans open after the slot claim and close before the
+  /// O(active_blocks) neighbour-table teardown, so the remainder grows with the
+  /// scan; the keyframe copy sits outside every span there is. Without them a
+  /// reader sums the column and gets a frame cost that is missing its tail --
+  /// and the sum is short by more the longer the scan runs, which is the one
+  /// direction that reads as rounding.
+  @ViewBuilder private var outsideTheBars: some View {
+    let extras =
+      [("extract residual", model.stageResidualMs), ("keyframe copy", model.atlasCopyMs)]
+      .filter { $0.1 > 0.005 }
+    if !extras.isEmpty {
+      VStack(alignment: .leading, spacing: 3) {
+        Text("not in the bars above")
+          .font(.system(size: 10.5, weight: .medium))
+          .foregroundStyle(.tertiary)
+        ForEach(extras, id: \.0) { name, ms in
+          HStack(alignment: .firstTextBaseline) {
+            Text(name).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(String(format: "%.2f ms", ms)).monospacedDigit()
+          }
+          .font(.footnote)
+        }
       }
-      .font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
+      .padding(.top, 3)
+    }
+  }
+
+  /// What makes the figures above less than they look.
+  ///
+  /// In milliseconds, not frames: the rows publish on the same path that
+  /// increments the fused counter, so a frame count between them is zero by
+  /// construction and the frames that leave the rows behind are exactly the
+  /// ones that never reach the counter.
+  @ViewBuilder private var staleness: some View {
+    let stale = model.msSinceStages >= 1000
+    if stale || model.stagesTruncated || model.gpuTimingRetired {
+      VStack(alignment: .leading, spacing: 2) {
+        if stale {
+          Text(String(format: "measured %.1f s ago", model.msSinceStages / 1000))
+        }
+        // An under-report with no other symptom: a full row array reads exactly
+        // like a pipeline that happened to have that many stages.
+        if model.stagesTruncated {
+          Text("more stages than the snapshot holds — rows are missing")
+        }
+        // A fault, and distinct from a device that never reported timestamps at
+        // all. Both leave every device bar absent; only this one is a failure.
+        if model.gpuTimingRetired {
+          Text("device timing retired after a failed fence — host only")
+        }
+      }
+      .font(.footnote)
+      .foregroundStyle(.orange)
+      .fixedSize(horizontal: false, vertical: true)
+      .padding(.top, 2)
+    }
+  }
+
+  /// The read order, independent of the order the bridge appends sections.
+  ///
+  /// Pinned because the grid is adaptive and a card that comes and goes moves
+  /// every card after it: `Alerts` appears only when something has failed, and
+  /// an unpinned order let the arrival of a fault reflow the panel a reader was
+  /// mid-way through. Unknown titles sort last rather than being dropped -- a
+  /// section this file has not been taught about is still a section the bridge
+  /// meant to publish.
+  private static let sectionOrder = ["Alerts", "Scene", "Block table", "Dirty", "Memory"]
+
+  private var orderedGroups: [StatGroup] {
+    model.groups.sorted { a, b in
+      let ra = Self.sectionOrder.firstIndex(of: a.id) ?? Self.sectionOrder.count
+      let rb = Self.sectionOrder.firstIndex(of: b.id) ?? Self.sectionOrder.count
+      return ra == rb ? a.id < b.id : ra < rb
+    }
+  }
+
+  /// The bars a card carries above its figures, where it has any.
+  ///
+  /// Only where a *position against a ceiling* is the question. Occupancy is
+  /// deliberately not here: the headline already carries that meter with its
+  /// 85% tick, and drawing it twice on one screen is the duplication this
+  /// change exists to remove.
+  @ViewBuilder private func gauges(for section: String) -> some View {
+    switch section {
+    case "Scene":
+      // Against the plan for the slot this extract wrote -- whether the next
+      // remesh has room, which the triangle count alone cannot answer.
+      if model.arenaFillKnown {
+        Gauge(
+          label: "arena", fraction: model.arenaFill, threshold: 0.9,
+          caption:
+            "\(Self.thousands(model.triangles)) / \(Self.thousands(model.triangleCapacity)) tris"
+        )
+      }
+    case "Memory":
+      // Both ceilings, because the smaller one binds and it is not always the
+      // same one. Neither is drawn from a reading that failed: at the limit the
+      // kernel clamps the remainder, so a derived ceiling collapses onto the
+      // footprint and the bar would read as a tidy 100% in exactly the
+      // pre-jetsam window it exists to catch.
+      // The peak ticks both bars rather than sitting under them as a row. It is
+      // the only figure on this card that survives the gap between polls -- a
+      // `resize` doubling spikes for well under one 2 Hz interval and is gone
+      // before the next sample -- so against the fill it says how much closer
+      // to the ceiling this scan has already been than it looks right now.
+      if model.memoryValid && !model.memoryAtLimit {
+        if model.memoryLimitBytes > 0 {
+          Gauge(
+            label: "jetsam",
+            fraction: Double(model.memoryUsedBytes) / Double(model.memoryLimitBytes),
+            threshold: 0.85,
+            caption: Self.megabytes(model.memoryUsedBytes, model.memoryLimitBytes),
+            mark: Self.fraction(model.memoryPeakBytes, model.memoryLimitBytes))
+        }
+        if model.memoryWorkingSetBytes > 0 {
+          Gauge(
+            label: "gpu",
+            fraction: Double(model.memoryUsedBytes) / Double(model.memoryWorkingSetBytes),
+            threshold: 0.85,
+            caption: Self.megabytes(model.memoryUsedBytes, model.memoryWorkingSetBytes),
+            mark: Self.fraction(model.memoryPeakBytes, model.memoryWorkingSetBytes))
+        }
+        if model.memoryPeakBytes > model.memoryUsedBytes {
+          Text("peak \(Self.mb(model.memoryPeakBytes))")
+            .font(.footnote).foregroundStyle(.secondary)
+        }
+      }
+    default:
+      EmptyView()
     }
   }
 
@@ -434,6 +647,37 @@ struct DashboardView: View {
 
   private static func millions(_ n: Int) -> String {
     String(format: "%.2f", Double(n) / 1_000_000)
+  }
+
+  /// Counts at the scale a gauge caption can hold. The arena runs to millions of
+  /// triangles and the raw digits do not fit beside a bar on a phone.
+  private static func thousands(_ n: Int) -> String {
+    n >= 1_000_000
+      ? String(format: "%.2f M", Double(n) / 1_000_000)
+      : String(format: "%.0f k", Double(n) / 1_000)
+  }
+
+  /// A gauge's two figures and its fraction, in one line under the bar.
+  ///
+  /// Both numerator and denominator, never the percentage alone: the fraction
+  /// is what the bar already draws, and a reader deciding whether to coarsen
+  /// the voxel size or drop a mesh slot needs the megabytes.
+  private static func megabytes(_ used: UInt64, _ total: UInt64) -> String {
+    guard total > 0 else { return mb(used) }
+    return String(
+      format: "%@ / %@  (%.0f%%)", mb(used), mb(total),
+      100 * Double(used) / Double(total))
+  }
+
+  private static func mb(_ bytes: UInt64) -> String {
+    String(format: "%.0f MB", Double(bytes) / (1024.0 * 1024.0))
+  }
+
+  /// A ratio for a gauge tick, or nil where there is nothing to divide by.
+  /// Returning nil rather than 0 keeps an absent reading from drawing a tick at
+  /// the origin, which reads as a high-water mark of zero.
+  private static func fraction(_ part: UInt64, _ whole: UInt64) -> Double? {
+    whole > 0 && part > 0 ? Double(part) / Double(whole) : nil
   }
 }
 
@@ -544,6 +788,15 @@ private struct Meter: View {
   /// fill and no tick, because a fabricated 1.0 rendered as a full bar is the
   /// most alarming reading on the panel produced by the absence of a reading.
   let known: Bool
+  /// A high-water mark to tick alongside the threshold, or nil for a bar whose
+  /// history is not kept.
+  ///
+  /// Drawn rather than written out because it answers a question about *this*
+  /// bar: how far past the fill the same quantity has already been. The memory
+  /// footprint is sampled at roughly 2 Hz and the allocation that gets a scan
+  /// killed is a spike lasting well under one interval -- so the fill is the
+  /// steady state and this is the only part of the gauge that saw the event.
+  var mark: Double? = nil
 
   var body: some View {
     GeometryReader { geo in
@@ -553,6 +806,14 @@ private struct Meter: View {
           Capsule()
             .fill(fraction >= threshold ? Color.orange : Color.accentColor)
             .frame(width: geo.size.width * min(max(fraction, 0), 1))
+          // Behind the threshold tick and in a quieter colour: it is context
+          // for the fill, while the threshold is the line that means act.
+          if let mark, mark > fraction {
+            Rectangle()
+              .fill(Color.primary.opacity(0.45))
+              .frame(width: 1.5)
+              .offset(x: geo.size.width * min(max(mark, 0), 1))
+          }
           Rectangle()
             .fill(Color.orange.opacity(0.9))
             .frame(width: 1.5)
@@ -566,6 +827,36 @@ private struct Meter: View {
     // the headline exists to carry. With a floor, an enclosing ViewThatFits is
     // told the row does not fit instead of being handed a 0 pt meter.
     .frame(minWidth: 80, idealWidth: 120, minHeight: 6, maxHeight: 6)
+  }
+}
+
+/// A labelled `Meter` with its two figures written beneath it.
+///
+/// The card-level counterpart to the headline's bare meter: same bar, same
+/// threshold tick, but carrying the label and the quantities a reader needs in
+/// order to act on the position. It exists because the rows it replaced could
+/// not draw a position at all -- `"1234 / 4096 MB (30.1%)"` says where the
+/// footprint is only to someone willing to divide, and the 85% line it is
+/// approaching was nowhere on the card.
+private struct Gauge: View {
+  let label: String
+  let fraction: Double
+  let threshold: Double
+  let caption: String
+  /// The high-water fraction, ticked on the bar. See `Meter.mark`.
+  var mark: Double? = nil
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      HStack(alignment: .firstTextBaseline) {
+        Text(label).foregroundStyle(.secondary)
+        Spacer(minLength: 8)
+        Text(caption).monospacedDigit()
+          .foregroundStyle(fraction >= threshold ? .orange : .secondary)
+      }
+      .font(.footnote)
+      Meter(fraction: fraction, threshold: threshold, known: true, mark: mark)
+    }
   }
 }
 

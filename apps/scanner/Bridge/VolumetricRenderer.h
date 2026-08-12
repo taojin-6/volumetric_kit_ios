@@ -300,13 +300,91 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 /// draw as a full volume.
 @property(nonatomic, readonly) BOOL occupancyKnown;
 @property(nonatomic, readonly) uint32_t triangles;
+/// The other half of the polycount, beside @ref triangles rather than derived
+/// from it: the extract emits an indexed mesh, so the ratio is a property of
+/// the surface and not a constant a reader can assume.
+@property(nonatomic, readonly) uint32_t vertices;
 /// Why the frame took no new geometry in, if it did not.
 @property(nonatomic, readonly) VolumetricAllocationStop allocationStop;
 /// The stop rendered for a reader, or nil when nothing stopped. Carries the
 /// *cause*: the advice for a full volume is actively wrong for the others.
 @property(nonatomic, readonly, copy, nullable) NSString* allocationStopReason;
+
+/// @name Figures a gauge is drawn from
+///
+/// Typed rather than pre-formatted, and that is the whole distinction between
+/// these and @ref sections. A row is a sentence and a meter is a ratio; a panel
+/// that wants to draw the 85% tick, or fill a bar to the fraction it measured,
+/// cannot recover either from `"84.6% of 32768 blocks"`. Everything here is
+/// also *in* a section somewhere as text -- deliberately, because the gauge
+/// shows the position and the row shows the quantity, and a reader acting on
+/// the number needs the second.
+/// @{
+
+/// Triangles the last extract planned room for, in the one slot it wrote.
+///
+/// The denominator of the arena fill gauge. Not @ref VolumetricRenderer's arena
+/// byte total, which is recon's sum across the whole ring -- see
+/// `FusionStats::extract`.
+@property(nonatomic, readonly) uint32_t triangleCapacity;
+/// The capacity @ref occupancy is a fraction of, sampled in the same breath as
+/// it.
+///
+/// **Not** the capacity that pairs with @ref activeBlocks. The two are stamped
+/// at different cadences on purpose (see `FusionStats::table_blocks`), and a
+/// panel that divides one by the other builds a ratio out of two instants --
+/// which reads as a halved occupancy on exactly the frame after a doubling.
+@property(nonatomic, readonly) uint32_t tableBlocks;
+/// Active blocks as of the last successful remesh, with @ref extractStale
+/// saying whether that is this frame.
+@property(nonatomic, readonly) uint32_t activeBlocks;
+/// Whether @ref activeBlocks and @ref triangleCapacity come from a remesh older
+/// than this frame.
+@property(nonatomic, readonly) BOOL extractStale;
+
+/// Milliseconds of the extract that its own phase rows do not account for.
+///
+/// `extract_ms - extract.total_ms()`, floored at zero. Published because the
+/// stage bars would otherwise be quietly incomplete: recon's spans open after
+/// the slot claim and close before the O(active_blocks) neighbour-table
+/// teardown, so this grows with the scan and is the one direction in which an
+/// unlabelled remainder is read as rounding.
+@property(nonatomic, readonly) double extractResidualMs;
+/// The fuse thread's per-textured-remesh keyframe copy, which sits inside no
+/// stage row and no other total. Zero when no keyframe was published.
+@property(nonatomic, readonly) double atlasCopyMs;
+/// Milliseconds since the stage rows were published, or 0 when none ever were.
+///
+/// The staleness half the bars otherwise lack. A frame count cannot carry it:
+/// the rows publish on the same path that increments the fused counter, so the
+/// frames that leave them behind are exactly the ones that never reach it.
+@property(nonatomic, readonly) double msSinceStages;
+/// Whether recon reported more stages than the snapshot could hold, making the
+/// bars an under-report rather than a short pipeline.
+@property(nonatomic, readonly) BOOL stagesTruncated;
+/// Whether device timing measured once and has since retired itself, which is a
+/// fault -- as distinct from a queue family that never reported timestamps,
+/// which is a hardware verdict. Both leave every device bar absent.
+@property(nonatomic, readonly) BOOL gpuTimingRetired;
+
 @property(nonatomic, readonly) uint64_t memoryFootprintBytes;
 @property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
+/// The jetsam ceiling, or 0 when it is not known -- which is not the same as
+/// zero headroom. Check @ref memoryValid and @ref memoryAtLimit before drawing
+/// a ratio against it: at the limit the kernel clamps the remainder, so the
+/// derived ceiling collapses onto the footprint and a bar drawn from the two
+/// reads as a tidy 100% in precisely the pre-jetsam window it exists to catch.
+@property(nonatomic, readonly) uint64_t memoryLimitBytes;
+/// High-water footprint over the process's life, or 0 when the kernel did not
+/// supply it. The only figure here that survives the gap between polls, and so
+/// the only one that can show a `resize` spike at all.
+@property(nonatomic, readonly) uint64_t memoryPeakBytes;
+/// Whether the kernel answered. The byte fields above are meaningless if not,
+/// and a bar drawn from their zeroes is a fabricated healthy reading.
+@property(nonatomic, readonly) BOOL memoryValid;
+/// Whether the kernel reports no headroom left: the last state before jetsam.
+@property(nonatomic, readonly) BOOL memoryAtLimit;
+/// @}
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
