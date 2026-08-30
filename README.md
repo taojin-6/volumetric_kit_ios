@@ -85,7 +85,7 @@ locked device.
 pre-commit install     # once — formatting + hygiene hooks on every commit
 ```
 
-The hooks mirror the sibling repos — the same pinned `clang-format` (22.1.5),
+The hooks mirror the sibling repos — the same pinned `clang-format` (22.1.8),
 the same `cmake-format`, and the same rule that Vulkan is reached only through
 gfx's `core/vulkan.hpp` umbrella — plus two of this repo's own: `swift-format`
 from the Xcode toolchain, and `shellcheck`.
