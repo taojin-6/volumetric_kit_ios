@@ -66,6 +66,44 @@ it explicitly or use a fresh build directory:
 cmake -S . -B build-ios -DVI_INCREMENTAL_BENCHMARK=OFF
 ```
 
+### The host tests
+
+`vi_core` — the scanner's pure logic — builds and runs on the machine you are
+sitting at:
+
+```sh
+cmake -S . -B build-host -DVI_HOST_TESTS=ON
+cmake --build build-host --parallel
+ctest --test-dir build-host --output-on-failure
+```
+
+No toolchain file, no MoltenVK, no recon, no gfx, no Xcode project — that mode
+short-circuits before any of them, so it is a couple of minutes rather than tens.
+
+It exists because **everything else here is build-only by nature**: MoltenVK
+ships no simulator slice and ARKit scene depth needs LiDAR, so nothing that
+touches Vulkan, recon or ARKit can execute anywhere but a real device. That left
+the parts of this app that genuinely *decide* things — a sign, a threshold,
+whether a kernel reading can be trusted — checkable only by installing a build
+and looking at it.
+
+`apps/scanner/Core/` is the subset that carries no such dependency: plain C++
+over glm, no Vulkan, no recon, no gfx, no Objective-C, no ARKit, no mach. The
+rule for what belongs there is in its `CMakeLists.txt`. Where a decision needs
+the device, the split is done at the seam rather than abandoned —
+`Bridge/MemoryQuery.cpp` makes the `task_info` call, `Core/MemoryBudget.cpp`
+decides what the answer means, and only the second half is testable. That is
+what puts the case that matters most within reach of a test: a kernel-clamped
+headroom of 0, which must be reported as an alarm rather than turned into a
+ceiling, and which cannot otherwise be reached without first persuading a real
+process to run out of memory.
+
+Two of the facts pinned here were settled on hardware and are expensive to
+re-establish — the sensor-basis-to-viewport turn, which had been wrong twice in
+two directions before an iPad Pro M5 settled it, and the takeover heading in
+`OrbitCamera`, which snapped the scene half a turn for any phone aimed above the
+horizon. Both are now regressions rather than sightings.
+
 ### Install and run
 
 ```sh
@@ -101,11 +139,13 @@ Two configuration notes specific to here:
   on a Linux hook runner. That is why the lint CI job runs on macOS while the
   siblings lint on Linux.
 
-CI (`.github/workflows/`) cross-compiles every app target for iOS arm64 and runs
-the same hooks. The build is **unsigned** (`CODE_SIGNING_ALLOWED=NO`), so no
-certificate or provisioning secret is needed, and **build-only**: MoltenVK ships
-no simulator slice and ARKit scene depth needs LiDAR, so nothing here is
-runnable in CI. It still earns its place — it catches a sibling change that
+CI (`.github/workflows/`) cross-compiles every app target for iOS arm64, runs
+the same hooks, and runs the `vi_core` host tests. The build is **unsigned**
+(`CODE_SIGNING_ALLOWED=NO`), so no certificate or provisioning secret is needed,
+and **build-only**: MoltenVK ships no simulator slice and ARKit scene depth needs
+LiDAR, so no *app* target is runnable in CI. The test leg is the one that
+executes — see [the host tests](#the-host-tests) for why that is a separate
+target rather than a wish. It still earns its place — it catches a sibling change that
 stops Xcode-generating, a toolchain regression, or a Swift/Objective-C++ seam
 that no longer compiles, all of which happened while standing this repo up. A
 final step asserts each bundle is really iOS arm64 (`LC_BUILD_VERSION`
@@ -129,8 +169,12 @@ Swift          app shell, UI, lifecycle (later: ARSession config, permissions)
     ↓ bridging header
 Obj-C++ (.mm)  VolumetricRenderer — CAMetalLayer → VkSurfaceKHR, ARFrame → PODs
     ↓
-C++            volumetric_kit_recon + volumetric_kit_gfx
+C++            vi_core (pure, host tested) + volumetric_kit_recon + _gfx
 ```
+
+`vi_core` (`apps/scanner/Core/`) is a fourth layer only in the sense that it sits
+under the bridge and depends on nothing above it. It is the app's own logic with
+the platform taken out — see [the host tests](#the-host-tests).
 
 The bridge is Objective-C++ rather than Swift because an `.mm` is the one
 translation unit where a `CAMetalLayer*` and a `vg::app::WindowedApp` are both

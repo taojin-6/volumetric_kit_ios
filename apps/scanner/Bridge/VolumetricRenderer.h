@@ -61,10 +61,15 @@ FOUNDATION_EXPORT NSErrorUserInfoKey const VolumetricRendererVulkanResultKey;
 /// This type says *which way the interface is facing* and nothing else. It
 /// deliberately does **not** say which orientation needs no correction, or what
 /// angle any of them implies: that is one constant,
-/// `kSensorBasisOrientation` in VolumetricRenderer.mm, and it is the only place
-/// in the app where an orientation becomes an angle. Read it before changing
-/// anything here — the derivation, the two conflicting device sightings, and
-/// the pair of measurements that finally settled it are all recorded on it.
+/// `kSensorBasisOrientation` in Core/ViewOrientation.hpp, and it is the only
+/// place in the app where an orientation becomes an angle. Read it before
+/// changing anything here — the derivation, the two conflicting device
+/// sightings, and the pair of measurements that finally settled it are all
+/// recorded on it.
+///
+/// The two enums are converted by a cast and pinned to each other by
+/// static_assert in VolumetricRenderer.mm, so this one's raw values are as
+/// load-bearing as that one's.
 ///
 /// The raw values are consecutive quarter turns, in the order below, and that
 /// is load-bearing: the turn is computed by subtracting two of them.

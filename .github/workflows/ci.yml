@@ -42,21 +42,27 @@ jobs:
   lint:
     uses: ./.github/workflows/lint.yml
 
+  test:
+    uses: ./.github/workflows/test.yml
+
   required:
     # The single status check branch protection requires. It passes only when
     # every leg succeeded, and FAILS (never skips) on any other outcome: a
     # skipped required check never reports its result and would block every
     # merge forever.
-    needs: [build, lint]
+    needs: [build, lint, test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Assert every required job succeeded
         run: |
-          echo "build=${{ needs.build.result }}" "lint=${{ needs.lint.result }}"
+          echo "build=${{ needs.build.result }}" \
+               "lint=${{ needs.lint.result }}" \
+               "test=${{ needs.test.result }}"
           if [ "${{ needs.build.result }}" = success ] \
-             && [ "${{ needs.lint.result }}" = success ]; then
+             && [ "${{ needs.lint.result }}" = success ] \
+             && [ "${{ needs.test.result }}" = success ]; then
             echo "All required CI jobs passed."
           else
             echo "::error::one or more required CI jobs did not succeed (see results above)"

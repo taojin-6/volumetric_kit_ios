@@ -9,7 +9,7 @@
 #include <cstring>
 #include <string>
 
-#import "MemoryBudget.hpp"
+#import "MemoryQuery.hpp"
 
 namespace volumetric_kit::ios_app {
 namespace {

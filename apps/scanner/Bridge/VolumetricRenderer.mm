@@ -10,9 +10,11 @@
 #import <Metal/Metal.h>
 
 #import "Fusion.hpp"
-#import "MemoryBudget.hpp"
+#import "MemoryQuery.hpp"
 #import "OrbitCamera.hpp"
 #import "SharedDevice.hpp"
+#import "StatTone.hpp"
+#import "ViewOrientation.hpp"
 
 #include <os/log.h>
 
@@ -143,7 +145,7 @@ NSString* to_ns_string(const std::string& text) {
 // MoltenVK -- so a comfortable jetsam percentage on its own is the reassuring
 // half of the picture, which is why the read-out prints this beside it.
 //
-// Deliberately not in Bridge/MemoryBudget: that file reads the jetsam ledger
+// Deliberately not in Bridge/MemoryQuery: that file reads the jetsam ledger
 // through Mach and stays plain C++, and these are separate subsystems that
 // scanner.entitlements is explicit about keeping apart. Read from Metal rather
 // than from VMA's HeapStats::budget_bytes, which is a heuristic until
@@ -434,107 +436,38 @@ struct FrameTrace {
 };
 
 // --- Viewport orientation ----------------------------------------------------
-// The one place the turn from ARKit's sensor basis to the viewport is defined.
+// The turn itself is in Core/ViewOrientation.hpp, where it is pure and host
+// tested -- including the on-device measurement that settled it, which is
+// recorded there in full.
 //
-// Everything else in this app that mentions orientation says only *which*
-// orientation the interface is in: the enum in VolumetricRenderer.h, Swift's
-// map from UIInterfaceOrientation, the read-out's label. This is the only thing
-// that says what that means in radians, deliberately. A zero and a sign
-// restated in a second place is precisely how the two come to disagree, and
-// this mapping has now been wrong twice, in two different directions.
+// What cannot move is this: the correspondence between the enum Swift sees and
+// the enum the turn is defined on. The mapping is computed by *subtracting raw
+// values*, so a VolumetricViewOrientation that stopped agreeing with its core
+// counterpart would turn every scan by a silent multiple of 90 degrees -- and
+// would do it without touching either file that looks responsible for the
+// angle. Pinned here, at the seam where the two meet.
+static_assert(static_cast<NSInteger>(VolumetricViewOrientationLandscapeLeft) ==
+                  static_cast<NSInteger>(app::ViewOrientation::LandscapeLeft),
+              "VolumetricViewOrientation and app::ViewOrientation disagree: "
+              "landscape-left");
+static_assert(static_cast<NSInteger>(VolumetricViewOrientationPortrait) ==
+                  static_cast<NSInteger>(app::ViewOrientation::Portrait),
+              "VolumetricViewOrientation and app::ViewOrientation disagree: "
+              "portrait");
+static_assert(static_cast<NSInteger>(VolumetricViewOrientationLandscapeRight) ==
+                  static_cast<NSInteger>(app::ViewOrientation::LandscapeRight),
+              "VolumetricViewOrientation and app::ViewOrientation disagree: "
+              "landscape-right");
+static_assert(
+    static_cast<NSInteger>(VolumetricViewOrientationPortraitUpsideDown) ==
+        static_cast<NSInteger>(app::ViewOrientation::PortraitUpsideDown),
+    "VolumetricViewOrientation and app::ViewOrientation disagree: upside-down");
 
-/// The orientation whose viewport already coincides with ARKit's sensor basis,
-/// and so needs no turn at all.
-///
-/// The mapping's single free parameter: every other orientation's turn is
-/// measured from here, so this constant *is* the convention. Two independent
-/// readings put it at the interface's landscape-right:
-///
-///   - `ARCamera.transform`'s +X "always points along the long axis of the
-///     device, from the front-facing camera toward the Home button". The Home
-///     button end is to the right exactly in `UIDeviceOrientationLandscapeLeft`
-///     -- which is the *interface's* LandscapeRight, the two being inverses of
-///     each other (UIApplication.h states the equivalence outright).
-///   - The sensor's own image says the same thing without reference to the
-///     prose: a back-camera portrait frame is EXIF orientation 6, whose 0th
-///     column is the visual top, so image +u runs *down* the screen in
-///     portrait, toward the Home button. The camera's +X is +u -- the CV
-///     conversion negates the second and third basis columns and leaves the
-///     first untouched -- so +X points the same way.
-///
-/// Both were already argued in this file before the zero sat here; what moved
-/// is which of them the code follows. The reading that shipped instead came
-/// from one uncontrolled sighting, that portrait rendered upside down under an
-/// earlier build's mapping. A second sighting, on the build that sighting
-/// produced, reports portrait upside down *again* -- and the two builds differ
-/// by exactly 180 degrees in portrait and by nothing at all in landscape, so
-/// they cannot both be describing portrait. They reconcile if the first was
-/// taken in landscape, which both readings agree the earlier build had wrong.
-///
-/// **MEASURED**, 2026-08-10, on an iPad Pro 11-inch (M5): landscape-right and
-/// portrait both render upright, with `orient` read off the console at each to
-/// confirm the renderer held the value being tested. That is the first time any
-/// part of this mapping has been settled by anything but a reading of the
-/// documentation, and it took two orientations because one cannot do it:
-///
-///   - **Landscape-right pins the zero.** It is the orientation this constant
-///     names, so the turn applied there is 0 -- and being upright is therefore
-///     the statement that the sensor basis and the viewport genuinely coincide
-///     here. The build before this one turned 180 degrees at this orientation
-///     and was upside down, which is the same observation from the other side.
-///   - **Portrait pins the step.** It is the *only* orientation that can: the
-///     turn is +-90 x (raw - 2), and at both landscapes that lands on 0 or 180,
-///     each its own negation. So the two landscapes look identical whichever
-///     way the step runs, and a sign error there is invisible by construction.
-///     Portrait is where the two differ, and it came up upright.
-///
-/// Two points determine the line, so landscape-left (raw 0, half a turn)
-/// follows from these rather than resting on the prose above -- it is computed
-/// by the same single expression, from a zero and a step that were both
-/// measured. Worth a glance, not worth blocking on. Info.plist declares
-/// Portrait, LandscapeLeft and LandscapeRight only, so raw 3 is unreachable and
-/// cannot be tested at all.
-///
-/// One caveat left standing: this was measured on an iPad. `ARCamera.transform`
-/// documents its basis without reference to the device, and the two readings
-/// above are device-independent, so there is no reason to expect an iPhone to
-/// differ -- but the sighting that sent this the wrong way in the first place
-/// may well have been taken on one, and nobody has checked.
-constexpr VolumetricViewOrientation kSensorBasisOrientation =
-    VolumetricViewOrientationLandscapeRight;
-
-// `viewport_turn` subtracts two of these raw values and reads the difference as
-// a count of quarter turns, which means something only while they are
-// consecutive and in this order. Pinned rather than assumed: these are a public
-// header's enumerators, and reordering them is an ordinary-looking edit that
-// would otherwise turn every scan by a silent multiple of 90 degrees.
-static_assert(VolumetricViewOrientationLandscapeLeft == 0,
-              "VolumetricViewOrientation raw values are quarter turns; "
-              "landscape-left must be 0");
-static_assert(VolumetricViewOrientationPortrait == 1,
-              "VolumetricViewOrientation raw values are quarter turns; "
-              "portrait must be 1");
-static_assert(VolumetricViewOrientationLandscapeRight == 2,
-              "VolumetricViewOrientation raw values are quarter turns; "
-              "landscape-right must be 2");
-static_assert(VolumetricViewOrientationPortraitUpsideDown == 3,
-              "VolumetricViewOrientation raw values are quarter turns; "
-              "upside-down must be 3");
-
-/// The turn from the sensor basis to @p orientation's viewport, in radians
-/// about the **GL** camera's +Z.
-///
-/// Which frame this acts in matters as much as the angle, so it is stated in
-/// the return rather than left to the call site: the caller applies this after
-/// `cv_from_gl_camera`, where +Z points out of the screen at the viewer and a
-/// positive angle turns the basis counterclockwise on screen. recon's own poses
-/// are CV (+Z along the view direction), and the identical rule applied to one
-/// of those comes out with the opposite sign.
+/// The turn for the orientation Swift handed us, in radians about the **GL**
+/// camera's +Z. See `app::viewport_turn`, which defines it and which the tests
+/// pin.
 float viewport_turn(VolumetricViewOrientation orientation) {
-  const auto quarter_turns =
-      static_cast<float>(static_cast<NSInteger>(orientation) -
-                         static_cast<NSInteger>(kSensorBasisOrientation));
-  return -quarter_turns * glm::half_pi<float>();
+  return app::viewport_turn(static_cast<app::ViewOrientation>(orientation));
 }
 
 /// Record the buffer -> image copy that publishes a staged keyframe, with the
@@ -1160,11 +1093,27 @@ VolumetricStatSection* make_section(NSString* title,
 }
 
 // A fraction's tone against two thresholds, so every meter in the app agrees
-// about when a number stops being routine.
+// about when a number stops being routine. The rule is in Core/StatTone.hpp,
+// where it is host tested; this is only the ObjC-typed name the panel uses.
+//
+// Pinned value-for-value like the orientation enum above, and for the same
+// reason: the two enums are converted by a cast, so a reordering would silently
+// recolour every gauge rather than failing.
+static_assert(static_cast<NSInteger>(VolumetricStatToneNeutral) ==
+                  static_cast<NSInteger>(app::StatTone::Neutral),
+              "VolumetricStatTone and app::StatTone disagree: neutral");
+static_assert(static_cast<NSInteger>(VolumetricStatToneGood) ==
+                  static_cast<NSInteger>(app::StatTone::Good),
+              "VolumetricStatTone and app::StatTone disagree: good");
+static_assert(static_cast<NSInteger>(VolumetricStatToneWarn) ==
+                  static_cast<NSInteger>(app::StatTone::Warn),
+              "VolumetricStatTone and app::StatTone disagree: warn");
+static_assert(static_cast<NSInteger>(VolumetricStatToneCritical) ==
+                  static_cast<NSInteger>(app::StatTone::Critical),
+              "VolumetricStatTone and app::StatTone disagree: critical");
+
 VolumetricStatTone tone_for(double fraction, double warn, double crit) {
-  if (fraction >= crit) return VolumetricStatToneCritical;
-  if (fraction >= warn) return VolumetricStatToneWarn;
-  return VolumetricStatToneNeutral;
+  return static_cast<VolumetricStatTone>(app::tone_for(fraction, warn, crit));
 }
 
 }  // namespace
@@ -1772,9 +1721,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // puts the scan on its side -- which reads as a broken reconstruction rather
   // than a misaligned render camera.
   //
-  // What the turn *is* is not decided here. See kSensorBasisOrientation, which
-  // is the only place in this app that turns an orientation into an angle, and
-  // carries the derivation and the device check with it.
+  // What the turn *is* is not decided here. See `kSensorBasisOrientation` in
+  // Core/ViewOrientation.hpp, which is the only place in this app that turns an
+  // orientation into an angle, and carries the derivation and the device check
+  // with it. The tests in tests/view_orientation_test.cpp pin the result.
   //
   // It does have to sit *here*, after cv_from_gl_camera and before either
   // camera sees the pose. Fusion is unaffected -- the pose and the intrinsics
@@ -3045,7 +2995,8 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // also charges host allocations Metal never sees -- which is the safe
   // direction for an instrument whose job is to warn, and it needs no second
   // allocator to agree with. `device RAM` rides along on the same row for scale
-  // and is not a ceiling anyone should size against; see MemoryBudget.hpp.
+  // and is not a ceiling anyone should size against; see
+  // Core/MemoryBudget.hpp.
   //
   // Assembled by concatenation, with every number adjacent to the words naming
   // it, rather than as one format string. The version this replaces bound four

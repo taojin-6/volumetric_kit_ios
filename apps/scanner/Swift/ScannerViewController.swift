@@ -353,7 +353,8 @@ final class ScannerViewController: UIViewController {
   /// renderer that was never told at all and is still on its default. The fix
   /// differs for each, and the first two are indistinguishable in portrait —
   /// which is why this line exists, and why the check recorded on
-  /// `kSensorBasisOrientation` asks for a landscape orientation too. The raw
+  /// `kSensorBasisOrientation` (Core/ViewOrientation.hpp) asks for a landscape
+  /// orientation too. The raw
   /// value is printed alongside the name because the mapping is argued in raw
   /// values.
   ///
