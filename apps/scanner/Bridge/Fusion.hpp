@@ -120,7 +120,7 @@ struct FusionConfig {
   ///       SIGKILLed, and @ref mesh_slots was not revisited when this doubled.
   ///
   ///       So the re-derivation this note has always asked for is still owed,
-  ///       against what Bridge/MemoryBudget reports on the target device. What
+  ///       against what Bridge/MemoryQuery reports on the target device. What
   ///       stands in for it meanwhile is enforcement rather than arithmetic:
   ///       @ref Fusion::fuse now checks `query_memory_budget()` headroom before
   ///       each doubling, will not re-attempt a resize at a size that already

@@ -136,17 +136,49 @@ struct MemoryBudget {
   bool valid = false;
 };
 
-/// @brief Read this process's memory position from the kernel.
+/// @brief The kernel's raw answer, before it is given meaning.
 ///
-/// One `task_info` call, plus a `sysctlbyname` on the first call only
-/// (`hw.memsize` is immutable for the process's lifetime, so it is cached).
-/// Cheap enough for a read-out polled at a few hertz, and not intended for a
-/// per-frame path.
+/// Split out so the derivation below can be tested on the host: everything that
+/// decides what a reading *means* is pure, and everything that needs mach and a
+/// live task port is on the other side of this struct, in
+/// `Bridge/MemoryQuery.cpp`. The dangerous case @ref MemoryBudget::limit_known
+/// exists for -- a kernel-clamped headroom of 0 collapsing the derived ceiling
+/// onto the footprint and reporting a tidy 100% in the pre-jetsam window -- is
+/// reachable here as an ordinary value, and cannot be reached at all through a
+/// call that must first persuade a real process to run out of memory.
+struct TaskMemoryReading {
+  /// The `kern_return_t` from `task_info`. `KERN_SUCCESS` (0) when @ref ok.
+  int task_info_status = 0;
+  /// `true` when `task_info` answered at all.
+  bool ok = false;
+  /// `true` when the kernel's reply was long enough to carry
+  /// `ledger_phys_footprint_peak` (`count >= TASK_VM_INFO_REV3_COUNT`).
+  ///
+  /// Which revision introduced which field is mach knowledge and stays with the
+  /// call; what a missing field *means* is here. A short reply degrades to "not
+  /// known" rather than to a stack reading printed as a measurement.
+  bool has_peak = false;
+  /// `true` when the reply carried `limit_bytes_remaining`
+  /// (`count >= TASK_VM_INFO_REV4_COUNT`).
+  bool has_remaining = false;
+  /// `task_vm_info::phys_footprint`.
+  std::uint64_t phys_footprint = 0;
+  /// `task_vm_info::ledger_phys_footprint_peak`; meaningful only under @ref
+  /// has_peak.
+  std::uint64_t ledger_phys_footprint_peak = 0;
+  /// `task_vm_info::limit_bytes_remaining`; meaningful only under @ref
+  /// has_remaining.
+  std::uint64_t limit_bytes_remaining = 0;
+  /// `hw.memsize`, or 0 when the sysctl was unavailable.
+  std::uint64_t device_ram_bytes = 0;
+};
+
+/// @brief Turn a kernel reading into the budget the read-out shows.
 ///
-/// @return The reading, or a default-constructed value (@ref
-///         MemoryBudget::valid `== false`, with @ref
-///         MemoryBudget::task_info_status carrying the kernel's code) when the
-///         kernel declined to answer.
-MemoryBudget query_memory_budget() noexcept;
+/// Pure: no syscall, no clock, no state. Every rule that decides whether a
+/// figure is trustworthy lives here -- the REV guards, the clamped-headroom
+/// alarm, and the refusal to derive a ceiling from a reading that cannot
+/// support one.
+MemoryBudget interpret_memory_budget(const TaskMemoryReading& reading) noexcept;
 
 }  // namespace volumetric_kit::ios_app

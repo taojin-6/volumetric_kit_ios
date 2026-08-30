@@ -1,0 +1,60 @@
+name: test
+
+# The host tests for vi_core -- the scanner's pure logic.
+#
+# This is the only job in this repo that *runs* anything. The app targets are
+# build-only by nature: MoltenVK ships no simulator slice and ARKit scene depth
+# needs LiDAR, so nothing that touches Vulkan, recon or ARKit can execute
+# anywhere but a real device. vi_core is the part that carries no such
+# dependency, and it is deliberately the part that decides things -- a sign, a
+# threshold, whether a kernel reading is trustworthy -- so it is where a test
+# earns the most.
+#
+# It configures with -DVI_HOST_TESTS=ON, which builds vi_core and the tests and
+# nothing else: no recon, no gfx, no MoltenVK, no Xcode project. That is why
+# this leg is a couple of minutes rather than the build leg's tens.
+#
+# Invoked by ci.yml, which owns the triggers and the concurrency group.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Pinned for the same reason the other legs are: `-latest` rolls to a new
+    # image on GitHub's schedule and swaps the toolchain under the run.
+    #
+    # macOS rather than Linux only because it is what the rest of this repo
+    # already pins and what these tests were verified on. vi_core links no Apple
+    # framework and includes no Apple header -- that is the boundary its
+    # CMakeLists.txt describes -- so a Linux leg would build it too, and would
+    # additionally *prove* that boundary rather than leaving it a claim. Worth
+    # adding; not added here unverified.
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # googletest is the only thing fetched in this mode, and it is pinned to a
+      # tag, so hashing the file that carries the pin is a complete key -- unlike
+      # the build leg, which has to resolve two moving sibling refs.
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v6
+        with:
+          path: build-host/_deps
+          key: >-
+            host-deps-${{ runner.os }}-${{
+            hashFiles('tests/CMakeLists.txt', 'CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build-host -DVI_HOST_TESTS=ON
+
+      - name: Build
+        run: cmake --build build-host --parallel
+
+      # --output-on-failure so a red run carries the assertion in the log rather
+      # than only the case name.
+      - name: Test
+        run: ctest --test-dir build-host --output-on-failure

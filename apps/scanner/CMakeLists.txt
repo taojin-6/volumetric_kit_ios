@@ -24,7 +24,7 @@ set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 add_library(
   scanner_bridge STATIC
   Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  Bridge/Fusion.mm Bridge/OrbitCamera.cpp Bridge/MemoryBudget.cpp)
+  Bridge/Fusion.mm Bridge/MemoryQuery.cpp)
 
 # ARC, selected by language rather than by a second copy of the source list.
 #
@@ -37,11 +37,11 @@ add_library(
 # worst failure is a jetsam SIGKILL with nothing in the log.
 #
 # COMPILE_LANGUAGE:OBJCXX is the discriminator the exclusion was really about:
-# .cpp sources compile as CXX and never see the flag, so OrbitCamera.cpp and
-# MemoryBudget.cpp stay out of it by construction rather than by being
-# remembered. (Neither is excluded for reaching the OS through C headers -- an
-# ARC translation unit may include <mach/mach.h> and <sys/sysctl.h> and call
-# into them perfectly well. It is the file extension that decides.)
+# .cpp sources compile as CXX and never see the flag, so MemoryQuery.cpp stays
+# out of it by construction rather than by being remembered -- as does every
+# source in vi_core. (It is not excluded for reaching the OS through C headers
+# -- an ARC translation unit may include <mach/mach.h> and <sys/sysctl.h> and
+# call into them perfectly well. It is the file extension that decides.)
 target_compile_options(scanner_bridge
                        PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 
@@ -57,11 +57,15 @@ target_compile_definitions(scanner_bridge PRIVATE VK_USE_PLATFORM_METAL_EXT)
 # translation unit at instantiation, and a TU that missed it would silently
 # build a projection the depth buffer disagrees with.
 #
-# Not inherited from anywhere. gfx sets it PUBLIC on volumetric_kit::gfx_camera,
-# which this target does not link -- gfx_pipelines pulls in gfx_core +
-# gfx_assets, and gfx_app pulls in gfx_core + gfx_windowing. Without it the near
-# plane lands at 2fn/(f+n) instead of n: ~10 cm rather than the 5 cm kNearClip
-# promises, and the turntable's closest zoom sits inside the clip volume.
+# Now also inherited from vi_core, which sets it PUBLIC for the same reason, and
+# kept here regardless: this target is where `glm::perspective` is actually
+# called, so it is where the convention has to hold whatever it links. It is not
+# inherited from the libraries -- gfx sets it PUBLIC on
+# volumetric_kit::gfx_camera, which this target does not link (gfx_pipelines
+# pulls in gfx_core + gfx_assets, and gfx_app pulls in gfx_core +
+# gfx_windowing). Without it the near plane lands at 2fn/(f+n) instead of n: ~10
+# cm rather than the 5 cm kNearClip promises, and the turntable's closest zoom
+# sits inside the clip volume.
 target_compile_definitions(scanner_bridge PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
 # The triangle's SPIR-V is embedded as a constexpr byte array, matching how the
@@ -115,11 +119,17 @@ if(VI_INCREMENTAL_BENCHMARK)
   target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
 endif()
 
+# vi_core is PUBLIC because the bridge's own headers expose it: the renderer
+# holds an OrbitCamera by value and hands MemoryBudget across the seam.
 target_link_libraries(
   scanner_bridge
-  PUBLIC volumetric_kit::gfx_app volumetric_kit::gfx_core
-         volumetric_kit::recon_sensor volumetric_kit::recon_texture
-         volumetric_kit::recon_tsdf volumetric_kit::gfx_pipelines)
+  PUBLIC vi_core
+         volumetric_kit::gfx_app
+         volumetric_kit::gfx_core
+         volumetric_kit::recon_sensor
+         volumetric_kit::recon_texture
+         volumetric_kit::recon_tsdf
+         volumetric_kit::gfx_pipelines)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
