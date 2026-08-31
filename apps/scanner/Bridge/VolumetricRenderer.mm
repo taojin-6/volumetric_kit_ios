@@ -9,9 +9,14 @@
 
 #import <Metal/Metal.h>
 
+#import "AllocationStop.hpp"
+#import "AllocationStopDisplay.hpp"
+#import "BridgeStrings.hpp"
+#import "FrameTrace.hpp"
 #import "Fusion.hpp"
 #import "MemoryQuery.hpp"
 #import "OrbitCamera.hpp"
+#import "RendererErrors.hpp"
 #import "SharedDevice.hpp"
 #import "StatTone.hpp"
 #import "ViewOrientation.hpp"
@@ -23,9 +28,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-// FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
-// fusionSummary uses std::snprintf. It compiled only because some gfx or recon
-// header happens to pull <cstdio> in transitively today.
+// `fusionSummary` and the read-out's cell builders use std::snprintf. Named
+// here rather than left to a transitive include: it compiled only because some
+// gfx or recon header happens to pull <cstdio> in today.
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -120,22 +125,6 @@ NSErrorUserInfoKey const VolumetricRendererVulkanResultKey =
 
 namespace {
 
-// Never nil, so a `nonnull` property cannot hand Swift a null it traps on:
-// `stringWithUTF8String:` returns nil for invalid UTF-8, and Vulkan promises
-// only that VkPhysicalDeviceProperties::deviceName is a NUL-terminated
-// char[256] -- a driver may put any bytes in it, and Swift imports the property
-// as a non-optional String.
-NSString* to_ns_string(const std::string& text) {
-  if (NSString* utf8 = [NSString stringWithUTF8String:text.c_str()]) {
-    return utf8;
-  }
-  // Latin-1 maps every byte to a code point, so this cannot fail in turn.
-  NSString* latin1 = [[NSString alloc] initWithBytes:text.data()
-                                              length:text.size()
-                                            encoding:NSISOLatin1StringEncoding];
-  return latin1 != nil ? latin1 : @"(unprintable)";
-}
-
 // Metal's recommended working-set ceiling in bytes, or 0 when unavailable.
 //
 // The third of the three ceilings this app runs under, and by the numbers in
@@ -166,274 +155,11 @@ std::uint64_t gpu_working_set_bytes() {
   return cached;
 }
 
-VolumetricRendererError error_code(vg::Status::Code domain) {
-  switch (domain) {
-    case vg::Status::Code::Ok:
-      return VolumetricRendererErrorUnknown;
-    case vg::Status::Code::InvalidArgument:
-      return VolumetricRendererErrorInvalidArgument;
-    case vg::Status::Code::NotFound:
-      return VolumetricRendererErrorNotFound;
-    case vg::Status::Code::Unsupported:
-      return VolumetricRendererErrorUnsupported;
-    case vg::Status::Code::OutOfMemory:
-      return VolumetricRendererErrorOutOfMemory;
-    case vg::Status::Code::IoError:
-      return VolumetricRendererErrorIoError;
-    case vg::Status::Code::Vulkan:
-      return VolumetricRendererErrorVulkan;
-  }
-  return VolumetricRendererErrorUnknown;
-}
-
-VolumetricRendererError error_code(vr::Status::Code domain) {
-  switch (domain) {
-    case vr::Status::Code::Ok:
-      return VolumetricRendererErrorUnknown;
-    case vr::Status::Code::InvalidArgument:
-      return VolumetricRendererErrorInvalidArgument;
-    case vr::Status::Code::NotFound:
-      return VolumetricRendererErrorNotFound;
-    case vr::Status::Code::Unsupported:
-      return VolumetricRendererErrorUnsupported;
-    case vr::Status::Code::OutOfMemory:
-      return VolumetricRendererErrorOutOfMemory;
-    case vr::Status::Code::IoError:
-      return VolumetricRendererErrorIoError;
-    // recon keeps its backend neutral, but here the backend *is* Vulkan and the
-    // detail code is the VkResult.
-    case vr::Status::Code::Backend:
-      return VolumetricRendererErrorVulkan;
-  }
-  return VolumetricRendererErrorUnknown;
-}
-
-// Surface a library Status as an NSError so Swift sees a native failure instead
-// of a status code it would have to interpret. The two libraries' Status types
-// are structurally alike (domain + optional backend code + message) but neither
-// imports the other, so each overload below reduces its own to these values.
-void set_error(NSError** error, const char* stage, VolumetricRendererError code,
-               std::optional<VkResult> vk_result, const std::string& message) {
-  if (error == nullptr) {
-    return;
-  }
-  NSMutableDictionary* info = [NSMutableDictionary dictionary];
-  std::string described = std::string(stage) + ": " + message;
-  if (vk_result) {
-    described += " (";
-    described += std::string(vg::to_string(*vk_result));
-    described += ")";
-    info[VolumetricRendererVulkanResultKey] = @(static_cast<int>(*vk_result));
-  }
-  info[NSLocalizedDescriptionKey] = to_ns_string(described);
-  *error = [NSError errorWithDomain:VolumetricRendererErrorDomain
-                               code:code
-                           userInfo:info];
-}
-
-void set_error(NSError** error, const vg::Status& status, const char* stage) {
-  const bool vulkan = status.domain() == vg::Status::Code::Vulkan;
-  set_error(error, stage, error_code(status.domain()),
-            vulkan ? std::optional<VkResult>(status.code()) : std::nullopt,
-            status.message());
-}
-
-// Carried through rather than flattened into `unsupported`: a device-creation
-// failure on a user's phone should name its VkResult, not read as a capability
-// the driver lacks.
-void set_error(NSError** error, const vr::Status& status, const char* stage) {
-  const bool backend = status.domain() == vr::Status::Code::Backend;
-  set_error(
-      error, stage, error_code(status.domain()),
-      backend ? std::optional<VkResult>(static_cast<VkResult>(status.detail()))
-              : std::nullopt,
-      status.message());
-}
-
 std::string api_version_string(std::uint32_t v) {
   return std::to_string(VK_API_VERSION_MAJOR(v)) + "." +
          std::to_string(VK_API_VERSION_MINOR(v)) + "." +
          std::to_string(VK_API_VERSION_PATCH(v));
 }
-
-/// The read-out's word for an @ref app::AllocationStop, and the only place one
-/// is turned into English.
-///
-/// A lookup rather than a literal at each site, because the read-out's job here
-/// is to report a cause, not to guess one. The `table` row used to append a
-/// hard-coded "(volume full)" to a flag that meant only "not allocating this
-/// frame", so a failed `load_factor` -- which fabricates a full table to fail
-/// safe -- printed a full volume directly beneath the banner naming the real
-/// upstream fault, and told the user to coarsen their voxels over it. Fusion
-/// deliberately withholds its own "volume full" string on that path; this is
-/// what stops the panel undoing that.
-const char* allocation_stop_note(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return "";
-    case app::AllocationStop::VolumeFull:
-      return "  -- NOT TAKING NEW GEOMETRY (volume full)";
-    case app::AllocationStop::OccupancyUnknown:
-      return "  -- NOT TAKING NEW GEOMETRY (occupancy unreadable, see error)";
-    case app::AllocationStop::BlocksDropped:
-      return "  -- NOT TAKING NEW GEOMETRY (blocks dropped, see error)";
-  }
-  return "";
-}
-
-/// The same cause, abbreviated for the frame trace's fixed-width line.
-const char* allocation_stop_tag(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return "ok";
-    case app::AllocationStop::VolumeFull:
-      return "full";
-    case app::AllocationStop::OccupancyUnknown:
-      return "unknown";
-    case app::AllocationStop::BlocksDropped:
-      return "dropped";
-  }
-  return "ok";
-}
-
-/// The same cause, as a dashboard row and as the banner's own sentence.
-///
-/// A fourth rendering of one value, and each medium genuinely differs: the log
-/// gets a suffix on a fixed-width line, the trace gets one word in a column,
-/// the bridge gets an enum, and this gets a phrase a person reads once and acts
-/// on. What they must not differ about is *which* cause, which is why they are
-/// all exhaustive switches on the same enum and sit together.
-///
-/// `advice` is the part that made this necessary. It was one hardcoded string
-/// -- coarsen the voxels, or raise `max_buckets` -- which is the right answer
-/// for `VolumeFull` and actively wrong for the other two: `OccupancyUnknown` is
-/// a failed `load_factor` read on a volume with room left, and `BlocksDropped`
-/// fires with occupancy far below the guard. Both sent the reader after a limit
-/// they had not reached.
-struct AllocationStopText {
-  const char* headline;
-  const char* advice;
-};
-AllocationStopText allocation_stop_text(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return {"", ""};
-    case app::AllocationStop::VolumeFull:
-      return {"volume full",
-              "Existing surface keeps refining, but new areas will not be "
-              "added. Finish here, or restart with a coarser voxel size."};
-    case app::AllocationStop::OccupancyUnknown:
-      return {"occupancy unreadable",
-              "The volume is not known to be full -- the table's load factor "
-              "could not be read, and allocation refused on a fabricated "
-              "figure. The cause is on the errors row."};
-    case app::AllocationStop::BlocksDropped:
-      return {"blocks dropped",
-              "The allocate hit a capacity limit and dropped this frame's "
-              "blocks. This can fire well below the occupancy guard -- at the "
-              "bucket ceiling, or with the frame's grow budget spent."};
-  }
-  return {"", ""};
-}
-
-/// The same cause, as the Swift-facing enum.
-///
-/// Switched rather than cast, though the two enumerations are declared in the
-/// same order: a cast makes that order load-bearing across two files that no
-/// build step compares, and the failure is a sample reporting the
-/// *neighbouring* cause -- a wrong answer that looks exactly like a right one.
-/// This way a value added on one side stops the compile.
-VolumetricAllocationStop allocation_stop_value(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return VolumetricAllocationStopNone;
-    case app::AllocationStop::VolumeFull:
-      return VolumetricAllocationStopVolumeFull;
-    case app::AllocationStop::OccupancyUnknown:
-      return VolumetricAllocationStopOccupancyUnknown;
-    case app::AllocationStop::BlocksDropped:
-      return VolumetricAllocationStopBlocksDropped;
-  }
-  return VolumetricAllocationStopNone;
-}
-
-// --- Frame trace -------------------------------------------------------------
-// A device loss is reported by the *next* vkWaitForFences, so by the time the
-// error surfaces the frame that faulted is already gone and nothing on the
-// stack says what it did. This keeps the last few frames' worth of the state
-// that could plausibly cause a GPU fault and dumps it when the loss is
-// detected.
-//
-// A ring rather than per-frame logging: at 60 Hz an os_log per frame is both
-// noise and a perturbation, and only the frames immediately before the fault
-// matter. Written from the render thread and read from the render thread, so no
-// locking.
-struct FrameTrace {
-  struct Entry {
-    std::uint64_t frame = 0;
-    std::uint64_t generation = 0;  // recon generation this frame drew
-    std::size_t mesh_slot = 0;
-    std::uint64_t released_through = 0;  // what we told recon it may reuse
-    std::uint32_t triangles = 0;
-    std::uint32_t triangle_capacity = 0;
-    std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry
-    std::uint32_t active_blocks = 0;
-    float extract_ms = 0.0f;
-    // The table as the *map* reported it, beside `active_blocks` as the last
-    // successful extract reported it. Both, because the gap between them is
-    // often the fault: this ring is dumped on a device-lost, which is what the
-    // occupancy guard exists to prevent, and in the regime that fires the
-    // guard `active_blocks` is exactly the frozen number the guard stopped
-    // trusting. `stop` says whether the guard was engaged at the time.
-    float occupancy = 0.0f;
-    app::AllocationStop stop = app::AllocationStop::None;
-    bool drew_mesh = false;
-  };
-
-  static constexpr std::size_t kCapacity = 24;
-  Entry entries[kCapacity];
-  std::uint64_t next = 0;
-
-  Entry& begin_frame_entry() {
-    Entry& e = entries[next % kCapacity];
-    e = Entry{};
-    e.frame = next;
-    ++next;
-    return e;
-  }
-
-  // Oldest-first, so the last line is the frame closest to the fault.
-  //
-  // Both channels on purpose: os_log is what survives a run with no debugger
-  // attached (readable afterwards via `log collect`), and stderr is what
-  // reaches `devicectl process launch --console` live. os_log alone goes
-  // nowhere near the console, which is the mistake worth not repeating.
-  void dump(const char* why) const {
-    const std::uint64_t count = std::min<std::uint64_t>(next, kCapacity);
-    os_log_error(OS_LOG_DEFAULT,
-                 "vk-trace: %{public}s -- last %llu frames:", why,
-                 static_cast<unsigned long long>(count));
-    std::fprintf(stderr, "vk-trace: %s -- last %llu frames:\n", why,
-                 static_cast<unsigned long long>(count));
-    for (std::uint64_t i = 0; i < count; ++i) {
-      const Entry& e = entries[(next - count + i) % kCapacity];
-      char line[256];
-      std::snprintf(
-          line, sizeof(line),
-          "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
-          "arena=%llu blocks=%u occ=%.1f%% alloc=%s extract=%.1fms",
-          static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
-          static_cast<unsigned long long>(e.generation), e.mesh_slot,
-          static_cast<unsigned long long>(e.released_through), e.triangles,
-          e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
-          e.active_blocks, 100.0 * static_cast<double>(e.occupancy),
-          allocation_stop_tag(e.stop), static_cast<double>(e.extract_ms));
-      os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);
-      std::fprintf(stderr, "vk-trace: %s\n", line);
-    }
-    std::fflush(stderr);
-  }
-};
 
 // --- Viewport orientation ----------------------------------------------------
 // The turn itself is in Core/ViewOrientation.hpp, where it is pure and host
@@ -489,7 +215,12 @@ float viewport_turn(VolumetricViewOrientation orientation) {
 void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
                          std::uint32_t width, std::uint32_t height,
                          bool first_write) {
-  VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  // Zero-initialised and then stamped, like every other Vulkan struct in this
+  // file. Naming sType in the braces leaves the remaining fields to aggregate
+  // initialisation, which -Wextra reports as a missing initialiser -- and this
+  // target now builds with -Wall -Wextra.
+  VkImageMemoryBarrier to_dst{};
+  to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   to_dst.srcAccessMask = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
   to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   to_dst.oldLayout = first_write ? VK_IMAGE_LAYOUT_UNDEFINED
@@ -757,7 +488,7 @@ struct RendererImpl {
   bool mesh_unusable = false;
   // Diagnostic only: what the last few frames drew, dumped when a device loss
   // (or any begin_frame failure) is detected. See FrameTrace.
-  FrameTrace trace;
+  app::FrameTrace trace;
 
   ~RendererImpl() {
     // Before anything else, and before any member is destroyed: the fuse thread
@@ -977,11 +708,19 @@ vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
     _occupancyKnown = stats.occupancy_known ? YES : NO;
     _triangles = stats.triangles;
     _vertices = stats.vertices;
-    _allocationStop = allocation_stop_value(stats.allocation_stop);
+    // Not `stats.allocation_stop` itself: the cause is a latch Fusion never
+    // clears, and this snapshot feeds Dashboard.swift's persistent banner --
+    // which went on telling the user to abandon the scan and restart at a
+    // coarser voxel size for the length of a phone call, about a volume that
+    // was not full. The log's `table` row was guarded and these were not; the
+    // rule is now in one place, in Core/AllocationStop.hpp.
+    const app::AllocationStop stop = app::reportable_allocation_stop(
+        stats.allocation_stop, stats.ms_since_fuse);
+    _allocationStop = app::allocation_stop_value(stop);
     _allocationStopReason =
-        stats.allocation_stop == app::AllocationStop::None
+        stop == app::AllocationStop::None
             ? nil
-            : to_ns_string(allocation_stop_text(stats.allocation_stop).advice);
+            : app::to_ns_string(app::allocation_stop_text(stop).advice);
 
     // The gauge figures. `table_blocks` rather than `table_capacity` beside the
     // occupancy, and `table_capacity` only beside `active_blocks` -- the two
@@ -1072,12 +811,12 @@ NSString* fmt(const char* format, ...) {
   }
   if (static_cast<std::size_t>(needed) < sizeof(stack)) {
     va_end(args);
-    return to_ns_string(stack);
+    return app::to_ns_string(stack);
   }
   std::vector<char> heap(static_cast<std::size_t>(needed) + 1);
   std::vsnprintf(heap.data(), heap.size(), format, args);
   va_end(args);
-  return to_ns_string(heap.data());
+  return app::to_ns_string(heap.data());
 }
 
 void add(NSMutableArray<VolumetricStatRow*>* rows, NSString* label,
@@ -1132,7 +871,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     _triangles = sample.triangles;
     _activeBlocks = sample.active_blocks;
     _framesSinceExtract = sample.frames_since_extract;
-    _allocationStop = allocation_stop_value(sample.allocation_stop);
+    _allocationStop = app::allocation_stop_value(sample.allocation_stop);
     // Derived rather than carried, so the two cannot disagree about the same
     // frame the way two independently-assigned fields eventually do.
     _allocationStopped =
@@ -1157,7 +896,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // reason deviceName goes through it. Today they are ASCII; FusionStats'
     // own warning about a row named from somewhere else is the case this
     // covers.
-    _name = to_ns_string(row.name != nullptr ? row.name : "");
+    _name = app::to_ns_string(row.name != nullptr ? row.name : "");
     _cpuMs = row.cpu_ms;
     _gpuMs = row.gpu_ms;
     _hasGpu = row.has_gpu ? YES : NO;
@@ -1204,7 +943,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   const vr::Status built = _impl->shared.build((__bridge const void*)layer,
                                                "volumetric_kit_ios scanner");
   if (!built) {
-    set_error(error, built, "SharedDevice");
+    app::set_error(error, built, "SharedDevice");
     return nil;
   }
 
@@ -1244,7 +983,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         return self->_impl->shared.release_surface();
       });
   if (!app) {
-    set_error(error, app.status(), "WindowedApp::adopt");
+    app::set_error(error, app.status(), "WindowedApp::adopt");
     return nil;
   }
   _impl->app = std::move(app).value();
@@ -1256,7 +995,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vr::Result<vr::Device> recon_device =
       vr::Device::adopt(_impl->shared.recon_payload(), {});
   if (!recon_device) {
-    set_error(error, recon_device.status(), "recon Device::adopt");
+    app::set_error(error, recon_device.status(), "recon Device::adopt");
     return nil;
   }
   _impl->recon_device.emplace(std::move(recon_device).value());
@@ -1270,7 +1009,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // The vr::Status overload, not a flatten through vg::Status::unsupported:
     // an allocator failure on a user's phone is out-of-memory or a VkResult,
     // and reporting it as "unsupported" reads as a capability the driver lacks.
-    set_error(error, recon_allocator.status(), "recon Allocator::create");
+    app::set_error(error, recon_allocator.status(), "recon Allocator::create");
     return nil;
   }
   _impl->recon_allocator.emplace(std::move(recon_allocator).value());
@@ -1280,7 +1019,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_vert_spv),
       vi_triangle_vert_spv_size);
   if (!vert) {
-    set_error(error, vert.status(), "vertex ShaderModule::create");
+    app::set_error(error, vert.status(), "vertex ShaderModule::create");
     return nil;
   }
   _impl->vertex_shader = std::move(vert).value();
@@ -1289,7 +1028,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_frag_spv),
       vi_triangle_frag_spv_size);
   if (!frag) {
-    set_error(error, frag.status(), "fragment ShaderModule::create");
+    app::set_error(error, frag.status(), "fragment ShaderModule::create");
     return nil;
   }
   _impl->fragment_shader = std::move(frag).value();
@@ -1306,7 +1045,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::GraphicsPipeline> pipeline =
       vg::GraphicsPipeline::create(device, desc);
   if (!pipeline) {
-    set_error(error, pipeline.status(), "GraphicsPipeline::create");
+    app::set_error(error, pipeline.status(), "GraphicsPipeline::create");
     return nil;
   }
   _impl->pipeline = std::move(pipeline).value();
@@ -1318,7 +1057,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       vg::pipelines::HybridMeshPipeline::create(
           device, _impl->app.swapchain().layout());
   if (!mesh_pipeline) {
-    set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
+    app::set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
     return nil;
   }
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
@@ -1349,14 +1088,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::Texture> atlas_texture = vg::upload_texture(
       _impl->app.device(), _impl->app.allocator(), atlas_desc);
   if (!atlas_texture) {
-    set_error(error, atlas_texture.status(), "atlas upload_texture");
+    app::set_error(error, atlas_texture.status(), "atlas upload_texture");
     return nil;
   }
   _impl->atlas_texture = std::move(atlas_texture).value();
 
   vg::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
   if (!atlas_sampler) {
-    set_error(error, atlas_sampler.status(), "atlas Sampler::create");
+    app::set_error(error, atlas_sampler.status(), "atlas Sampler::create");
     return nil;
   }
   _impl->atlas_sampler.emplace(std::move(atlas_sampler).value());
@@ -1372,7 +1111,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::DescriptorPool> atlas_pool =
       vg::DescriptorPool::create(device, &atlas_pool_size, 1, kAtlasSets);
   if (!atlas_pool) {
-    set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
+    app::set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
     return nil;
   }
   _impl->atlas_pool = std::move(atlas_pool).value();
@@ -1380,7 +1119,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
       _impl->mesh_pipeline->descriptor_set_layout(0));
   if (!atlas_set) {
-    set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
+    app::set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
     return nil;
   }
   _impl->atlas_set = std::move(atlas_set).value();
@@ -1410,8 +1149,8 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     vg::Result<vg::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
         _impl->mesh_pipeline->descriptor_set_layout(0));
     if (!slot_set) {
-      set_error(error, slot_set.status(),
-                "atlas ring DescriptorPool::allocate");
+      app::set_error(error, slot_set.status(),
+                     "atlas ring DescriptorPool::allocate");
       return nil;
     }
     _impl->atlas_slots[i].set = std::move(slot_set).value();
@@ -1466,7 +1205,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
     // OutOfMemory that must reach Swift as one.
-    set_error(error, fusion_started, "Fusion::start");
+    app::set_error(error, fusion_started, "Fusion::start");
     return nil;
   }
 
@@ -1482,8 +1221,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (!frame) {
     // The fault happened in an *earlier* frame; this is only where it is
     // noticed. Dump what those frames were doing before the error propagates.
-    _impl->trace.dump(frame.status().message().c_str());
-    set_error(error, frame.status(), "begin_frame");
+    // Through `describe` rather than `message()`: for every gfx fence wait
+    // the message is the bare string "vkWaitForFences" -- the call, not its
+    // result -- so a lost device and a slow one produced byte-identical
+    // dumps, in the log this ring exists to be read from and where the
+    // NSError built on the next line is long gone.
+    _impl->trace.dump(app::describe(frame.status(), "begin_frame").c_str());
+    app::set_error(error, frame.status(), "begin_frame");
     return NO;
   }
   if (!frame.value()) {
@@ -1499,7 +1243,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // drawable for far longer than the ring is deep, so claiming per tick flushed
   // the whole window with blank entries -- and a device loss noticed just after
   // one dumped 24 empty lines and none of the frames that could have caused it.
-  FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
+  app::FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
 
   // Take the newest mesh, if fusion published one since the last upload. Never
   // wait for it: the render loop draws the previous mesh rather than stalling,
@@ -1814,6 +1558,41 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   }
   trace.released_through = released_through;
 
+  // Fusion's half of the entry, outside the draw branch.
+  //
+  // Ten of the twelve fields were written only when a mesh was drawn, and the
+  // dump's format is fixed -- so a frame that never sampled the allocator
+  // printed `alloc=ok arena=0 blocks=0 occ=0.0%`, byte-identical to one that
+  // measured an idle allocator and an empty arena. Those are the regimes a
+  // device-lost dump is *read* in: before the first successful take, after a
+  // latched upload failure, or under VI_INCREMENTAL_BENCHMARK, which publishes
+  // no geometry for the whole session. `arena_bytes` carries a reading
+  // instruction on FrameTrace::Entry -- compare it against the previous entry
+  // -- and a phantom drop to 0 at every drew=1 -> drew=0 boundary breaks
+  // exactly the comparison that would find the use-after-free described above.
+  //
+  // The same placement mistake as the release logic thirty lines up, which sat
+  // inside this branch until it stopped recon reusing anything at all.
+  //
+  // The narrow accessor, not stats(): this runs every frame, and FusionStats
+  // carries a std::string whose copy would malloc inside the mutex the fuse
+  // thread takes on every one of its own frames. A handful of scalars is all
+  // the ring holds. See Fusion::trace_stats.
+  const app::FusionTraceStats fused = _impl->fusion.trace_stats();
+  trace.triangles = fused.triangles;
+  trace.triangle_capacity = fused.triangle_capacity;
+  trace.arena_bytes = fused.arena_bytes;
+  trace.active_blocks = fused.active_blocks;
+  trace.occupancy = fused.occupancy;
+  trace.occupancy_known = fused.occupancy_known;
+  // Latched rather than passed through reportable_allocation_stop, unlike the
+  // three live renderings: this is the forensic copy, and `ms_since_fuse`
+  // beside it is what qualifies the cause. Discarding what the cause *was* is
+  // the wrong trade in the one artifact a device loss leaves behind.
+  trace.stop = fused.allocation_stop;
+  trace.ms_since_fuse = fused.ms_since_fuse;
+  trace.extract_ms = fused.extract_ms;
+
   if (draw_mesh) {
     // recon's buffers, named rather than copied. LiveMesh owns nothing and
     // reads the index count GPU-side out of the indirect command, so the count
@@ -1825,21 +1604,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     live.indirect = live_src.indirect;
     const vg::pipelines::HybridMeshDraw draw{live};
 
-    // The narrow accessor, not stats(): this runs every frame, and FusionStats
-    // carries a std::string whose copy would malloc inside the mutex the fuse
-    // thread takes on every one of its own frames. A handful of scalars is all
-    // the ring holds. See Fusion::trace_stats.
-    const app::FusionTraceStats s = _impl->fusion.trace_stats();
+    // The three fields that are genuinely about the mesh this frame drew.
     trace.drew_mesh = true;
     trace.generation = live_src.generation;
     trace.mesh_slot = _impl->mesh_slot;
-    trace.triangles = s.triangles;
-    trace.triangle_capacity = s.triangle_capacity;
-    trace.arena_bytes = s.arena_bytes;
-    trace.active_blocks = s.active_blocks;
-    trace.occupancy = s.occupancy;
-    trace.stop = s.allocation_stop;
-    trace.extract_ms = s.extract_ms;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is
     // just as reachable as a zero height -- an orientation change, an iPad
@@ -1941,7 +1709,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // A stale swapchain is the normal signal that the drawable changed size;
     // the next begin_frame rebuilds. Only a genuine error propagates.
     if (!vg::windowing::swapchain_stale(end)) {
-      set_error(error, end, "end_frame");
+      // Dumped here as well as out of begin_frame. gfx reports a vkQueueSubmit
+      // or present failure from this call, and a VK_ERROR_DEVICE_LOST is a
+      // normal way MoltenVK surfaces one -- `swapchain_stale` matches only
+      // OUT_OF_DATE and SUBOPTIMAL, so a lost device took this path and threw
+      // the whole ring away in silence. ScannerViewController suspends the
+      // loop on the NO below, so the 24 entries would die with _impl.
+      _impl->trace.dump(app::describe(end, "end_frame").c_str());
+      app::set_error(error, end, "end_frame");
       return NO;
     }
     return YES;
@@ -2457,10 +2232,15 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // The cause, not one of the four causes. See `allocation_stop_text`: the
     // advice for a full volume is actively wrong for the other two, and this
     // row used to assert it for all of them.
-    if (s.allocation_stop != app::AllocationStop::None) {
+    // Through reportable_allocation_stop like the banner and the `table` row:
+    // ALLOCATION STOPPED is a present-tense claim, and the latch behind it
+    // outlives the fuse loop that set it.
+    if (const app::AllocationStop stop =
+            app::reportable_allocation_stop(s.allocation_stop, s.ms_since_fuse);
+        stop != app::AllocationStop::None) {
       add(r, @"state",
           fmt("ALLOCATION STOPPED — %s",
-              allocation_stop_text(s.allocation_stop).headline),
+              app::allocation_stop_text(stop).headline),
           VolumetricStatToneCritical);
     }
     // The other capacity, with its own partner and its own cadence stated. Two
@@ -2878,26 +2658,20 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                     100.0 * static_cast<double>(s.occupancy), s.table_blocks);
     }
     table_row = cell;
-    // A stopped scan is a present-tense claim, so it has to stop being made
-    // when the fuse loop stops running. `allocation_stop` and `occupancy` are
-    // per-frame values latched into a snapshot that outlives the frame, and an
-    // ARKit interruption -- a call, Control Centre, the app switcher -- stops
-    // frames without stopping the display link, so the panel went on announcing
-    // a full volume for the length of a phone call, about a scan that was not
-    // allocating because it was not scanning.
-    //
-    // A second is generous against a 60 Hz capture decimated to whatever
-    // `fuse_every` is, and deliberately so: this should fire on an
-    // interruption, not on a slow frame.
-    constexpr float kFuseStaleAfterMs = 1000.0f;
-    if (s.ms_since_fuse > kFuseStaleAfterMs) {
+    // The freshness rule, and the threshold with it, are in
+    // Core/AllocationStop.hpp -- this row was the only place that had them,
+    // which is how the banner and the panel's `state` row came to go on
+    // announcing a full volume for the length of a phone call. This rendering
+    // says how long instead of merely dropping the claim, because it is the
+    // one with room for it.
+    if (!app::fuse_loop_running(s.ms_since_fuse)) {
       char note[96];
       std::snprintf(note, sizeof(note),
                     "  -- not fusing (%.1f s since a frame)",
                     static_cast<double>(s.ms_since_fuse) / 1000.0);
       table_row += note;
     } else {
-      table_row += allocation_stop_note(s.allocation_stop);
+      table_row += app::allocation_stop_note(s.allocation_stop);
     }
   }
 
@@ -3396,7 +3170,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`
   // returns for invalid UTF-8.
-  return to_ns_string(buf);
+  return app::to_ns_string(buf);
 }
 
 - (void)noteMemoryWarning {
@@ -3439,17 +3213,17 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
 - (NSString*)deviceName {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return to_ns_string(props.deviceName);
+  return app::to_ns_string(props.deviceName);
 }
 
 - (NSString*)apiVersion {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return to_ns_string(api_version_string(props.apiVersion));
+  return app::to_ns_string(api_version_string(props.apiVersion));
 }
 
 - (NSString*)sharedDeviceSummary {
-  return to_ns_string(_impl->shared.summary());
+  return app::to_ns_string(_impl->shared.summary());
 }
 
 - (BOOL)sharesOneDevice {
