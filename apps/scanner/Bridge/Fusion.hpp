@@ -36,6 +36,13 @@
 // the device, and this header cannot be reached from a host build: it pulls in
 // all of recon.
 #include "AllocationStop.hpp"
+// @ref kSurveyEveryFrames and the staleness rules the read-out shares with the
+// fuse loop, and @ref plan_growth / @ref guard_allocation -- the two decisions
+// `fuse` makes about the block table. All pure, all on the far side of the same
+// boundary and for the same reason: a threshold decided without the device
+// belongs where a host test can reach it.
+#include "Freshness.hpp"
+#include "GrowthPolicy.hpp"
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -50,25 +57,6 @@
 namespace volumetric_kit::ios_app {
 
 namespace vr = volumetric_kit::recon;
-
-/// @brief How many *fused* frames between dirty-block surveys.
-///
-/// Fused rather than captured, which is the unit the window is reported in and
-/// the one @ref FusionConfig::fuse_every does not distort: keying the survey
-/// off the capture counter made the real period 60/gcd(60, fuse_every) fused
-/// frames, so every value sharing a factor with 60 shortened the window
-/// silently and `fuse_every == 60` collapsed it to *every* fused frame -- a
-/// full compaction, fence and readback per fuse, on the knob someone reaches
-/// for precisely to buy frame budget back.
-///
-/// Public because the read-out needs it to tell a survey that has not happened
-/// yet from one that is failing. Both leave @ref
-/// FusionStats::survey_active_blocks at 0 and the gate on it is a one-way
-/// latch, so the *only* thing separating them is whether enough fused frames
-/// have gone by for a sample to have been due -- and a panel that hardcoded its
-/// own 60 to find that out would be the second copy of this number, drifting
-/// the first time it moved.
-constexpr std::uint64_t kSurveyEveryFrames = 60;
 
 /// @brief Per-scan tuning. Defaults target *first light* rather than room
 ///        coverage: a small map that fills quickly and grows through

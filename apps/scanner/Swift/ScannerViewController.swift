@@ -718,6 +718,7 @@ final class ScannerViewController: UIViewController {
     dashboard.framesFused = snapshot.framesFused
     dashboard.msSinceStages = snapshot.msSinceStages
     dashboard.msSinceFuse = snapshot.msSinceFuse
+    dashboard.stagesStale = snapshot.stagesStale
     dashboard.stagesTruncated = snapshot.stagesTruncated
     dashboard.gpuTimingRetired = snapshot.gpuTimingRetired
     dashboard.history = snapshot.history.map {

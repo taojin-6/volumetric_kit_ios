@@ -20,35 +20,6 @@ float ms_since(Clock::time_point t0) {
   return std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
 }
 
-/// How many times one frame may grow the map and retry its allocation.
-///
-/// One doubling is not enough when the user pans onto a whole new room section.
-/// Bounded rather than unbounded so a frame cannot spend the whole budget
-/// resizing -- and bounded well below the number of doublings that now span the
-/// table's whole range, which is the part that has to be re-checked whenever
-/// `FusionConfig::max_buckets` moves.
-///
-/// It was 5 against a 16384-bucket ceiling reached in four doublings from the
-/// 1024-bucket start, so the cap and the range were not the same number and one
-/// frame could not walk from one end to the other. Doubling the ceiling made
-/// them equal: five doublings is exactly 1024 -> 32768, so a single `fuse` call
-/// could commit the full ~1.5 GiB grid with a ~2.3 GiB transient beside it, on
-/// the fuse thread, in one frame -- while `capacity_limited()` is true for
-/// bucket-local `chain` exhaustion, which fires with the global load factor
-/// well under the grow threshold. Two keeps this a backstop for a frame that
-/// outruns one doubling, which is what it is documented to be, and leaves the
-/// rest of the range to the preemptive path that checks the memory budget.
-constexpr int kMaxGrowAttempts = 2;
-
-/// Blocks per bucket, which is `VoxelGridParams::bucket_size` below.
-///
-/// Named once rather than written as an `8` wherever the block-table capacity
-/// is derived: the occupancy guards divide by this, and a bucket size changed
-/// at the grid params with the guards left restating the old one would silently
-/// mis-scale the very thresholds that keep the allocate kernel out of its
-/// pathological regime.
-constexpr std::int32_t kBlocksPerBucket = 8;
-
 /// The stage labels this file seeds, restated from the tiers that report them.
 ///
 /// Restated rather than pointed at because recon has no constants to point at:
@@ -71,25 +42,6 @@ constexpr const char* kTextureStage = "texture";
 /// stage's own name. Seeded in that position so the sub-row sits directly under
 /// the row it decomposes.
 constexpr const char* kActiveSetStage = "  ..active set";
-
-/// The resident bytes `VoxelBlockGrid` holds for a table of `buckets` buckets.
-///
-/// `num_buckets * kBlocksPerBucket` blocks, 512 voxels each, and 12 B of
-/// attributes per voxel -- tsdf + weight + color, the three specs `start`
-/// registers. At 16384 buckets that is 805 MB, which is the figure
-/// `scanner.entitlements` records for the grid, so the arithmetic here and the
-/// measurement there agree.
-///
-/// The grid only. The mesh arena ring is the larger term and is not derived
-/// from this; see FusionConfig::max_buckets for what that means for the
-/// headroom check that calls this.
-std::uint64_t grid_bytes_for(std::int32_t buckets) {
-  constexpr std::uint64_t kVoxelsPerBlock = 512;
-  constexpr std::uint64_t kAttributeBytesPerVoxel = 12;
-  return static_cast<std::uint64_t>(buckets) *
-         static_cast<std::uint64_t>(kBlocksPerBucket) * kVoxelsPerBlock *
-         kAttributeBytesPerVoxel;
-}
 
 /// The floor on `FusionConfig::mesh_slots`; see that field.
 constexpr std::uint32_t kMinMeshSlots = 2;
@@ -120,16 +72,6 @@ constexpr bool publishes_mesh(const FusionConfig& config) {
 constexpr std::uint32_t effective_mesh_slots(const FusionConfig& config) {
   return config.incremental_benchmark ? 1u : config.mesh_slots;
 }
-
-/// How far past its own cadence a survey reading may fall before the read-out
-/// stops presenting it as current.
-///
-/// A window and a half: wide enough that the ordinary cadence never trips it
-/// (the sample publishes exactly every kSurveyEveryFrames frames when it is
-/// working), narrow enough that a survey which has stopped is named within
-/// another half-window rather than at some unbounded later point.
-constexpr std::uint64_t kSurveyStaleAfter =
-    kSurveyEveryFrames + kSurveyEveryFrames / 2;
 
 }  // namespace
 
@@ -553,44 +495,44 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // afforded. So grow on occupancy instead, well before the fallback dominates.
   // The reactive path below stays as a backstop for a frame that fills the
   // table faster than one doubling absorbs.
-  // recon's own constant, not a third copy of the number: the map's header
-  // gives this figure as the occupancy a caller should grow at rather than run
-  // past, and a UI drawing its own ceiling or an embedder refusing at its own
-  // threshold otherwise ends up disagreeing with the library it is guarding.
+  // The decision itself is in Core/GrowthPolicy.hpp -- occupancy against
+  // recon's threshold, the ceiling, a size already refused, and whether the
+  // jetsam headroom covers the transient. It is pure, so it is host tested;
+  // what stays here is the `resize` it authorises and the sentences that quote
+  // its figures back to the reader.
   //
-  // Gated on `occupancy_known` as well as on the threshold: see the fabricated
-  // 1.0 above, which would otherwise read as a standing instruction to double.
-  // And skipped at a size that has already been refused --
-  // `config_.num_buckets` advances only on success, so a failing resize
-  // otherwise satisfies this condition again on the very next fused frame, and
-  // keeps asking the allocator for the largest block this app requests at
-  // capture rate.
-  if (occupancy_known && occupancy > vr::volume::VoxelHashMap::kGrowThreshold &&
-      config_.num_buckets < config_.max_buckets &&
-      config_.num_buckets != preemptive_grow_failed_at_) {
-    const std::int32_t grown_to =
-        std::min(config_.num_buckets * 2, config_.max_buckets);
-    // Ask the kernel before asking the allocator. `resize` builds the grown
-    // attribute arrays beside the live ones, so the transient is the whole new
-    // size on top of what is already resident -- ~1.5 GiB at the 32768-bucket
-    // ceiling, beside a mesh arena ring that is the larger term still (3089 MB
-    // of arenas against an 805 MB grid, measured; see FusionConfig::
-    // max_buckets). This is the allocation that gets a scan SIGKILLed rather
-    // than failed, and jetsam does not return a Status.
-    //
-    // Affordable despite MemoryBudget's own "not intended for a per-frame path"
-    // note, because this is not a per-frame path: it is gated on a doubling,
-    // which happens a handful of times in a scan's life. One `task_info` call
-    // against a 1.5 GiB commit is not the cost worth saving.
-    const MemoryBudget budget = query_memory_budget();
-    const std::uint64_t needed = grid_bytes_for(grown_to);
-    if (budget.valid && budget.limit_known && budget.available_bytes < needed) {
-      frame_error = "preemptive resize declined: doubling to " +
-                    std::to_string(grown_to) + " buckets needs " +
-                    std::to_string(needed / (1024 * 1024)) + " MB and " +
-                    std::to_string(budget.available_bytes / (1024 * 1024)) +
-                    " MB is left before the process limit; not growing "
-                    "(existing surface still fusing)";
+  // recon's threshold is *passed in*, not restated: the map's header gives that
+  // figure as the occupancy a caller should grow at rather than run past, and
+  // says outright that an embedder refusing at its own threshold ends up
+  // disagreeing with the library it is guarding.
+  GrowthInputs growth;
+  growth.occupancy = occupancy;
+  growth.occupancy_known = occupancy_known;
+  growth.grow_threshold = vr::volume::VoxelHashMap::kGrowThreshold;
+  growth.num_buckets = config_.num_buckets;
+  growth.max_buckets = config_.max_buckets;
+  growth.declined_at = preemptive_grow_failed_at_;
+  // The budget is read only once a doubling is otherwise due, which is what
+  // `growth_due` is split out for: `query_memory_budget` is a `task_info` trap
+  // and MemoryBudget documents itself as not for a per-frame path -- and this
+  // is one. On the handful of frames that reach it, one syscall against a
+  // ~1.5 GiB commit is not the cost worth saving.
+  GrowthPlan plan;
+  if (growth_due(growth)) {
+    growth.budget = query_memory_budget();
+    plan = plan_growth(growth);
+  }
+
+  if (plan.action != GrowthAction::None) {
+    const std::int32_t grown_to = plan.grow_to;
+    if (plan.action == GrowthAction::DeclinedForMemory) {
+      frame_error =
+          "preemptive resize declined: doubling to " +
+          std::to_string(grown_to) + " buckets needs " +
+          std::to_string(plan.needed_bytes / (1024 * 1024)) + " MB and " +
+          std::to_string(growth.budget.available_bytes / (1024 * 1024)) +
+          " MB is left before the process limit; not growing "
+          "(existing surface still fusing)";
       frame_stage_failed = true;
       preemptive_grow_failed_at_ = config_.num_buckets;
     } else if (const vr::Status grown = [&] {
@@ -630,44 +572,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 
   // --- Refuse to allocate into a table with no room left --------------------
   //
-  // The growth above only helps while there is somewhere to grow. At the
-  // max_buckets ceiling occupancy climbs unchecked, and the overflow scan is
-  // O(num_buckets * bucket_size) per insert -- so a *larger* ceiling makes the
-  // pathological case worse, not better, and no ceiling is high enough to be a
-  // fix on its own. Measured: 31480 of 32768 blocks (96%) at the old
-  // 4096-bucket ceiling hung the GPU.
-  //
-  // So past the point where the fallback dominates, stop feeding it. Skipping
-  // allocation costs *new* geometry only: integrate still fuses every block
-  // already in the table, so the existing surface keeps refining and the app
-  // keeps running. That is the trade max_buckets was always documented to make
-  // ("a scan that is missing far geometry, still running, and saying so") -- it
-  // just was not actually enforced anywhere, and the unenforced version was a
-  // GPU hang.
-  // Deliberately NOT kGrowThreshold. That one says "start growing"; this one
-  // says "stop feeding the overflow scan", and the band between them is the
-  // room a doubling needs to land in. Collapsing them would refuse allocation
-  // at the moment growth begins, on a table with plenty of room.
-  //
-  // @note **This threshold's justification is older than the kernel it guards,
-  //       and 0.85 has not been re-measured since.** Everything above describes
-  //       `allocate_in_overflow` as it behaved before recon d282bbd and e36f6ad
-  //       (both 2026-08-08), which together stopped the exhaustive sweep from
-  //       paying a contended atomicCompSwap per slot: a candidate's pointer is
-  //       read unlocked first, so only free-looking slots pay the atomic (~25x
-  //       fewer at 96% occupancy), and an empty heap short-circuits on a single
-  //       atomic load -- named there as "the state the iPad was in, sweeping
-  //       the whole table to discover nothing". CMakeLists.txt tracks recon's
-  //       `main`, so this app already builds that kernel, and this very change
-  //       took `kGrowThreshold` from the same changeset.
-  //
-  //       Kept in force regardless, because a cliff that costs coverage is the
-  //       safe side of an unmeasured guess and nothing has run on device since
-  //       the fix. But it is now capping scans against a pathology that has
-  //       been repaired upstream, so the number to re-measure is this one --
-  //       not the ceiling it is protecting.
-  constexpr float kRefuseAllocateAtOccupancy = 0.85f;
-  const bool table_exhausted = occupancy > kRefuseAllocateAtOccupancy;
+  // The threshold, why it is not recon's grow threshold, and the two causes it
+  // separates are all in Core/GrowthPolicy.hpp, where a host test can reach
+  // them -- including the one that matters most and is hardest to produce on a
+  // device: a fabricated occupancy tripping the guard on a table with room
+  // left. Refusing costs *new* geometry only; integrate still fuses every block
+  // already in the table, which is what lets the scan keep running and say so.
+  const AllocationGuard guard = guard_allocation(occupancy, occupancy_known);
+  const bool table_exhausted = !guard.allocate;
 
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
@@ -683,14 +595,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // other. Published once at the end rather than here, so it can carry both --
   // setting it from the guard alone left the second route as silent as it was
   // before the field existed, and that route fires while the table reads 60%.
-  //
-  // The guard's own two causes are separated here rather than at the read-out:
-  // a fabricated occupancy trips it just as a genuinely full table does, and
-  // only this scope knows which happened.
-  AllocationStop allocation_stop = !table_exhausted ? AllocationStop::None
-                                   : occupancy_known
-                                       ? AllocationStop::VolumeFull
-                                       : AllocationStop::OccupancyUnknown;
+  AllocationStop allocation_stop = guard.stop;
   if (table_exhausted && frame_error.empty()) {
     // Both halves of the ratio taken after the grow above, not across it. The
     // first cut divided a numerator sampled before the doubling by
@@ -699,8 +604,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // 32768 ceiling printed "88% of 16384 blocks at the 32768-bucket ceiling"
     // and prescribed raising a ceiling four doublings away. Multiplying the
     // sentence's own two numbers gave a block count that never existed.
-    const std::int64_t blocks =
-        static_cast<std::int64_t>(config_.num_buckets) * kBlocksPerBucket;
+    const std::int64_t blocks = table_blocks_for(config_.num_buckets);
     const bool at_ceiling = config_.num_buckets >= config_.max_buckets;
     frame_error =
         "volume full: " + std::to_string(static_cast<int>(occupancy * 100.0f)) +
@@ -724,7 +628,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.occupancy = occupancy;
     stats_.occupancy_known = occupancy_known;
     stats_.table_blocks =
-        static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
+        static_cast<std::uint32_t>(table_blocks_for(config_.num_buckets));
     stats_.allocation_stop = allocation_stop != AllocationStop::None
                                  ? allocation_stop
                                  : AllocationStop::BlocksDropped;
@@ -912,7 +816,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.occupancy = occupancy;
     stats_.occupancy_known = occupancy_known;
     stats_.table_blocks =
-        static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
+        static_cast<std::uint32_t>(table_blocks_for(config_.num_buckets));
     stats_.allocation_stop = allocation_stop;
     // How far behind this frame the published extract breakdown now is.
     // Everything in `stats_.extract` -- the phases, the block count, the arena,
@@ -927,13 +831,12 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.frames_since_extract =
         active_blocks_measured_ ? stats_.frames_fused - active_blocks_at_frame_
                                 : 0;
-    // Two cadences of slack rather than none: a remesh that skips because the
-    // renderer has not collected the last mesh is the ordinary steady state,
-    // and a marker that flickered on it would be noise rather than signal.
-    const std::uint64_t fresh_within =
-        2ull * std::max<std::uint32_t>(config_.remesh_every, 1u);
+    // Both rules are in Core/Freshness.hpp, where the read-out also reads them:
+    // the margin used to be written out as `x + x / 2` here and again there,
+    // under two names, each free to be re-derived differently.
     stats_.extract_stale =
-        active_blocks_measured_ && stats_.frames_since_extract > fresh_within;
+        extract_stale(active_blocks_measured_, stats_.frames_since_extract,
+                      config_.remesh_every);
     // The same pair for the survey, which needs it more: the read-out gates the
     // dirty rows on `survey_active_blocks > 0` and never lowers that gate, so
     // without this a survey that has stopped publishing keeps its last sample
@@ -941,7 +844,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.frames_since_survey =
         survey_measured_ ? stats_.frames_fused - survey_at_frame_ : 0;
     stats_.survey_stale =
-        survey_measured_ && stats_.frames_since_survey > kSurveyStaleAfter;
+        survey_stale(survey_measured_, stats_.frames_since_survey);
     // Assigned, not cleared: a frame that fused with dropped blocks says so.
     //
     // This assignment is also what makes `errors` load-bearing. It runs every
@@ -1634,7 +1537,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // published on different cadences is wrong in whichever direction they
   // differ -- see FusionStats::table_capacity.
   stats_.table_capacity =
-      static_cast<std::uint32_t>(config_.num_buckets * kBlocksPerBucket);
+      static_cast<std::uint32_t>(table_blocks_for(config_.num_buckets));
   // Stamped with the reading, because the reading is what `fuse`'s anti-hang
   // guards run on and a successful extract is the only thing that refreshes it.
   // Without the stamp there is no way to tell a live occupancy figure from one

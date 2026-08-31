@@ -263,6 +263,38 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
   VolumetricStatToneCritical,
 };
 
+/// @brief The two tiers a figure is read against, as fractions.
+typedef struct {
+  double warn;
+  double critical;
+} VolumetricToneThresholds;
+
+/// @brief The thresholds the panel's gauges draw against.
+///
+/// Published rather than left for the panel to restate, because a gauge is not
+/// a second view of a row: @ref VolumetricStatRow.drawnAsGauge suppresses the
+/// row wherever a bar exists, so on those figures these numbers are the *only*
+/// thing deciding what colour a reader sees -- and the bridge has already toned
+/// the corresponding row with them.
+///
+/// The two sides drifting is not hypothetical. The arena gauge was once built
+/// with a single 0.9 tier while its row kept 0.9/0.98, so at 0.99 the row
+/// rendered red directly beneath a merely-orange bar drawn from the same
+/// measurement. Giving the bar two tiers fixed the shape and left both sides
+/// still holding their own literals; this is what removes the second copy.
+///
+/// A plain C struct, like @ref VolumetricCaptureStats, so Swift reads the
+/// fields directly with no bridging object per tick.
+typedef struct {
+  /// Block-table occupancy, for the headline meter.
+  VolumetricToneThresholds occupancy;
+  /// Mesh arena fill, on the Scene card.
+  VolumetricToneThresholds arenaFill;
+  /// Footprint against the jetsam ceiling and against the GPU working set --
+  /// one pair for both, since they are two ceilings on the same held bytes.
+  VolumetricToneThresholds memory;
+} VolumetricGaugeThresholds;
+
 /// @brief One labelled figure.
 @interface VolumetricStatRow : NSObject
 /// Unavailable for the reason @ref VolumetricRenderer's is: the properties
@@ -428,6 +460,15 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 /// the fusion for the camera. The *difference* isolates the case that is
 /// actually a fault: frames arriving, none completing.
 @property(nonatomic, readonly) double msSinceFuse;
+/// Whether @ref msSinceStages has fallen far enough behind @ref msSinceFuse to
+/// stop presenting the stage rows as this frame's.
+///
+/// The comparison itself, not its inputs, because it is the part that was
+/// getting restated: `Core/Freshness.hpp` decides it, the log's `(N s old)`
+/// line prints it, and the panel used to re-derive it from the two doubles
+/// above against a literal `1000`. Three copies of one rule, and the two
+/// renderings were free to disagree about a figure they draw side by side.
+@property(nonatomic, readonly) BOOL stagesStale;
 /// Whether recon reported more stages than the snapshot could hold, making the
 /// bars an under-report rather than a short pipeline.
 @property(nonatomic, readonly) BOOL stagesTruncated;
@@ -703,6 +744,14 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// scan rather than as a bug. The C++ constant this mirrors cannot be seen from
 /// Swift, so a bridged accessor is the only thing that actually prevents it.
 @property(class, nonatomic, readonly) NSUInteger frameHistoryCapacity;
+
+/// @brief The thresholds the panel's gauges must draw against.
+///
+/// A class property for the same reason @ref frameHistoryCapacity is one: the
+/// C++ constants cannot be seen from Swift, and an accessor is the only thing
+/// that actually stops the panel restating them. See @ref
+/// VolumetricGaugeThresholds for what restating them already cost once.
+@property(class, nonatomic, readonly) VolumetricGaugeThresholds gaugeThresholds;
 
 /// @brief Block-table capacity as of the last successful remesh — the partner
 ///        of @ref VolumetricDashboardSnapshot.activeBlocks, and of nothing

@@ -189,6 +189,12 @@ final class DashboardModel: ObservableObject {
   @Published var msSinceStages: Double = 0
   /// Never compared to a threshold on its own -- see `staleness`.
   @Published var msSinceFuse: Double = 0
+  /// Whether the stage rows have fallen behind the fuse loop. Decided by the
+  /// bridge against `kFuseStaleAfterMs`, not re-derived here from
+  /// `msSinceStages` and `msSinceFuse` -- that comparison used to be written
+  /// out in this file against a literal `1000`, a third copy of a rule the log
+  /// and the panel print side by side.
+  @Published var stagesStale = false
   @Published var stagesTruncated = false
   @Published var gpuTimingRetired = false
 
@@ -233,6 +239,19 @@ struct DashboardView: View {
   /// a landscape iPad, where six groups fit across, and a portrait phone, where
   /// one does. A hardcoded grid would be right on exactly one of them.
   private let columns = [GridItem(.adaptive(minimum: 290), spacing: 12)]
+
+  /// The tiers every gauge below draws against, from the bridge.
+  ///
+  /// Read from `VolumetricRenderer` rather than written out here, because a
+  /// gauge is not a second view of a row -- `drawnAsGauge` suppresses the row
+  /// wherever a bar exists, so on those figures these numbers are the only
+  /// thing deciding what colour a reader sees, and the bridge has already toned
+  /// the matching row with them. Four literal pairs used to sit in this file,
+  /// mirroring four in `Readout.mm`; the arena pair had already drifted once.
+  ///
+  /// Static because they are compile-time constants on the far side too: this
+  /// is a value read once, not a per-tick bridge call.
+  private static let thresholds = VolumetricRenderer.gaugeThresholds
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
@@ -389,7 +408,8 @@ struct DashboardView: View {
       // headline and the Block table card cannot disagree about the same
       // fraction. The tick stays on the 85% line -- the one that means act.
       Meter(
-        fraction: model.occupancy, warn: 0.7, critical: 0.85,
+        fraction: model.occupancy, warn: Self.thresholds.occupancy.warn,
+        critical: Self.thresholds.occupancy.critical,
         known: model.occupancyKnown)
       // The unknown case is a *refusal to report*, not a reading of zero. The
       // fusion forces occupancy to 1.0 when load_factor fails so its guard
@@ -545,7 +565,7 @@ struct DashboardView: View {
   /// whole duration, blaming the fusion for the camera. The difference isolates
   /// the case that is a fault: frames arriving, none completing.
   @ViewBuilder private var staleness: some View {
-    let stale = model.msSinceStages > model.msSinceFuse + 1000
+    let stale = model.stagesStale
     if stale || model.stagesTruncated || model.gpuTimingRetired {
       VStack(alignment: .leading, spacing: 2) {
         if stale {
@@ -611,7 +631,9 @@ struct DashboardView: View {
       // carried no signal at all.
       if model.arenaFillKnown {
         Gauge(
-          label: "arena", fraction: model.arenaFill, warn: 0.9, critical: 0.98,
+          label: "arena", fraction: model.arenaFill,
+          warn: Self.thresholds.arenaFill.warn,
+          critical: Self.thresholds.arenaFill.critical,
           caption: Self.ratio(
             model.triangles, model.triangleCapacity, unit: "tris"),
           stale: model.extractStale)
@@ -642,7 +664,8 @@ struct DashboardView: View {
           Gauge(
             label: "jetsam",
             fraction: Double(model.memoryUsedBytes) / Double(model.memoryLimitBytes),
-            warn: 0.7, critical: 0.85,
+            warn: Self.thresholds.memory.warn,
+            critical: Self.thresholds.memory.critical,
             caption: Self.megabytes(model.memoryUsedBytes, model.memoryLimitBytes),
             mark: Self.fraction(model.memoryPeakBytes, model.memoryLimitBytes))
         }
@@ -650,7 +673,8 @@ struct DashboardView: View {
           Gauge(
             label: "gpu",
             fraction: Double(model.memoryUsedBytes) / Double(model.memoryWorkingSetBytes),
-            warn: 0.7, critical: 0.85,
+            warn: Self.thresholds.memory.warn,
+            critical: Self.thresholds.memory.critical,
             caption: Self.megabytes(model.memoryUsedBytes, model.memoryWorkingSetBytes),
             mark: Self.fraction(model.memoryPeakBytes, model.memoryWorkingSetBytes))
         }

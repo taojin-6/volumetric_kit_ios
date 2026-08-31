@@ -15,7 +15,6 @@
 #import "ARKitCapture.h"
 
 #import "AllocationStop.hpp"
-#import "AllocationStopDisplay.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
 #import "FrameTrace.hpp"
@@ -1201,6 +1200,20 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 
 + (NSUInteger)frameHistoryCapacity {
   return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
+}
+
++ (VolumetricGaugeThresholds)gaugeThresholds {
+  // Transcribed field by field rather than cast from the C++ pairs. The two
+  // structs are laid out identically today and a reinterpret_cast would work
+  // today, which is exactly the kind of coupling that survives a field being
+  // inserted on one side and starts painting the memory bar with the arena's
+  // thresholds -- a wrong colour that looks like a right one.
+  const auto pair = [](app::ToneThresholds t) {
+    return VolumetricToneThresholds{t.warn, t.critical};
+  };
+  return VolumetricGaugeThresholds{pair(app::kOccupancyThresholds),
+                                   pair(app::kArenaFillThresholds),
+                                   pair(app::kMemoryThresholds)};
 }
 
 - (uint32_t)blockCapacity {

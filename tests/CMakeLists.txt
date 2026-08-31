@@ -31,8 +31,13 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(
   vi_core_tests
-  allocation_stop_test.cpp memory_budget_test.cpp orbit_camera_test.cpp
-  stat_tone_test.cpp view_orientation_test.cpp)
+  allocation_stop_test.cpp
+  freshness_test.cpp
+  growth_policy_test.cpp
+  memory_budget_test.cpp
+  orbit_camera_test.cpp
+  stat_tone_test.cpp
+  view_orientation_test.cpp)
 
 target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main)
 
