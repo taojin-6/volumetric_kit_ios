@@ -31,6 +31,7 @@ add_library(
   Bridge/FrameTrace.cpp
   Bridge/Fusion.mm
   Bridge/MemoryQuery.cpp
+  Bridge/Readout.mm
   Bridge/RendererErrors.mm
   Bridge/SharedDevice.mm)
 
