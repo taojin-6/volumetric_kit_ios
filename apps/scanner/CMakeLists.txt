@@ -26,6 +26,7 @@ add_library(
   Bridge/VolumetricRenderer.mm
   Bridge/AllocationStopDisplay.mm
   Bridge/ARKitCapture.mm
+  Bridge/AtlasRing.mm
   Bridge/FrameTrace.mm
   Bridge/Fusion.mm
   Bridge/MemoryQuery.cpp
