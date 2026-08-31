@@ -5,6 +5,13 @@
 
 #import "AllocationStopDisplay.hpp"
 #import "BridgeStrings.hpp"
+// `stages_stale` and `kSurveyStaleAfter`, on the same rule as <vector> below:
+// they arrive today through Readout.hpp -> Fusion.hpp, and nothing Fusion.hpp
+// declares uses either -- so the include-pruning pass that correctly drops them
+// from that header would break three lines here that have nothing to do with
+// it. Before these moved out of Fusion.hpp the include really was the
+// dependency; now it is a coincidence.
+#import "Freshness.hpp"
 #import "StatTone.hpp"
 
 #include <os/log.h>
@@ -590,6 +597,35 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
               : fmt("x%llu", (unsigned long long)in.memory_warnings),
           VolumetricStatToneCritical);
     }
+    // Growth turned away for headroom: a state, not a fault, and the one row
+    // on this card that is not counted.
+    //
+    // Here because a reader consults Alerts to find out why a scan is not
+    // behaving, and "the block table has stopped growing" is that -- but Warn
+    // rather than Critical, and without a count, because the scan is still
+    // fusing every block it already holds and the condition lifts on its own
+    // when the pressure does. It reached this card through the error counter
+    // once, which made a momentary shortfall a permanent critical card.
+    if (s.growth_declined_for_memory) {
+      // The headroom half only when this poll's reading carries one. The
+      // decline itself was taken against a valid reading with a real ceiling --
+      // `plan_growth` declines on nothing else -- but that was on the fuse
+      // thread and this is a fresh `task_info` up to half a second later, which
+      // can come back invalid or ceiling-less. Printing a clamped or absent
+      // remainder as "MB before the limit" would put a fabricated number beside
+      // a real one in the row a reader consults to judge the decision.
+      const bool headroom_known = budget.valid && budget.limit_known;
+      add(r, @"volume growth",
+          headroom_known
+              ? fmt("declined — doubling to %d buckets needs %.0f MB, %.0f MB "
+                    "before the limit  (existing surface still fusing)",
+                    s.growth_declined_to, s.growth_declined_bytes / mb,
+                    budget.available_bytes / mb)
+              : fmt("declined — doubling to %d buckets needs %.0f MB  "
+                    "(existing surface still fusing)",
+                    s.growth_declined_to, s.growth_declined_bytes / mb),
+          VolumetricStatToneWarn);
+    }
     // The fusion's own error counter, here rather than on the section that
     // describes the geometry. It was a row on `Fusion` -- beside the frame and
     // vertex counts, in a card a reader consults for scale rather than for
@@ -924,9 +960,15 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     // whose next remesh skips, and freezes for the session under a persistent
     // extract failure while the map doubles beneath it.
     if (s.occupancy_known) {
+      // Derived from the guard and from recon's threshold rather than read from
+      // a pair of literals -- see `occupancy_thresholds`. This row and the
+      // headline meter are both on screen at once, drawn from this measurement,
+      // so the two numbers deciding their colour have to be the two numbers
+      // deciding the behaviour.
       add(r, @"occupied",
           fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_blocks),
-          panel_tone(s.occupancy, kOccupancyThresholds));
+          panel_tone(s.occupancy,
+                     occupancy_thresholds(Fusion::grow_threshold())));
     } else {
       add(r, @"occupied", fmt("unreadable  (of %u blocks)", s.table_blocks),
           VolumetricStatToneWarn);

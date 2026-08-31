@@ -32,6 +32,11 @@
 
 #include "AllocationStop.hpp"
 #include "MemoryBudget.hpp"
+// @ref ToneThresholds, for @ref occupancy_thresholds. The dependency runs this
+// way round on purpose: the tone header states a general rule and has no
+// opinion about block tables, while both numbers the occupancy pair is built
+// from are this file's business -- one of them is declared below it.
+#include "StatTone.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -43,6 +48,28 @@ namespace volumetric_kit::ios_app {
 /// mis-scale the very thresholds that keep the allocate kernel out of its
 /// pathological regime.
 inline constexpr std::int32_t kBlocksPerBucket = 8;
+
+/// @brief Voxels along a block edge -- `VoxelGridParams::block_size`.
+inline constexpr std::int32_t kBlockEdgeVoxels = 8;
+
+/// @brief Voxels per block -- `VoxelGridParams::voxels_per_block`.
+///
+/// Cubed here rather than written as a literal 512 beside a `// 8^3`, which is
+/// what the grid params carried: the comment is not checked and the two numbers
+/// are one number.
+inline constexpr std::int32_t kVoxelsPerBlock =
+    kBlockEdgeVoxels * kBlockEdgeVoxels * kBlockEdgeVoxels;
+
+/// @brief Attribute bytes per voxel -- tsdf + weight + color.
+///
+/// The three specs `Fusion::start` registers, and it registers them through
+/// this: @ref grid_bytes_for multiplies by this figure to decide whether a
+/// doubling can be afforded, and a fourth attribute added to that table with
+/// this left behind would under-report the commit by a third and hand the
+/// headroom check a number the process cannot survive. `Fusion.mm`
+/// static_asserts the specs against it beside the table itself, which is the
+/// one place both are visible -- this library cannot include recon.
+inline constexpr std::int32_t kAttributeBytesPerVoxel = 12;
 
 /// @brief How many times one frame may grow the map and retry its allocation.
 ///
@@ -63,6 +90,29 @@ inline constexpr std::int32_t kBlocksPerBucket = 8;
 /// outruns one doubling, which is what it is documented to be, and leaves the
 /// rest of the range to the preemptive path that checks the memory budget.
 inline constexpr int kMaxGrowAttempts = 2;
+
+/// @brief Fused frames a memory-declined doubling waits before asking again.
+///
+/// A decline is a reading of the *device*, not of the table: the headroom that
+/// would not cover a doubling a second ago may cover it now, because whatever
+/// was holding it has been backgrounded. So this refusal expires, where @ref
+/// GrowthInputs::declined_at -- an allocator that actually refused the request
+/// -- is pinned to the size it happened at.
+///
+/// It has to expire, and that is not a preference. Pinning a memory decline to
+/// a size is a cap for the rest of the scan: `num_buckets` advances only on a
+/// successful resize, so the pin never goes stale on its own; growth is the
+/// only thing that lowers occupancy; and once occupancy climbs past @ref
+/// kRefuseAllocateAtOccupancy the guard below stops the allocation whose
+/// overflow would have driven the reactive backstop. Every route out is shut by
+/// the same latch, and the scan reports a volume full short of a ceiling it
+/// never reached, forever, from one momentary shortfall at a doubling boundary.
+///
+/// Long enough that the `task_info` trap @ref growth_due exists to keep off the
+/// per-frame path stays off it -- a standing decline costs one syscall per this
+/// many fused frames, not one per frame -- and short enough that a scan
+/// recovers within a second or two of the pressure lifting.
+inline constexpr std::uint64_t kMemoryDeclineRetryFrames = 60;
 
 /// @brief The occupancy past which no new blocks are allocated at all.
 ///
@@ -102,11 +152,35 @@ inline constexpr int kMaxGrowAttempts = 2;
 ///       protecting.
 inline constexpr float kRefuseAllocateAtOccupancy = 0.85f;
 
+/// @brief The tiers the occupancy figure is *reported* against.
+///
+/// Derived rather than written out, because both tiers already exist and one of
+/// them is not this app's to state. The critical tier **is** @ref
+/// kRefuseAllocateAtOccupancy, so the bar goes red at the cliff rather than at
+/// a second copy of it; the warn tier is recon's grow threshold, passed in for
+/// the reason this file's note gives. Written out as a `{0.7, 0.85}` pair
+/// beside the other gauges, they were two more literals free to drift -- and
+/// already were not the same quantity: `(double)0.85f` is 0.85000002384 and the
+/// literal is 0.84999999999, so the bar and the guard sat on different numbers
+/// while a comment asserted they were one.
+///
+/// The two *comparisons* are still deliberately not identical, and now the
+/// difference is only their direction: @ref guard_allocation is strict, so a
+/// table sitting exactly on the cliff still allocates, while `tone_for` is
+/// inclusive, so that same table already reads Critical. Red therefore arrives
+/// *at* the cliff rather than after it, which is the side an alarm should err
+/// on -- and re-measuring @ref kRefuseAllocateAtOccupancy now moves both.
+constexpr ToneThresholds occupancy_thresholds(float grow_threshold) noexcept {
+  return ToneThresholds(static_cast<double>(grow_threshold),
+                        static_cast<double>(kRefuseAllocateAtOccupancy));
+}
+
 /// @brief The resident bytes `VoxelBlockGrid` holds for @p buckets buckets.
 ///
-/// `buckets * kBlocksPerBucket` blocks, 512 voxels each, and 12 B of attributes
-/// per voxel -- tsdf + weight + color, the three specs `Fusion::start`
-/// registers. At 16384 buckets that is 805 MB, which is the figure
+/// @ref kBlocksPerBucket blocks per bucket, @ref kVoxelsPerBlock voxels each,
+/// and @ref kAttributeBytesPerVoxel of attributes per voxel -- every factor
+/// named, and `Fusion::start` configures the grid from the same three rather
+/// than from literals beside them. At 16384 buckets that is 805 MB, the figure
 /// `scanner.entitlements` records for the grid, so the arithmetic here and the
 /// measurement there agree.
 ///
@@ -114,11 +188,10 @@ inline constexpr float kRefuseAllocateAtOccupancy = 0.85f;
 /// from this; see `FusionConfig::max_buckets` for what that means for the
 /// headroom check that calls this.
 constexpr std::uint64_t grid_bytes_for(std::int32_t buckets) noexcept {
-  constexpr std::uint64_t kVoxelsPerBlock = 512;
-  constexpr std::uint64_t kAttributeBytesPerVoxel = 12;
   return static_cast<std::uint64_t>(buckets) *
-         static_cast<std::uint64_t>(kBlocksPerBucket) * kVoxelsPerBlock *
-         kAttributeBytesPerVoxel;
+         static_cast<std::uint64_t>(kBlocksPerBucket) *
+         static_cast<std::uint64_t>(kVoxelsPerBlock) *
+         static_cast<std::uint64_t>(kAttributeBytesPerVoxel);
 }
 
 /// @brief The blocks a table of @p buckets buckets holds.
@@ -151,18 +224,41 @@ struct GrowthInputs {
   bool occupancy_known = false;
   /// recon's `VoxelHashMap::kGrowThreshold`, passed in rather than restated --
   /// see this file's note.
-  float grow_threshold = 0.0f;
+  ///
+  /// Defaulted to 1.0 rather than 0.0, which is the difference between an
+  /// omitted threshold meaning "never grow" and meaning "grow on every fused
+  /// frame". No load factor exceeds 1.0 -- `Fusion` fabricates exactly 1.0 when
+  /// it cannot read one -- so this default is unsatisfiable and a caller that
+  /// forgets the field gets a table that never grows, which is a visible bug in
+  /// the direction that costs coverage. The old default was satisfied at 2%
+  /// occupancy: the `task_info` trap back on the per-frame path and the largest
+  /// allocation this app makes requested at capture rate, which is the exact
+  /// runaway @ref declined_at exists to stop.
+  ///
+  /// The deleted code could not be got wrong this way -- it named the constant
+  /// inside the condition, so there was nothing to omit. A field cannot recover
+  /// that, but it can choose which way it fails.
+  float grow_threshold = 1.0f;
   /// The table's size now.
   std::int32_t num_buckets = 0;
   /// The ceiling `FusionConfig::max_buckets` sets.
   std::int32_t max_buckets = 0;
-  /// A size whose resize has already been refused, or 0.
+  /// A size whose resize has already been *attempted and refused*, or 0.
   ///
   /// `num_buckets` advances only on a *successful* resize, so without this a
   /// failing grow satisfies the same condition again on the very next fused
   /// frame -- asking the allocator for the largest block this app requests, at
   /// capture rate.
+  ///
+  /// The allocator having said no is the whole of what this records. A doubling
+  /// the *headroom check* turned away never reached the allocator and must not
+  /// come here; it goes to @ref memory_declined, which expires. See @ref
+  /// kMemoryDeclineRetryFrames for why the distinction is load-bearing.
   std::int32_t declined_at = 0;
+  /// Whether a doubling has been declined for headroom and not yet re-asked.
+  bool memory_declined = false;
+  /// Fused frames since that decline. Read only when @ref memory_declined.
+  std::uint64_t frames_since_memory_decline = 0;
   /// The kernel's memory reading, for the headroom check.
   MemoryBudget budget{};
 };
@@ -201,8 +297,14 @@ struct GrowthPlan {
 ///
 /// Reads no budget field, so the caller may leave it default-constructed.
 constexpr bool growth_due(const GrowthInputs& in) noexcept {
+  // A headroom decline backs off on a cadence rather than being pinned to a
+  // size; see kMemoryDeclineRetryFrames for why it cannot be pinned.
+  const bool waiting_out_a_decline =
+      in.memory_declined &&
+      in.frames_since_memory_decline < kMemoryDeclineRetryFrames;
   return in.occupancy_known && in.occupancy > in.grow_threshold &&
-         in.num_buckets < in.max_buckets && in.num_buckets != in.declined_at;
+         in.num_buckets < in.max_buckets && in.num_buckets != in.declined_at &&
+         !waiting_out_a_decline;
 }
 
 /// @brief Decide whether to grow ahead of density.
@@ -259,7 +361,14 @@ struct AllocationGuard {
 /// @brief Whether a table at @p occupancy may still take new blocks.
 constexpr AllocationGuard guard_allocation(float occupancy,
                                            bool occupancy_known) noexcept {
-  if (occupancy <= kRefuseAllocateAtOccupancy) {
+  // Negated rather than written as `occupancy <= kRefuseAllocateAtOccupancy`,
+  // which is its inverse only for ordered values. A NaN compares false against
+  // both, so the `<=` form falls through to the refusal -- turning what this
+  // guard did before it moved (allocate, silently) into a stopped scan, an
+  // AllocationStop latch `Fusion` never lowers, and a "volume full: 0%" built
+  // from a UB cast of the NaN. The refusal has to be reached by *being past*
+  // the cliff, not by failing to be under it.
+  if (!(occupancy > kRefuseAllocateAtOccupancy)) {
     return {true, AllocationStop::None};
   }
   return {false, occupancy_known ? AllocationStop::VolumeFull

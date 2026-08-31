@@ -219,15 +219,38 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   active_blocks_at_frame_ = 0;
   active_blocks_measured_ = false;
   preemptive_grow_failed_at_ = 0;
+  // Every remaining member counted in `stats_.frames_fused`, which the
+  // `stats_ = FusionStats{}` above puts back to 0. Missing them was not a
+  // cosmetic omission: `frames_fused - survey_at_frame_` is unsigned, so a
+  // second `start()` left the first frame of the new scan subtracting the old
+  // scan's four-thousand-and-somethingth from zero, wrapping to 1.8e19, and
+  // `survey_stale` then reported a stale survey on frame one of a healthy scan.
+  // `dirty_window_start_` carries the same wrap into the published window
+  // length, and `survey_first_window` -- which is `dirty_window_start_ == 0` --
+  // mislabels the new scan's genuine first window as an ordinary one.
+  survey_at_frame_ = 0;
+  survey_measured_ = false;
+  dirty_window_start_ = 0;
+  extract_window_start_ = 0;
+  memory_declined_ = false;
+  memory_declined_at_frame_ = 0;
+  declined_grow_to_ = 0;
+  declined_grow_bytes_ = 0;
 
   vr::volume::VoxelGridParams grid{};
   grid.voxel_size = config.voxel_size;
-  grid.block_size = 8;
-  grid.voxels_per_block = 512;  // 8^3
+  grid.block_size = kBlockEdgeVoxels;
+  grid.voxels_per_block = kVoxelsPerBlock;
   grid.trunc_dist = config.trunc_dist;
   grid.bucket_size = kBlocksPerBucket;
   grid.num_buckets = config.num_buckets;
-  grid.num_blocks = config.num_buckets * kBlocksPerBucket;
+  // Through the same helper the four *reporting* sites use, which is the one
+  // that was left open-coded when they moved. A `table_blocks_for` that gained
+  // a term would otherwise update every sentence about the block count and not
+  // the number recon is actually given, and the read-out's denominator would
+  // quote a capacity the grid does not have.
+  grid.num_blocks =
+      static_cast<std::int32_t>(table_blocks_for(config.num_buckets));
   grid.max_chain = 128;
 
   // tsdf + weight are what the integrator writes; color is what makes the
@@ -236,6 +259,17 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   const vr::volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                              {"weight", sizeof(float)},
                                              {"color", sizeof(std::uint32_t)}};
+  // The link `grid_bytes_for` cannot make for itself. It lives in vi_core,
+  // which cannot include recon, so its per-voxel figure and this table are in
+  // different libraries; here is the one scope that sees both. A fourth
+  // attribute added above without moving the constant would leave the headroom
+  // check under-reporting the commit by a third -- and that check is what
+  // decides whether a ~1.5 GiB doubling goes to an allocator jetsam answers
+  // with a SIGKILL rather than a Status.
+  static_assert(
+      sizeof(float) + sizeof(float) + sizeof(std::uint32_t) ==
+          static_cast<std::size_t>(kAttributeBytesPerVoxel),
+      "kAttributeBytesPerVoxel and this AttributeSpec table disagree");
   vr::Result<vr::volume::VoxelBlockGrid> made =
       vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 3);
   if (!made) {
@@ -512,6 +546,13 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   growth.num_buckets = config_.num_buckets;
   growth.max_buckets = config_.max_buckets;
   growth.declined_at = preemptive_grow_failed_at_;
+  // The headroom refusal's own backoff, which is a cadence rather than a pin to
+  // a size -- see kMemoryDeclineRetryFrames. `stats_.frames_fused` is read
+  // unlocked here as it is at the remesh gate below: the fuse thread is its
+  // only writer, and every other reader takes the mutex.
+  growth.memory_declined = memory_declined_;
+  growth.frames_since_memory_decline =
+      memory_declined_ ? stats_.frames_fused - memory_declined_at_frame_ : 0;
   // The budget is read only once a doubling is otherwise due, which is what
   // `growth_due` is split out for: `query_memory_budget` is a `task_info` trap
   // and MemoryBudget documents itself as not for a per-frame path -- and this
@@ -523,50 +564,82 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     plan = plan_growth(growth);
   }
 
-  if (plan.action != GrowthAction::None) {
-    const std::int32_t grown_to = plan.grow_to;
-    if (plan.action == GrowthAction::DeclinedForMemory) {
-      frame_error =
-          "preemptive resize declined: doubling to " +
-          std::to_string(grown_to) + " buckets needs " +
-          std::to_string(plan.needed_bytes / (1024 * 1024)) + " MB and " +
-          std::to_string(growth.budget.available_bytes / (1024 * 1024)) +
-          " MB is left before the process limit; not growing "
-          "(existing surface still fusing)";
-      frame_stage_failed = true;
-      preemptive_grow_failed_at_ = config_.num_buckets;
-    } else if (const vr::Status grown = [&] {
-                 // Its own row, because nothing else covers it. recon's
-                 // `allocate` row spans `allocate_from_depth`'s own dispatches
-                 // and voxel_hash_map.hpp says so where it documents that row,
-                 // directing a caller to give a resize between retries a row of
-                 // its own. This is the *other* doubling -- the preemptive one
-                 // -- and it is the more expensive half: a grow toward the
-                 // 32768-bucket ceiling commits ~1.5 GiB with ~2.3 GiB
-                 // transient, hundreds of milliseconds that would otherwise
-                 // appear in no row the read-out prints.
-                 vr::StageScope span(metrics, kResizeStage);
-                 return grid_->resize(grown_to);
-               }()) {
-      config_.num_buckets = grown_to;
-      preemptive_grow_failed_at_ = 0;
-      // Re-read, because the guard below acts on this number and the doubling
-      // just halved it. Sampling once above and testing there is what made the
-      // frame that grew the map also the frame that refused to allocate into
-      // it: one pan took occupancy across both thresholds at once, the resize
-      // took the true figure from 0.88 to 0.44, and the stale 0.88 then
-      // skipped the allocate outright and announced a stopped scan on a table
-      // that had just been given room. Another 4-byte read of the heap counter.
-      if (vr::Result<float> after = grid_->map().load_factor()) {
-        occupancy = after.value();
+  // A switch rather than the two-way `if`/`else` this was, for the reason
+  // Core/CMakeLists.txt gives for building with `-Werror=switch`: the action is
+  // three-valued now and a refusal added upstream must stop the compile. Under
+  // an `else` it would not have -- everything that is not DeclinedForMemory
+  // falls into the arm that performs the resize, so a
+  // `DeclinedForFragmentation` would compile clean and go on to make the ~1.5
+  // GiB allocation it was added to prevent, on the fuse thread, silently.
+  switch (plan.action) {
+    case GrowthAction::None:
+      break;
+    case GrowthAction::DeclinedForMemory:
+      // Reported as state, not as a failure, and neither through
+      // `frame_stage_failed` nor through `frame_error`. GrowthPolicy.hpp
+      // documents this action as "not a fault in the scan" and
+      // FusionStats::errors documents itself as stage failures only, excluding
+      // by name the same class of expected outcome -- a full volume
+      // republishing its notice every frame it keeps fusing. Counted, one
+      // momentary shortfall at a doubling boundary left the Alerts card and the
+      // `errors` banner up for the rest of a healthy scan; and routed through
+      // `last_error` instead, the sentence would have rendered only on the
+      // frames some *other* fault had raised the counter on, attributed to that
+      // fault's count. FusionStats::growth_declined_for_memory carries it with
+      // the lifetime it actually has.
+      //
+      // Nor `preemptive_grow_failed_at_`: nothing was asked of the allocator,
+      // so there is no refused size to pin. See kMemoryDeclineRetryFrames.
+      memory_declined_ = true;
+      memory_declined_at_frame_ = stats_.frames_fused;
+      declined_grow_to_ = plan.grow_to;
+      declined_grow_bytes_ = plan.needed_bytes;
+      break;
+    case GrowthAction::Resize: {
+      const std::int32_t grown_to = plan.grow_to;
+      const vr::Status grown = [&] {
+        // Its own row, because nothing else covers it. recon's `allocate` row
+        // spans `allocate_from_depth`'s own dispatches and voxel_hash_map.hpp
+        // says so where it documents that row, directing a caller to give a
+        // resize between retries a row of its own. This is the *other* doubling
+        // -- the preemptive one -- and it is the more expensive half: a grow
+        // toward the 32768-bucket ceiling commits ~1.5 GiB with ~2.3 GiB
+        // transient, hundreds of milliseconds that would otherwise appear in no
+        // row the read-out prints.
+        vr::StageScope span(metrics, kResizeStage);
+        return grid_->resize(grown_to);
+      }();
+      if (grown) {
+        config_.num_buckets = grown_to;
+        preemptive_grow_failed_at_ = 0;
+        // The table is bigger, so whatever the headroom would not cover is a
+        // question about a different size now.
+        memory_declined_ = false;
+        memory_declined_at_frame_ = 0;
+        declined_grow_to_ = 0;
+        declined_grow_bytes_ = 0;
+        // Re-read, because the guard below acts on this number and the doubling
+        // just halved it. Sampling once above and testing there is what made
+        // the frame that grew the map also the frame that refused to allocate
+        // into it: one pan took occupancy across both thresholds at once, the
+        // resize took the true figure from 0.88 to 0.44, and the stale 0.88
+        // then skipped the allocate outright and announced a stopped scan on a
+        // table that had just been given room. Another 4-byte read of the heap
+        // counter.
+        if (vr::Result<float> after = grid_->map().load_factor()) {
+          occupancy = after.value();
+        }
+      } else {
+        // Not fatal: the table is merely denser than preferred, and the
+        // allocate below still works -- more slowly. Reported rather than
+        // returned so the frame still fuses. This one *is* a stage failure and
+        // this one *is* pinned to its size: the allocator was asked and said
+        // no.
+        frame_error = "preemptive resize: " + grown.message();
+        frame_stage_failed = true;
+        preemptive_grow_failed_at_ = config_.num_buckets;
       }
-    } else {
-      // Not fatal: the table is merely denser than preferred, and the
-      // allocate below still works -- more slowly. Reported rather than
-      // returned so the frame still fuses.
-      frame_error = "preemptive resize: " + grown.message();
-      frame_stage_failed = true;
-      preemptive_grow_failed_at_ = config_.num_buckets;
+      break;
     }
   }
 
@@ -671,7 +744,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       break;
     }
     const std::int32_t grown_to =
-        std::min(config_.num_buckets * 2, config_.max_buckets);
+        grow_target(config_.num_buckets, config_.max_buckets);
     // Accumulates into the same `resize` row as the preemptive doubling above,
     // which is the honest total: both are the same operation at the same cost,
     // and a frame that reaches this loop has usually skipped that one.
@@ -818,6 +891,12 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     stats_.table_blocks =
         static_cast<std::uint32_t>(table_blocks_for(config_.num_buckets));
     stats_.allocation_stop = allocation_stop;
+    // Republished every fused frame rather than latched, which is the point of
+    // it: the read-out asks whether growth is being declined *now*, and the
+    // answer goes back to false the moment the backoff lapses or a grow lands.
+    stats_.growth_declined_for_memory = memory_declined_;
+    stats_.growth_declined_to = declined_grow_to_;
+    stats_.growth_declined_bytes = declined_grow_bytes_;
     // How far behind this frame the published extract breakdown now is.
     // Everything in `stats_.extract` -- the phases, the block count, the arena,
     // `dispatches` -- is written only by a fully-successful remesh, so without
@@ -1619,6 +1698,10 @@ bool Fusion::set_occlusion_threshold(float metres) {
 
 float Fusion::occlusion_threshold() const {
   return occlusion_threshold_.load(std::memory_order_relaxed);
+}
+
+float Fusion::grow_threshold() noexcept {
+  return vr::volume::VoxelHashMap::kGrowThreshold;
 }
 
 void Fusion::note_error(const std::string& message) {

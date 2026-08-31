@@ -18,6 +18,7 @@
 
 #include "GrowthPolicy.hpp"
 
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -61,6 +62,26 @@ TEST(GrowthPolicy, GridBytesMatchTheRecordedMeasurement) {
   EXPECT_EQ(app::grid_bytes_for(16384), 805306368ULL);
   // And the ceiling this app configures, quoted as ~1.5 GiB in FusionConfig.
   EXPECT_EQ(app::grid_bytes_for(32768) / (1024 * 1024), 1536u);
+}
+
+/// Every factor named, and the arithmetic the product of the names.
+///
+/// `grid_bytes_for` carried 512 and 12 as literals in its body while
+/// `Fusion::start` configured the grid from its own copies of both -- in a
+/// different directory and a different library, since this one cannot include
+/// recon. `GridBytesMatchTheRecordedMeasurement` above pins the *output*, so it
+/// stays green through a fourth attribute or a 16^3 block while the headroom
+/// check silently under-reports the commit by a third or by 8x. This pins the
+/// relationship; the static_assert beside the AttributeSpec table in Fusion.mm
+/// pins the half that has to be checked where recon is visible.
+TEST(GrowthPolicy, GridBytesIsTheProductOfItsNamedFactors) {
+  EXPECT_EQ(
+      app::kVoxelsPerBlock,
+      app::kBlockEdgeVoxels * app::kBlockEdgeVoxels * app::kBlockEdgeVoxels);
+  EXPECT_EQ(app::grid_bytes_for(1024),
+            1024ULL * static_cast<std::uint64_t>(app::kBlocksPerBucket) *
+                static_cast<std::uint64_t>(app::kVoxelsPerBlock) *
+                static_cast<std::uint64_t>(app::kAttributeBytesPerVoxel));
 }
 
 TEST(GrowthPolicy, TableBlocksScaleByTheBucketSize) {
@@ -120,6 +141,29 @@ TEST(GrowthPolicy, AnUnreadableOccupancyNeverTriggersAGrow) {
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
 }
 
+/// An omitted threshold means "never grow", not "grow on every fused frame".
+///
+/// The deleted code named recon's constant inside the condition, so there was
+/// nothing to omit; a field can be. Defaulted to 0.0 it was satisfied at 2%
+/// occupancy -- so a second call site, or a partial copy of the assignment
+/// block in `Fusion::fuse`, would put the `task_info` trap back on the
+/// per-frame path and ask the allocator for this app's largest block at capture
+/// rate. That is the runaway `declined_at` exists to stop, arriving through the
+/// door beside it. 1.0 is unsatisfiable: no load factor exceeds it, and the
+/// fabricated reading `Fusion` substitutes when it cannot take one is
+/// exactly 1.0.
+TEST(GrowthPolicy, AnOmittedGrowThresholdNeverGrows) {
+  app::GrowthInputs in;
+  in.occupancy = 0.99f;
+  in.occupancy_known = true;
+  in.num_buckets = 1024;
+  in.max_buckets = 32768;
+  // `grow_threshold` deliberately left at its default.
+
+  EXPECT_FALSE(app::growth_due(in));
+  EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
+}
+
 TEST(GrowthPolicy, StopsAtTheConfiguredCeiling) {
   app::GrowthInputs in = due_to_grow();
   in.num_buckets = 32768;
@@ -151,46 +195,61 @@ TEST(GrowthPolicy, DoesNotReAskAtASizeThatAlreadyFailed) {
 /// "due" where the full plan says None, the syscall comes back per frame; if it
 /// said "not due" where the plan would have grown, the table never grows at
 /// all.
+///
+/// Each case names the action it expects, rather than the two halves being
+/// compared to each other. Compared to each other the test could not fail:
+/// `plan_growth` opens with `if (!growth_due(in)) return plan;` and every path
+/// past it sets a non-None action, so `plan_growth(in).action != None` *is*
+/// `growth_due(in)` for every possible input, and the six rows stayed green
+/// through exactly the divergence the paragraph above describes -- someone
+/// open-coding the conditions in `plan_growth` and dropping one. Both halves
+/// would have moved together.
 TEST(GrowthPolicy, TheCheapHalfAgreesWithTheFullPlan) {
   const app::GrowthInputs base = due_to_grow();
 
   struct Case {
     const char* what;
     app::GrowthInputs in;
+    app::GrowthAction expected;
   };
   std::vector<Case> cases;
-  cases.push_back({"due", base});
+  cases.push_back({"due", base, app::GrowthAction::Resize});
   {
     app::GrowthInputs in = base;
     in.occupancy = 0.5f;
-    cases.push_back({"below threshold", in});
+    cases.push_back({"below threshold", in, app::GrowthAction::None});
   }
   {
     app::GrowthInputs in = base;
     in.occupancy_known = false;
-    cases.push_back({"unreadable occupancy", in});
+    cases.push_back({"unreadable occupancy", in, app::GrowthAction::None});
   }
   {
     app::GrowthInputs in = base;
     in.num_buckets = in.max_buckets;
-    cases.push_back({"at the ceiling", in});
+    cases.push_back({"at the ceiling", in, app::GrowthAction::None});
   }
   {
     app::GrowthInputs in = base;
     in.declined_at = in.num_buckets;
-    cases.push_back({"already refused", in});
+    cases.push_back({"already refused", in, app::GrowthAction::None});
+  }
+  {
+    app::GrowthInputs in = base;
+    in.memory_declined = true;
+    in.frames_since_memory_decline = 1;
+    cases.push_back({"waiting out a decline", in, app::GrowthAction::None});
   }
   {
     app::GrowthInputs in = base;
     in.budget.available_bytes = 0;
-    cases.push_back({"no headroom", in});
+    cases.push_back({"no headroom", in, app::GrowthAction::DeclinedForMemory});
   }
 
   for (const Case& c : cases) {
-    const bool due = app::growth_due(c.in);
-    const bool planned =
-        app::plan_growth(c.in).action != app::GrowthAction::None;
-    EXPECT_EQ(due, planned) << c.what;
+    EXPECT_EQ(app::plan_growth(c.in).action, c.expected) << c.what;
+    EXPECT_EQ(app::growth_due(c.in), c.expected != app::GrowthAction::None)
+        << c.what;
   }
 }
 
@@ -221,6 +280,52 @@ TEST(GrowthPolicy, DeclinesADoublingTheHeadroomCannotCover) {
   // growing" and no figures to judge it by.
   EXPECT_EQ(plan.grow_to, 32768);
   EXPECT_EQ(plan.needed_bytes, app::grid_bytes_for(32768));
+}
+
+/// **A headroom refusal expires. Pinned to a size it caps the scan for good.**
+///
+/// `num_buckets` advances only on a successful resize, so a size-pinned decline
+/// never goes stale on its own. Growth is the only thing that lowers occupancy,
+/// so occupancy climbs; once it passes `kRefuseAllocateAtOccupancy` the
+/// allocate guard short-circuits the overflow count the reactive backstop grows
+/// on, and that route shuts too. One momentary shortfall at a doubling boundary
+/// -- some other app briefly holding the headroom -- then held the table at its
+/// current size for the rest of the scan, reporting a volume full short of a
+/// ceiling it never reached.
+TEST(GrowthPolicy, AHeadroomDeclineExpiresRatherThanCappingTheScan) {
+  app::GrowthInputs in = due_to_grow();
+  in.num_buckets = 16384;  // doubling to 32768 wants 1536 MB
+  in.budget.available_bytes = 512ULL * 1024 * 1024;
+
+  ASSERT_EQ(app::plan_growth(in).action, app::GrowthAction::DeclinedForMemory);
+
+  // The frames just after it do not re-ask, which is what the backoff buys: the
+  // `task_info` trap stays off the per-frame path.
+  in.memory_declined = true;
+  in.frames_since_memory_decline = 1;
+  EXPECT_FALSE(app::growth_due(in));
+  EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
+
+  // ...and then it lapses, at the same size, with nothing about the table
+  // having changed. That is the whole difference from `declined_at`.
+  in.frames_since_memory_decline = app::kMemoryDeclineRetryFrames;
+  EXPECT_TRUE(app::growth_due(in));
+  EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::DeclinedForMemory);
+
+  // Once the pressure lifts, the doubling the scan was capped at goes through.
+  in.budget.available_bytes = 8ULL * 1024 * 1024 * 1024;
+  EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
+}
+
+/// The two refusals are separate inputs because they expire differently, and a
+/// lapsed headroom decline must not lift a pin the allocator put there.
+TEST(GrowthPolicy, ALapsedDeclineDoesNotClearARefusedSize) {
+  app::GrowthInputs in = due_to_grow();
+  in.memory_declined = true;
+  in.frames_since_memory_decline = app::kMemoryDeclineRetryFrames;
+  in.declined_at = in.num_buckets;
+
+  EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
 }
 
 TEST(GrowthPolicy, HeadroomExactlyCoveringTheGrowIsEnough) {
@@ -275,6 +380,23 @@ TEST(AllocationGuard, TheCliffItselfStillAllocates) {
       app::guard_allocation(app::kRefuseAllocateAtOccupancy, true).allocate);
 }
 
+/// A non-finite occupancy is *not* past the cliff.
+///
+/// Written as `occupancy <= kRefuseAllocateAtOccupancy` the guard reads as the
+/// inverse of the `occupancy > k` it replaced, and is -- for ordered values. A
+/// NaN compares false against both, so that form falls through to the refusal:
+/// a frame that used to allocate silently instead stops the scan, latches an
+/// AllocationStop `Fusion` never lowers, and prints "volume full: 0%" from a UB
+/// cast of the NaN. `guard_allocation` is host-testable API now, and its only
+/// documented contract is "past kRefuseAllocateAtOccupancy".
+TEST(AllocationGuard, ANonFiniteOccupancyIsNotPastTheCliff) {
+  const app::AllocationGuard g =
+      app::guard_allocation(std::numeric_limits<float>::quiet_NaN(), true);
+
+  EXPECT_TRUE(g.allocate);
+  EXPECT_EQ(g.stop, app::AllocationStop::None);
+}
+
 /// **The distinction the read-out's advice depends on.** A fabricated occupancy
 /// trips this guard exactly as a genuinely full table does, and only this scope
 /// knows which happened -- so the two causes are separated here rather than at
@@ -302,6 +424,34 @@ TEST(AllocationGuard, LeavesRoomForADoublingToLandIn) {
 
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
   EXPECT_TRUE(app::guard_allocation(in.occupancy, true).allocate);
+}
+
+/// The tiers the occupancy figure is *reported* against are the two numbers
+/// that decide, not a second pair beside them.
+///
+/// They were a `{0.7, 0.85}` literal in StatTone.hpp -- restating recon's grow
+/// threshold, which GrowthPolicy.hpp forbids categorically, and the allocate
+/// guard, which it invites re-measuring on the next device pass. They were not
+/// even the same quantity: `(double)0.85f` is 0.85000002384 against a literal
+/// 0.84999999999. Move `kRefuseAllocateAtOccupancy` to 0.92 and the meter, its
+/// tick and the `occupied` row would all have gone on reddening at 0.85 while
+/// the table allocated normally for another seven points.
+TEST(AllocationGuard, TheReportedTiersAreTheNumbersThatDecide) {
+  const app::ToneThresholds t = app::occupancy_thresholds(kReconGrowThreshold);
+
+  EXPECT_EQ(t.warn, static_cast<double>(kReconGrowThreshold));
+  EXPECT_EQ(t.critical, static_cast<double>(app::kRefuseAllocateAtOccupancy));
+
+  // Warn arrives where recon starts growing; red arrives *at* the cliff rather
+  // than after it -- the guard is strict and the tone inclusive, so the table
+  // sitting exactly on it still allocates and already reads Critical. That is
+  // the direction an alarm should err, and it is now one number, not two.
+  EXPECT_EQ(app::tone_for(static_cast<double>(kReconGrowThreshold), t),
+            app::StatTone::Warn);
+  const double at_cliff = static_cast<double>(app::kRefuseAllocateAtOccupancy);
+  EXPECT_EQ(app::tone_for(at_cliff, t), app::StatTone::Critical);
+  EXPECT_TRUE(
+      app::guard_allocation(app::kRefuseAllocateAtOccupancy, true).allocate);
 }
 
 TEST(AllocationGuard, IsConstexpr) {

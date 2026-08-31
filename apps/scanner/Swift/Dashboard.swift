@@ -242,15 +242,19 @@ struct DashboardView: View {
 
   /// The tiers every gauge below draws against, from the bridge.
   ///
-  /// Read from `VolumetricRenderer` rather than written out here, because a
-  /// gauge is not a second view of a row -- `drawnAsGauge` suppresses the row
-  /// wherever a bar exists, so on those figures these numbers are the only
-  /// thing deciding what colour a reader sees, and the bridge has already toned
-  /// the matching row with them. Four literal pairs used to sit in this file,
-  /// mirroring four in `Readout.mm`; the arena pair had already drifted once.
+  /// Read from `VolumetricRenderer` rather than written out here, because a bar
+  /// and the row beneath it are drawn from one measurement and are on screen
+  /// together: `drawnAsGauge` is set on the Memory rows only, so the `arena`
+  /// row renders under the `arena` bar and the `occupied` row under the
+  /// headline meter, each toned by the bridge with these same numbers. A second
+  /// copy here is a contradiction a reader can see in one glance. Four literal
+  /// pairs used to sit in this file, mirroring four in `Readout.mm`; the arena
+  /// pair had already drifted once.
   ///
-  /// Static because they are compile-time constants on the far side too: this
-  /// is a value read once, not a per-tick bridge call.
+  /// Static because none of them moves during a run: the far side folds each
+  /// from constants -- the occupancy pair through `Fusion::grow_threshold()`,
+  /// which hands back recon's -- so this is a value read once rather than a
+  /// per-tick bridge call.
   private static let thresholds = VolumetricRenderer.gaugeThresholds
 
   var body: some View {
@@ -915,11 +919,32 @@ private struct Meter: View {
   /// steady state and this is the only part of the gauge that saw the event.
   var mark: Double? = nil
 
-  /// The fill colour for a fraction, on the same two tiers the rows use.
-  static func tint(_ fraction: Double, warn: Double, critical: Double) -> Color {
-    if fraction >= critical { return .red }
-    if fraction >= warn { return .orange }
-    return .accentColor
+  /// Which tier a fraction falls in, decided by the bridge.
+  ///
+  /// `app::tone_for`, the same call that tones the row beneath this bar --
+  /// rather than a second `>= critical` / `>= warn` ladder written out here.
+  /// The thresholds already cross the seam; the rule reading them did not, so
+  /// making a boundary exclusive or adding a tier moved the row and left the
+  /// bar, which is the disagreement the shared thresholds exist to prevent.
+  static func tone(_ fraction: Double, warn: Double, critical: Double)
+    -> VolumetricStatTone
+  {
+    VolumetricRenderer.tone(
+      forFraction: fraction,
+      thresholds: VolumetricToneThresholds(warn: warn, critical: critical))
+  }
+
+  /// The fill colour for a tier.
+  ///
+  /// Deliberately not the panel's row colours: a bar below its warn tier is the
+  /// accent, where a row at the same tier is plain text. The tier is shared, the
+  /// palette is not.
+  static func tint(for tone: VolumetricStatTone) -> Color {
+    switch tone {
+    case .critical: return .red
+    case .warn: return .orange
+    default: return .accentColor
+    }
   }
 
   var body: some View {
@@ -935,7 +960,10 @@ private struct Meter: View {
         Capsule().fill(.quaternary)
         if known {
           Capsule()
-            .fill(Self.tint(fraction, warn: warn, critical: critical))
+            .fill(
+              Self.tint(
+                for: Self.tone(fraction, warn: warn, critical: critical))
+            )
             .frame(width: geo.size.width * min(max(fraction, 0), 1))
           // Behind the threshold tick and in a quieter colour: it is context
           // for the fill, while the threshold is the line that means act.
@@ -1005,8 +1033,11 @@ private struct Gauge: View {
   }
 
   private var captionTint: Color {
-    fraction >= warn
-      ? Meter.tint(fraction, warn: warn, critical: critical) : .secondary
+    // The same tier the bar is filled with, rather than a third comparison
+    // against `warn`: a caption that went colourless on a boundary the fill had
+    // already crossed is the same drift one row down.
+    let tone = Meter.tone(fraction, warn: warn, critical: critical)
+    return tone == .neutral ? .secondary : Meter.tint(for: tone)
   }
 }
 

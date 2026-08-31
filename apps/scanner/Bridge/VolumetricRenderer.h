@@ -271,11 +271,14 @@ typedef struct {
 
 /// @brief The thresholds the panel's gauges draw against.
 ///
-/// Published rather than left for the panel to restate, because a gauge is not
-/// a second view of a row: @ref VolumetricStatRow.drawnAsGauge suppresses the
-/// row wherever a bar exists, so on those figures these numbers are the *only*
-/// thing deciding what colour a reader sees -- and the bridge has already toned
-/// the corresponding row with them.
+/// Published rather than left for the panel to restate, because a bar and a row
+/// drawn from one measurement are on screen *together*. @ref
+/// VolumetricStatRow.drawnAsGauge is set on the Memory rows only, so the
+/// `arena` row renders directly beneath the `arena` bar and the `occupied` row
+/// beneath the headline meter -- and the bridge has already toned each of those
+/// rows with these numbers. Two renderings of one figure, side by side, is the
+/// condition under which a second copy of a threshold is visible as a
+/// contradiction rather than merely wrong.
 ///
 /// The two sides drifting is not hypothetical. The arena gauge was once built
 /// with a single 0.9 tier while its row kept 0.9/0.98, so at 0.99 the row
@@ -752,6 +755,22 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// that actually stops the panel restating them. See @ref
 /// VolumetricGaugeThresholds for what restating them already cost once.
 @property(class, nonatomic, readonly) VolumetricGaugeThresholds gaugeThresholds;
+
+/// @brief The tone @p fraction reads as against @p thresholds.
+///
+/// The app's one implementation of that rule. Bridging the *numbers* left the
+/// panel re-deriving the decision from them in Swift -- a second `>= critical`
+/// / `>= warn` ladder over the same two tiers -- so a boundary changed from
+/// inclusive to exclusive, or a third tier added, would move the row and leave
+/// the bar above it where it was. That is the same disagreement the shared
+/// thresholds were introduced to end, one level up.
+///
+/// Not a substitute for @ref VolumetricStatRow.tone, which is this applied to a
+/// figure the bridge already holds. This is for the panel's bars, whose
+/// fractions are assembled on the Swift side.
++ (VolumetricStatTone)toneForFraction:(double)fraction
+                           thresholds:(VolumetricToneThresholds)thresholds
+    NS_SWIFT_NAME(tone(forFraction:thresholds:));
 
 /// @brief Block-table capacity as of the last successful remesh — the partner
 ///        of @ref VolumetricDashboardSnapshot.activeBlocks, and of nothing
