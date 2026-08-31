@@ -8,7 +8,7 @@
 ///
 /// Pure, so the thresholds every meter in the app shares can be tested on the
 /// host. The Objective-C `VolumetricStatTone` mirrors @ref StatTone value for
-/// value and `VolumetricRenderer.mm` static_asserts the two agree.
+/// value and `Readout.mm` static_asserts the two agree.
 
 namespace volumetric_kit::ios_app {
 

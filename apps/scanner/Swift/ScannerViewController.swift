@@ -566,6 +566,23 @@ final class ScannerViewController: UIViewController {
     // and its doc says so.
     let tracking = arSession.tracking
     let s = arSession.capture.stats
+    // Read ONCE, here, and used for both the panel and the transcript -- the
+    // same rule the two lines above follow, applied to the read-out.
+    //
+    // `dashboardSnapshot` exists for this. Building the panel from
+    // `statSections` + `stageRows` + `frameHistory` + the memory properties took
+    // five FusionStats copies and three task_info traps per tick, which the fuse
+    // thread writes between: the headline meter could read 84% beside a Volume
+    // card reading 86% with allocation stopped, and the pipeline bars could
+    // belong to a frame the sections did not describe.
+    //
+    // `fusionSummary` was the last read still outside it, taken twenty lines
+    // below this one -- its own FusionStats copy, its own task_info trap, and
+    // the whole read-out built a second time on the main thread inside the
+    // display-link callback. `.summary` is that text rendered from the rows
+    // this snapshot carries, so the transcript and the panel beside it describe
+    // one frame rather than two.
+    let snapshot = renderer.dashboardSnapshot
 
     // Built as lines, once, then joined for stdout -- rather than appended to a
     // string the panel cannot read. The `Capture` card rendered an array
@@ -648,7 +665,7 @@ final class ScannerViewController: UIViewController {
         "convert   \(convert)",
       ]
       text += """
-        \(renderer.fusionSummary)
+        \(snapshot.summary)
 
         ARKit capture
           frames    \(counts)
@@ -660,15 +677,6 @@ final class ScannerViewController: UIViewController {
           convert   \(convert)
         """
     }
-    // Publish what the dashboard draws, from ONE read of each source.
-    //
-    // `dashboardSnapshot` exists for this. Building the panel from
-    // `statSections` + `stageRows` + `frameHistory` + the memory properties took
-    // five FusionStats copies and three task_info traps per tick, which the fuse
-    // thread writes between: the headline meter could read 84% beside a Volume
-    // card reading 86% with allocation stopped, and the pipeline bars could
-    // belong to a frame the sections did not describe.
-    let snapshot = renderer.dashboardSnapshot
 
     // From this object's own state, not from ARKit's error fields. Those say
     // whether the session is healthy; this row claims the capture + fuse + draw
@@ -736,16 +744,17 @@ final class ScannerViewController: UIViewController {
     dashboard.occupancy = snapshot.occupancy
     dashboard.occupancyKnown = snapshot.occupancyKnown
     dashboard.allocationStopReason = snapshot.allocationStopReason
-    // The grouping is the bridge's, not this file's. That keeps the panel from
-    // inventing a grouping of its own; it is **not** a guarantee against drift,
-    // which is what this note used to claim. The log line formats its own text
-    // from the same stats (see the TODO on `-statSections`), and the two had in
-    // fact drifted -- see the note at the top of Dashboard.swift.
+    // The grouping is the bridge's, not this file's, and so is the text above:
+    // both come off one snapshot, so the panel and the transcript cannot
+    // disagree about a figure or about which frame it belongs to. See the note
+    // at the top of Dashboard.swift for what they used to disagree about.
     dashboard.groups = snapshot.sections.map { s in
       StatGroup(
         id: s.title,
         items: s.rows.map {
-          StatItem(label: $0.label, value: $0.value, tone: $0.tone)
+          StatItem(
+            label: $0.label, value: $0.value, tone: $0.tone,
+            drawnAsGauge: $0.drawnAsGauge)
         })
     }
     // True prose rather than figures, so these stay as lines -- but as three

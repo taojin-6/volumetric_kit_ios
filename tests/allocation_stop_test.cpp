@@ -28,7 +28,7 @@ TEST(AllocationStop, NoneRendersAsNothing) {
       app::allocation_stop_text(AllocationStop::None);
   EXPECT_STREQ(text.headline, "");
   EXPECT_STREQ(text.advice, "");
-  EXPECT_EQ(app::allocation_stop_note(AllocationStop::None), "");
+  EXPECT_EQ(app::allocation_stop_row(AllocationStop::None), "");
 }
 
 TEST(AllocationStop, EveryCauseHasItsOwnWords) {
@@ -51,45 +51,62 @@ TEST(AllocationStop, TagsAreDistinct) {
                app::allocation_stop_tag(AllocationStop::BlocksDropped));
 }
 
-/// The regression this table was written for: the `table` row appended a
+/// The regression this table was written for: the read-out's row appended a
 /// hard-coded "(volume full)" to a flag that meant only "not allocating this
 /// frame", so a failed `load_factor` -- which fabricates a full table to fail
 /// safe -- reported a full volume beneath the banner naming the real fault.
 TEST(AllocationStop, OnlyAFullVolumeSaysFullVolume) {
   EXPECT_NE(
-      app::allocation_stop_note(AllocationStop::VolumeFull).find("volume full"),
+      app::allocation_stop_row(AllocationStop::VolumeFull).find("volume full"),
       std::string::npos);
-  EXPECT_EQ(app::allocation_stop_note(AllocationStop::OccupancyUnknown)
+  EXPECT_EQ(app::allocation_stop_row(AllocationStop::OccupancyUnknown)
                 .find("volume full"),
             std::string::npos);
-  EXPECT_EQ(app::allocation_stop_note(AllocationStop::BlocksDropped)
+  EXPECT_EQ(app::allocation_stop_row(AllocationStop::BlocksDropped)
                 .find("volume full"),
             std::string::npos);
 }
 
-/// The note and the panel headline are one phrase, composed rather than written
-/// twice: rewording a cause in one place must not leave a collected log and a
-/// screenshot of the panel naming it differently.
-TEST(AllocationStop, NoteCarriesTheHeadlineVerbatim) {
+/// The row and the banner's headline are one phrase, composed rather than
+/// written twice: rewording a cause in one place must not leave a collected log
+/// and a screenshot of the panel naming it differently. This is the assertion
+/// that makes the composer worth having -- the panel's `state` row and the
+/// banner beside it are the two renderings that would drift.
+TEST(AllocationStop, RowCarriesTheHeadlineVerbatim) {
   for (const AllocationStop stop : kCauses) {
-    const std::string note = app::allocation_stop_note(stop);
-    EXPECT_NE(note.find(app::allocation_stop_text(stop).headline),
+    const std::string row = app::allocation_stop_row(stop);
+    EXPECT_NE(row.find(app::allocation_stop_text(stop).headline),
               std::string::npos)
-        << note;
+        << row;
+  }
+}
+
+/// Every cause says the scan has stopped taking geometry, in the same words.
+/// The row leads with the claim rather than the cause because that is what a
+/// reader glancing at the card is deciding on; a cause without it reads as a
+/// note about the volume rather than as a stopped scan.
+TEST(AllocationStop, EveryCauseLeadsWithTheClaim) {
+  for (const AllocationStop stop : kCauses) {
+    EXPECT_EQ(app::allocation_stop_row(stop).rfind("ALLOCATION STOPPED", 0), 0u)
+        << app::allocation_stop_row(stop);
   }
 }
 
 /// Only the two causes whose fault is upstream point at the errors row; a full
 /// volume is the documented trade working and posts no error to look at.
+///
+/// The same words `AllocationStopText::advice` uses for it, because a row that
+/// sends a reader to a differently-named place than the banner does is the
+/// drift this composer exists to stop.
 TEST(AllocationStop, OnlyUpstreamFaultsPointAtTheErrorsRow) {
   EXPECT_EQ(
-      app::allocation_stop_note(AllocationStop::VolumeFull).find("see error"),
+      app::allocation_stop_row(AllocationStop::VolumeFull).find("errors row"),
       std::string::npos);
-  EXPECT_NE(app::allocation_stop_note(AllocationStop::OccupancyUnknown)
-                .find("see error"),
+  EXPECT_NE(app::allocation_stop_row(AllocationStop::OccupancyUnknown)
+                .find("errors row"),
             std::string::npos);
-  EXPECT_NE(app::allocation_stop_note(AllocationStop::BlocksDropped)
-                .find("see error"),
+  EXPECT_NE(app::allocation_stop_row(AllocationStop::BlocksDropped)
+                .find("errors row"),
             std::string::npos);
 }
 

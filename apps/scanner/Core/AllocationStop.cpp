@@ -37,18 +37,17 @@ AllocationStopText allocation_stop_text(AllocationStop stop) noexcept {
   return {"", "", false};
 }
 
-std::string allocation_stop_note(AllocationStop stop) {
+std::string allocation_stop_row(AllocationStop stop) {
   if (stop == AllocationStop::None) {
     return {};
   }
   const AllocationStopText text = allocation_stop_text(stop);
-  std::string note = "  -- NOT TAKING NEW GEOMETRY (";
-  note += text.headline;
+  std::string row = "ALLOCATION STOPPED — ";
+  row += text.headline;
   if (text.on_errors_row) {
-    note += ", see error";
+    row += "  (see the errors row)";
   }
-  note += ")";
-  return note;
+  return row;
 }
 
 const char* allocation_stop_tag(AllocationStop stop) noexcept {

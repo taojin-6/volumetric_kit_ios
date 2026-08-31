@@ -36,11 +36,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-// `fusionSummary` and the read-out's cell builders use std::snprintf. Named
-// here rather than left to a transitive include: it compiled only because some
-// gfx or recon header happens to pull <cstdio> in today.
-#include <cstdarg>
-#include <cstdio>
+// <cstdio> and <cstdarg> were here for `fusionSummary` and the read-out's cell
+// builders, which now live in Readout.mm and name them there. Nothing in this
+// file formats any more.
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -206,11 +204,20 @@ namespace {
 /// The counters live here rather than in `FusionStats` because the upload is
 /// the render thread's stage and the memory warning arrives on the UI thread --
 /// neither is in the fusion's snapshot, which is exactly why the panel was once
-/// missing both. @p s and @p budget are borrowed, so the caller keeps them
-/// alive for the statement that uses the result.
+/// missing both.
+///
+/// @p s and @p budget are **borrowed into the returned struct**, which outlives
+/// this call -- so both have to be named locals in the caller. `lifetimebound`
+/// is what enforces that: without it the obvious one-liner form,
+/// `readout_inputs(*_impl, _impl->fusion.stats(), app::query_memory_budget())`,
+/// compiles clean under `-Wall -Wextra` and reads the whole panel out of two
+/// destroyed temporaries, because lifetime extension does not reach through a
+/// constructor parameter into a reference member.
 app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
-                                  const app::FusionStats& s,
-                                  const app::MemoryBudget& budget) {
+                                  const app::FusionStats& s
+                                  [[clang::lifetimebound]],
+                                  const app::MemoryBudget& budget
+                                  [[clang::lifetimebound]]) {
   app::ReadoutInputs in{s, budget};
   in.gpu_working_set_bytes = gpu_working_set_bytes();
   in.mesh_upload_failures = impl.mesh_upload_failures;
@@ -1272,6 +1279,10 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (NSString*)fusionSummary {
+  // Its own read, which is why a caller wanting both this and the panel on one
+  // tick should take `dashboardSnapshot` and read `.summary` off it instead --
+  // that is this same text, rendered from the rows that snapshot carries. Kept
+  // for callers that want only the transcript.
   const app::FusionStats s = _impl->fusion.stats();
   const app::MemoryBudget budget = app::query_memory_budget();
   return app::fusion_summary(readout_inputs(*_impl, s, budget));

@@ -29,12 +29,19 @@
 /// The grouping and the figures come from the bridge (`statSections`); the
 /// *order* they are read in and the gauges drawn over them come from this file.
 /// That split is deliberate: the bridge knows which numbers are coherent with
-/// each other, and only a view knows what fits on a screen. It is not a
-/// guarantee against drift, and was never quite the one the previous note here
-/// claimed -- the log line formats its own text (see the TODO on
-/// `-statSections`), and the two had in fact drifted: the panel divided live
-/// occupancy by a remesh-cadence capacity while the transcript, three hundred
-/// lines away in the same file, divided it by the right one.
+/// each other, and only a view knows what fits on a screen. It *is* now a
+/// guarantee against drift, which the previous note here was right to say it
+/// was not: the log used to format its own text from the same stats and the two
+/// had in fact drifted -- the panel divided live occupancy by a remesh-cadence
+/// capacity while the transcript, three hundred lines away in the same file,
+/// divided it by the right one. The transcript is rendered from these sections
+/// now (`VolumetricDashboardSnapshot.summary`), so there is one place a figure
+/// is decided and one place it is worded.
+///
+/// Which leaves one asymmetry worth knowing about: the log has no bars, so the
+/// bridge publishes every figure and marks the ones a gauge here draws. This
+/// file skips those rows; the transcript prints them. See
+/// `StatItem.drawnAsGauge`.
 
 import Charts
 import SwiftUI
@@ -85,6 +92,11 @@ struct StatItem: Identifiable {
   let label: String
   let value: String
   let tone: VolumetricStatTone
+  /// Whether a gauge on this card already draws this figure, in which case the
+  /// panel does not also list it as a row. Carried from the bridge rather than
+  /// decided here: the bridge publishes every figure it has, because the log
+  /// renders the same model and has no gauges. See `VolumetricStatRow`.
+  let drawnAsGauge: Bool
 }
 
 /// A named group, mirrored out of `VolumetricStatSection`.
@@ -565,7 +577,10 @@ struct DashboardView: View {
   /// mid-way through. Unknown titles sort last rather than being dropped -- a
   /// section this file has not been taught about is still a section the bridge
   /// meant to publish.
-  private static let sectionOrder = ["Alerts", "Scene", "Block table", "Dirty", "Memory"]
+  private static let sectionOrder = [
+    "Alerts", "Scene", "Fuse timing", "Extract phases", "Block table", "Dirty",
+    "Memory",
+  ]
 
   private var orderedGroups: [StatGroup] {
     model.groups.sorted { a, b in
@@ -651,9 +666,16 @@ struct DashboardView: View {
     max(model.stages.map { max($0.hostMs, $0.deviceMs) }.max() ?? 1, 0.001)
   }
 
+  /// The rows a card lists, which is every figure the bridge published for it
+  /// except the ones a gauge above already draws.
+  ///
+  /// Filtered here rather than withheld by the bridge, because the bridge's
+  /// model feeds the log too and the log has no bars: gating the figures on
+  /// "a gauge will carry this" left the transcript's Memory block at one
+  /// `device RAM` row through the whole healthy state.
   private func rows(_ items: [StatItem]) -> some View {
     VStack(alignment: .leading, spacing: 3) {
-      ForEach(items) { item in
+      ForEach(items.filter { !$0.drawnAsGauge }) { item in
         HStack(alignment: .firstTextBaseline) {
           Text(item.label.trimmingCharacters(in: .whitespaces))
             .foregroundStyle(.secondary)
