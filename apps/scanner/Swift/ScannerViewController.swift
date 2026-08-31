@@ -488,6 +488,53 @@ final class ScannerViewController: UIViewController {
     return "\(machine)  \(cores) cores"
   }
 
+  /// The console transcript, rendered from the same lines the panel draws.
+  ///
+  /// The second of the two renderings `updateStatus` produces, and deliberately
+  /// the only place that knows how the transcript is *shaped* -- the blank
+  /// lines, the heading, the indent. Its inputs are already-formatted lines, so
+  /// there is no figure it can format differently from the panel; that was the
+  /// whole failure it replaces.
+  ///
+  /// Static and free of `self` so it cannot reach past its arguments and read a
+  /// counter the panel was not given.
+  ///
+  /// @param summary  The fusion read-out, or nil to omit it entirely.
+  private static func transcript(
+    device: String, render: [String], fps: Double,
+    session: [String], summary: String?, counters: [String]
+  ) -> String {
+    // Paragraphs, joined once. Appending "\n\n" at each site is what let the
+    // unsupported-ARKit line lose its break while its two neighbours kept
+    // theirs: a separator applied by the join cannot be forgotten at one site.
+    //
+    // This changes the output by exactly one blank line, after `fps`. The
+    // header block used to end in the single newline its string literal
+    // happened to carry, so it was the one paragraph in the transcript not
+    // followed by a break -- the same per-site inconsistency, in the place it
+    // was least visible. Uniform now, and that is the whole delta: every other
+    // byte of all three arrangements is unchanged.
+    var blocks = [
+      """
+      \(device)
+      \(render.joined(separator: "\n"))
+      \(String(format: "%.0f", fps)) fps
+      """
+    ]
+    blocks += session
+    if let summary {
+      blocks.append(summary)
+    }
+    if !counters.isEmpty {
+      // Indented under a heading, which is the one arrangement the panel does
+      // not share: it has a card title and a table, and needs neither.
+      blocks.append(
+        "ARKit capture\n"
+          + counters.map { "  " + $0 }.joined(separator: "\n"))
+    }
+    return blocks.joined(separator: "\n\n")
+  }
+
   private func startDisplayLink() {
     guard displayLink == nil else { return }
     // Through the proxy, never `target: self` -- see DisplayLinkProxy.
@@ -596,25 +643,34 @@ final class ScannerViewController: UIViewController {
       "presented \(renderer.framesPresented)",
       "camera    \(camera)",
     ]
-    var captureLines: [String] = []
-
-    var text = """
-      \(deviceSummary)
-      \(renderLines.joined(separator: "\n"))
-      \(String(format: "%.0f", fps)) fps
-
-      """
+    // The capture read-out, as two groups of lines built ONCE.
+    //
+    // Every figure below used to be written out twice -- appended to `text` for
+    // stdout and appended again to `captureLines` for the panel -- which is the
+    // defect Readout.hpp was created to remove on the bridge's side of the
+    // seam, arrived at independently one layer up. The two copies had already
+    // begun to differ: the unsupported-ARKit line reached the transcript
+    // without the paragraph break its two neighbours got.
+    //
+    // So: one model, two renderings, and the renderings differ only in how they
+    // *arrange* these lines. The panel draws both groups as one `Capture` card;
+    // the transcript keeps the session lines above the fusion read-out and
+    // indents the counters beneath a heading, because on a wall of text the
+    // session's health is the thing worth reading first.
+    //
+    // Two groups rather than one, because that arrangement is the whole reason
+    // the transcript could not simply join a single array.
+    var sessionLines: [String] = []
+    var counterLines: [String] = []
 
     if let reason = arSession.unsupportedReason {
-      captureLines.append("ARKit: \(reason)")
-      text += "ARKit: \(reason)"
+      sessionLines.append("ARKit: \(reason)")
     } else {
       if let failure = arSession.sessionError {
         // Alongside the counters, not instead of them: a session can fail and
         // recover, and replacing the read-out meant a single transient
         // interruption hid capture for the rest of the run.
-        captureLines.append("ARKit session failed: \(failure)")
-        text += "ARKit session failed: \(failure)\n\n"
+        sessionLines.append("ARKit session failed: \(failure)")
       }
       // Ahead of the counters, because it is the answer to "why is the frame
       // count rising and nothing appearing": frames arriving while ARKit does
@@ -622,8 +678,7 @@ final class ScannerViewController: UIViewController {
       let withheld =
         tracking.framesWithheld > 0
         ? "  (\(tracking.framesWithheld) withheld)" : ""
-      captureLines.append("tracking  \(tracking.description)\(withheld)")
-      text += "tracking  \(tracking.description)\(withheld)\n\n"
+      sessionLines.append("tracking  \(tracking.description)\(withheld)")
 
       // Formatted up front rather than inside the literal: a `\`-continuation
       // inside a \(...) interpolation is not something the Swift parser accepts.
@@ -655,7 +710,7 @@ final class ScannerViewController: UIViewController {
       let counts =
         "\(s.frames_submitted) in / \(s.frames_polled) polled"
         + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
-      captureLines += [
+      counterLines = [
         "frames    \(counts)",
         "depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)",
         "colour    \(s.color_width) x \(s.color_height)",
@@ -664,19 +719,18 @@ final class ScannerViewController: UIViewController {
         "position  \(position) m",
         "convert   \(convert)",
       ]
-      text += """
-        \(snapshot.summary)
-
-        ARKit capture
-          frames    \(counts)
-          depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)
-          colour    \(s.color_width) x \(s.color_height)
-          encoding  \(encoding)
-          intrinsic \(intrinsics)
-          position  \(position) m
-          convert   \(convert)
-        """
     }
+
+    let captureLines = sessionLines + counterLines
+    // Withheld where there is no capture to describe. A device with no LiDAR
+    // produces an all-zero read-out, and printing it under the line explaining
+    // that the hardware cannot scan reads as a scan that is failing rather than
+    // one that was never possible.
+    let text = Self.transcript(
+      device: deviceSummary, render: renderLines, fps: fps,
+      session: sessionLines,
+      summary: counterLines.isEmpty ? nil : snapshot.summary,
+      counters: counterLines)
 
     // From this object's own state, not from ARKit's error fields. Those say
     // whether the session is healthy; this row claims the capture + fuse + draw
