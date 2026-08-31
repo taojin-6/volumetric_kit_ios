@@ -16,7 +16,16 @@
 # a VkDevice or an ARFrame, it stays in Bridge/ and this side gets the part that
 # reasons about what it returned. Bridge/MemoryQuery.cpp is that split done
 # once: the syscall there, the meaning here.
-add_library(vi_core STATIC MemoryBudget.cpp OrbitCamera.cpp ViewOrientation.cpp)
+add_library(vi_core STATIC AllocationStop.cpp MemoryBudget.cpp OrbitCamera.cpp
+                           ViewOrientation.cpp)
+
+# The same warning set the sibling libraries build under, and here for a reason
+# beyond consistency: AllocationStop.cpp turns an enum into what four different
+# media say about it, and every one of those is an exhaustive switch whose
+# guarantee -- "a cause added stops the compile" -- is a bare warning without
+# `-Werror=switch`. Left as a warning, a new cause links cleanly and reports
+# itself as a healthy scan on every rendering at once.
+target_compile_options(vi_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
 target_include_directories(vi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 

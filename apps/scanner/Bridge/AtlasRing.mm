@@ -11,7 +11,12 @@ namespace volumetric_kit::ios_app {
 void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
                          std::uint32_t width, std::uint32_t height,
                          bool first_write) {
-  VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  // Zero-initialised and then stamped, like every other Vulkan struct here.
+  // Naming sType in the braces leaves the remaining fields to aggregate
+  // initialisation, which -Wextra reports as a missing initialiser -- and this
+  // target builds with -Wall -Wextra since the review of #29.
+  VkImageMemoryBarrier to_dst{};
+  to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   to_dst.srcAccessMask = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
   to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   to_dst.oldLayout = first_write ? VK_IMAGE_LAYOUT_UNDEFINED

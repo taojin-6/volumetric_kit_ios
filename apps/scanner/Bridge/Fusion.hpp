@@ -30,6 +30,13 @@
 #include <utility>
 #include <vector>
 
+// @ref AllocationStop, which this file sets and Core/AllocationStop.hpp turns
+// into what the log, the trace and the panel each say about it. The enum lives
+// there rather than here because those renderings are decisions made without
+// the device, and this header cannot be reached from a host build: it pulls in
+// all of recon.
+#include "AllocationStop.hpp"
+
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/stage_metrics.hpp"
@@ -406,29 +413,6 @@ struct FusionConfig {
   /// undefined, not an error.
   std::uint32_t queue_families[2] = {0, 0};
   std::uint32_t queue_family_count = 0;
-};
-
-/// @brief Why a fused frame took no new geometry in, when it took none.
-///
-/// A cause rather than a bool so the read-out can name one without knowing this
-/// file's thresholds. See @ref FusionStats::allocation_stop.
-enum class AllocationStop : std::uint8_t {
-  /// The frame allocated normally.
-  None = 0,
-  /// Occupancy is past the refuse-to-allocate guard: the documented trade
-  /// working, and the one cause a user can act on (coarser voxels, or a higher
-  /// `FusionConfig::max_buckets` if the map is not already at it).
-  VolumeFull,
-  /// `load_factor` could not be read, so the guard refused on a fabricated
-  /// occupancy. Not a full volume; the fault is upstream and is in @ref
-  /// FusionStats::last_error. Kept distinct because the actionable advice for a
-  /// full volume is actively wrong here.
-  OccupancyUnknown,
-  /// The allocate reported a capacity limit and the blocks were dropped -- at
-  /// the bucket ceiling, or with the frame's grow budget spent. Reaches this
-  /// through `AllocFailures::capacity_limited`, which includes bucket-local
-  /// chain exhaustion, so it can fire with occupancy far below the guard.
-  BlocksDropped,
 };
 
 /// @brief What the last remesh's projective-texturing pass actually did.
@@ -1023,7 +1007,25 @@ struct FusionTraceStats {
   ///
   /// Both are PODs, so they cost this struct nothing it was designed to avoid.
   float occupancy = 0.0f;
+  /// Whether @ref occupancy is a reading rather than a fallback, carried for
+  /// the same reason @ref FusionStats::occupancy_known is: a failed
+  /// `load_factor` publishes a fabricated 1.0 so the allocate guard fails
+  /// safe, and a dump that printed it as `occ=100.0%` invented a measurement
+  /// in the one artifact a device loss leaves behind.
+  bool occupancy_known = true;
   AllocationStop allocation_stop = AllocationStop::None;
+  /// Milliseconds since @ref Fusion::fuse last published, computed at read
+  /// time like @ref FusionStats::ms_since_fuse and `0.0f` when no frame has
+  /// fused at all.
+  ///
+  /// The qualifier @ref allocation_stop needs. It is a latch `Fusion` never
+  /// clears, so an ARKit interruption -- which stops fuse frames without
+  /// stopping the display link -- leaves a stale cause stamped onto render
+  /// frames that allocated nothing. The live renderings drop the claim
+  /// entirely (see @ref reportable_allocation_stop); the trace keeps both
+  /// numbers, because what the cause *was* is exactly what a forensic dump is
+  /// opened to find.
+  float ms_since_fuse = 0.0f;
 };
 
 /// @brief Fuses captured frames into a volume and extracts a drawable mesh.

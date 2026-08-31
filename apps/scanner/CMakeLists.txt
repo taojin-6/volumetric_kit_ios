@@ -27,7 +27,8 @@ add_library(
   Bridge/AllocationStopDisplay.mm
   Bridge/ARKitCapture.mm
   Bridge/AtlasRing.mm
-  Bridge/FrameTrace.mm
+  Bridge/BridgeStrings.mm
+  Bridge/FrameTrace.cpp
   Bridge/Fusion.mm
   Bridge/MemoryQuery.cpp
   Bridge/RendererErrors.mm
@@ -43,14 +44,41 @@ add_library(
 # CAMetalDrawable that file touches simply leaks -- in the app whose documented
 # worst failure is a jetsam SIGKILL with nothing in the log.
 #
-# COMPILE_LANGUAGE:OBJCXX is the discriminator the exclusion was really about:
-# .cpp sources compile as CXX and never see the flag, so MemoryQuery.cpp stays
-# out of it by construction rather than by being remembered -- as does every
-# source in vi_core. (It is not excluded for reaching the OS through C headers
-# -- an ARC translation unit may include <mach/mach.h> and <sys/sysctl.h> and
-# call into them perfectly well. It is the file extension that decides.)
+# Both lines, because the two generators take different routes and the failure
+# mode is the same silence the source list had.
+#
+# CMake's Xcode generator DROPS a COMPILE_LANGUAGE genex in
+# target_compile_options -- it has no per-language flag setting to put it in --
+# so the genex alone reached no file in this target at all. Nothing said so:
+# every .mm here had been compiling as manual retain/release, with no dealloc
+# anywhere in Bridge/ and the one that exists written for ARC's ordering. The
+# Xcode build setting is what actually arrives, and Xcode applies it only to the
+# ObjC dialects, so MemoryQuery.cpp and FrameTrace.cpp still stay out by
+# construction rather than by being remembered -- as does every source in
+# vi_core. (They are not excluded for reaching the OS through C headers -- an
+# ARC translation unit may include <mach/mach.h> and call into it perfectly
+# well. It is the file extension that decides.)
+#
+# The genex stays for the generators that honour it: this repo configures with
+# -G Xcode, but a Ninja or Makefile configure that silently lost ARC again is
+# exactly the failure being fixed, and it costs one line to not have it.
+set_target_properties(scanner_bridge
+                      PROPERTIES XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES)
 target_compile_options(scanner_bridge
                        PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+
+# The warning set the sibling libraries build under, which this target had none
+# of -- not -Wall, not -Wextra, not -Werror.
+#
+# -Werror=switch is the load-bearing one. Bridge/AllocationStopDisplay.hpp and
+# Bridge/RendererErrors.hpp both promise that a value added upstream stops the
+# compile, and both siblings track main rather than a pin. As a bare warning
+# that promise is false: a new gfx or recon Status::Code links cleanly and
+# reports itself to Swift as VolumetricRendererErrorUnknown, and a new
+# AllocationStop cause reports a scan that has stopped taking geometry as a
+# healthy one on every rendering at once. Core/AllocationStop.cpp carries the
+# other half of the same guarantee and sets the same flags.
+target_compile_options(scanner_bridge PRIVATE -Wall -Wextra -Werror=switch)
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
 # VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella

@@ -9,6 +9,7 @@
 
 #import <Metal/Metal.h>
 
+#import "AllocationStop.hpp"
 #import "AllocationStopDisplay.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
@@ -29,9 +30,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-// FrameTrace::dump uses std::fprintf / std::snprintf / std::fflush, and
-// fusionSummary uses std::snprintf. It compiled only because some gfx or recon
-// header happens to pull <cstdio> in transitively today.
+// `fusionSummary` and the read-out's cell builders use std::snprintf. Named
+// here rather than left to a transitive include: it compiled only because some
+// gfx or recon header happens to pull <cstdio> in today.
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -82,27 +83,6 @@
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
 namespace app = volumetric_kit::ios_app;
-
-// What this file was split into, brought in by name.
-//
-// Named individually rather than with a `using namespace`, so this list *is*
-// the inventory of what left: a symbol that stops resolving names itself, and
-// adding one back here is a deliberate line rather than an invisible
-// consequence of a wildcard.
-//
-// Needed at all because the call sites are inside `@implementation`, which is
-// global scope. These used to sit in this file's anonymous namespace, where
-// unqualified lookup found them; they now live in a real namespace, where it
-// does not.
-using volumetric_kit::ios_app::allocation_stop_note;
-using volumetric_kit::ios_app::allocation_stop_text;
-using volumetric_kit::ios_app::allocation_stop_value;
-using volumetric_kit::ios_app::build_atlas_ring;
-using volumetric_kit::ios_app::FrameTrace;
-using volumetric_kit::ios_app::record_atlas_upload;
-using volumetric_kit::ios_app::RendererImpl;
-using volumetric_kit::ios_app::set_error;
-using volumetric_kit::ios_app::to_ns_string;
 
 // --- The recon/gfx vertex layout, pinned across repos ------------------------
 // This TU is the only place `recon::mesh::Vertex` and `gfx::assets::Vertex` are
@@ -297,11 +277,19 @@ float viewport_turn(VolumetricViewOrientation orientation) {
     _occupancyKnown = stats.occupancy_known ? YES : NO;
     _triangles = stats.triangles;
     _vertices = stats.vertices;
-    _allocationStop = allocation_stop_value(stats.allocation_stop);
+    // Not `stats.allocation_stop` itself: the cause is a latch Fusion never
+    // clears, and this snapshot feeds Dashboard.swift's persistent banner --
+    // which went on telling the user to abandon the scan and restart at a
+    // coarser voxel size for the length of a phone call, about a volume that
+    // was not full. The log's `table` row was guarded and these were not; the
+    // rule is now in one place, in Core/AllocationStop.hpp.
+    const app::AllocationStop stop = app::reportable_allocation_stop(
+        stats.allocation_stop, stats.ms_since_fuse);
+    _allocationStop = app::allocation_stop_value(stop);
     _allocationStopReason =
-        stats.allocation_stop == app::AllocationStop::None
+        stop == app::AllocationStop::None
             ? nil
-            : to_ns_string(allocation_stop_text(stats.allocation_stop).advice);
+            : app::to_ns_string(app::allocation_stop_text(stop).advice);
 
     // The gauge figures. `table_blocks` rather than `table_capacity` beside the
     // occupancy, and `table_capacity` only beside `active_blocks` -- the two
@@ -392,12 +380,12 @@ NSString* fmt(const char* format, ...) {
   }
   if (static_cast<std::size_t>(needed) < sizeof(stack)) {
     va_end(args);
-    return to_ns_string(stack);
+    return app::to_ns_string(stack);
   }
   std::vector<char> heap(static_cast<std::size_t>(needed) + 1);
   std::vsnprintf(heap.data(), heap.size(), format, args);
   va_end(args);
-  return to_ns_string(heap.data());
+  return app::to_ns_string(heap.data());
 }
 
 void add(NSMutableArray<VolumetricStatRow*>* rows, NSString* label,
@@ -452,7 +440,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     _triangles = sample.triangles;
     _activeBlocks = sample.active_blocks;
     _framesSinceExtract = sample.frames_since_extract;
-    _allocationStop = allocation_stop_value(sample.allocation_stop);
+    _allocationStop = app::allocation_stop_value(sample.allocation_stop);
     // Derived rather than carried, so the two cannot disagree about the same
     // frame the way two independently-assigned fields eventually do.
     _allocationStopped =
@@ -477,7 +465,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // reason deviceName goes through it. Today they are ASCII; FusionStats'
     // own warning about a row named from somewhere else is the case this
     // covers.
-    _name = to_ns_string(row.name != nullptr ? row.name : "");
+    _name = app::to_ns_string(row.name != nullptr ? row.name : "");
     _cpuMs = row.cpu_ms;
     _gpuMs = row.gpu_ms;
     _hasGpu = row.has_gpu ? YES : NO;
@@ -499,7 +487,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
 @end
 
 @implementation VolumetricRenderer {
-  std::unique_ptr<RendererImpl> _impl;
+  std::unique_ptr<app::RendererImpl> _impl;
   // Retained, not borrowed. The fuse thread dereferences the raw
   // ICameraCapture* this object owns, and the two are siblings on the view
   // controller with no specified destruction order -- so "must outlive the
@@ -515,7 +503,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (self == nil) {
     return nil;
   }
-  _impl = std::make_unique<RendererImpl>();
+  _impl = std::make_unique<app::RendererImpl>();
 
   // --- One VkDevice, adopted by both libraries ------------------------------
   // Not an optimisation: a VkBuffer is valid only on the VkDevice that created
@@ -524,7 +512,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   const vr::Status built = _impl->shared.build((__bridge const void*)layer,
                                                "volumetric_kit_ios scanner");
   if (!built) {
-    set_error(error, built, "SharedDevice");
+    app::set_error(error, built, "SharedDevice");
     return nil;
   }
 
@@ -547,7 +535,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // Set rather than left at gfx's default: RendererImpl::kMeshSlots is sized
   // against this number, and a default that changed in the other repo would
   // silently turn the mesh ring into a use-after-free.
-  config.frames_in_flight = RendererImpl::kFramesInFlight;
+  config.frames_in_flight = app::RendererImpl::kFramesInFlight;
 
   vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
       _impl->shared.gfx_payload(), config,
@@ -564,7 +552,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         return self->_impl->shared.release_surface();
       });
   if (!app) {
-    set_error(error, app.status(), "WindowedApp::adopt");
+    app::set_error(error, app.status(), "WindowedApp::adopt");
     return nil;
   }
   _impl->app = std::move(app).value();
@@ -576,7 +564,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vr::Result<vr::Device> recon_device =
       vr::Device::adopt(_impl->shared.recon_payload(), {});
   if (!recon_device) {
-    set_error(error, recon_device.status(), "recon Device::adopt");
+    app::set_error(error, recon_device.status(), "recon Device::adopt");
     return nil;
   }
   _impl->recon_device.emplace(std::move(recon_device).value());
@@ -590,7 +578,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // The vr::Status overload, not a flatten through vg::Status::unsupported:
     // an allocator failure on a user's phone is out-of-memory or a VkResult,
     // and reporting it as "unsupported" reads as a capability the driver lacks.
-    set_error(error, recon_allocator.status(), "recon Allocator::create");
+    app::set_error(error, recon_allocator.status(), "recon Allocator::create");
     return nil;
   }
   _impl->recon_allocator.emplace(std::move(recon_allocator).value());
@@ -600,7 +588,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_vert_spv),
       vi_triangle_vert_spv_size);
   if (!vert) {
-    set_error(error, vert.status(), "vertex ShaderModule::create");
+    app::set_error(error, vert.status(), "vertex ShaderModule::create");
     return nil;
   }
   _impl->vertex_shader = std::move(vert).value();
@@ -609,7 +597,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_frag_spv),
       vi_triangle_frag_spv_size);
   if (!frag) {
-    set_error(error, frag.status(), "fragment ShaderModule::create");
+    app::set_error(error, frag.status(), "fragment ShaderModule::create");
     return nil;
   }
   _impl->fragment_shader = std::move(frag).value();
@@ -626,7 +614,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::GraphicsPipeline> pipeline =
       vg::GraphicsPipeline::create(device, desc);
   if (!pipeline) {
-    set_error(error, pipeline.status(), "GraphicsPipeline::create");
+    app::set_error(error, pipeline.status(), "GraphicsPipeline::create");
     return nil;
   }
   _impl->pipeline = std::move(pipeline).value();
@@ -638,7 +626,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       vg::pipelines::HybridMeshPipeline::create(
           device, _impl->app.swapchain().layout());
   if (!mesh_pipeline) {
-    set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
+    app::set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
     return nil;
   }
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
@@ -669,14 +657,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::Texture> atlas_texture = vg::upload_texture(
       _impl->app.device(), _impl->app.allocator(), atlas_desc);
   if (!atlas_texture) {
-    set_error(error, atlas_texture.status(), "atlas upload_texture");
+    app::set_error(error, atlas_texture.status(), "atlas upload_texture");
     return nil;
   }
   _impl->atlas_texture = std::move(atlas_texture).value();
 
   vg::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
   if (!atlas_sampler) {
-    set_error(error, atlas_sampler.status(), "atlas Sampler::create");
+    app::set_error(error, atlas_sampler.status(), "atlas Sampler::create");
     return nil;
   }
   _impl->atlas_sampler.emplace(std::move(atlas_sampler).value());
@@ -686,13 +674,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // thread that is recording -- and the sets it hands out are bound by frames
   // still in flight, so freeing one is a use-after-free with no diagnostic on
   // this configuration.
-  const std::uint32_t kAtlasSets = RendererImpl::kMeshSlots + 1;
+  const std::uint32_t kAtlasSets = app::RendererImpl::kMeshSlots + 1;
   const VkDescriptorPoolSize atlas_pool_size{
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kAtlasSets};
   vg::Result<vg::DescriptorPool> atlas_pool =
       vg::DescriptorPool::create(device, &atlas_pool_size, 1, kAtlasSets);
   if (!atlas_pool) {
-    set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
+    app::set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
     return nil;
   }
   _impl->atlas_pool = std::move(atlas_pool).value();
@@ -700,7 +688,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   vg::Result<vg::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
       _impl->mesh_pipeline->descriptor_set_layout(0));
   if (!atlas_set) {
-    set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
+    app::set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
     return nil;
   }
   _impl->atlas_set = std::move(atlas_set).value();
@@ -726,12 +714,12 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // fixed, small allocation made before the first frame, so it not being
   // available is a configuration fault rather than the transient the per-frame
   // path has to tolerate.
-  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
+  for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
     vg::Result<vg::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
         _impl->mesh_pipeline->descriptor_set_layout(0));
     if (!slot_set) {
-      set_error(error, slot_set.status(),
-                "atlas ring DescriptorPool::allocate");
+      app::set_error(error, slot_set.status(),
+                     "atlas ring DescriptorPool::allocate");
       return nil;
     }
     _impl->atlas_slots[i].set = std::move(slot_set).value();
@@ -742,7 +730,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // buffers in place now, so an extract must never land on geometry a pending
   // frame is still reading -- and the ring is what makes that impossible rather
   // than merely unlikely.
-  fusion_config.mesh_slots = RendererImpl::kMeshSlots;
+  fusion_config.mesh_slots = app::RendererImpl::kMeshSlots;
   // Both families, always. Under the two-families plan a phone actually gets,
   // recon writes these buffers on one and gfx reads them on the other, and an
   // EXCLUSIVE buffer read by a family that does not own it is undefined with no
@@ -786,7 +774,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
     // OutOfMemory that must reach Swift as one.
-    set_error(error, fusion_started, "Fusion::start");
+    app::set_error(error, fusion_started, "Fusion::start");
     return nil;
   }
 
@@ -802,8 +790,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (!frame) {
     // The fault happened in an *earlier* frame; this is only where it is
     // noticed. Dump what those frames were doing before the error propagates.
-    _impl->trace.dump(frame.status().message().c_str());
-    set_error(error, frame.status(), "begin_frame");
+    // Through `describe` rather than `message()`: for every gfx fence wait
+    // the message is the bare string "vkWaitForFences" -- the call, not its
+    // result -- so a lost device and a slow one produced byte-identical
+    // dumps, in the log this ring exists to be read from and where the
+    // NSError built on the next line is long gone.
+    _impl->trace.dump(app::describe(frame.status(), "begin_frame").c_str());
+    app::set_error(error, frame.status(), "begin_frame");
     return NO;
   }
   if (!frame.value()) {
@@ -819,7 +812,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // drawable for far longer than the ring is deep, so claiming per tick flushed
   // the whole window with blank entries -- and a device loss noticed just after
   // one dumped 24 empty lines and none of the frames that could have caused it.
-  FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
+  app::FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
 
   // Take the newest mesh, if fusion published one since the last upload. Never
   // wait for it: the render loop draws the previous mesh rather than stalling,
@@ -875,7 +868,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // A slot per frame in flight, holding the *generation* rather than the
       // geometry: the buffers are recon's, and this only has to remember which
       // one to release once this frame's fence has signalled.
-      _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
+      _impl->mesh_slot = (_impl->mesh_slot + 1) % app::RendererImpl::kMeshSlots;
       _impl->mesh_slots[_impl->mesh_slot] = m;
       _impl->have_mesh = true;
 
@@ -909,8 +902,8 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // silently mis-sizes the ring on any device that reports otherwise.
         if (!_impl->atlas_ready) {
           const vg::Status built = [&] {
-            return build_atlas_ring(*_impl, fresh->atlas_width,
-                                    fresh->atlas_height);
+            return app::build_atlas_ring(*_impl, fresh->atlas_width,
+                                         fresh->atlas_height);
           }();
           if (!built.ok()) {
             // Not fatal to the frame, and deliberately not latched: the ring is
@@ -936,7 +929,8 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                                fresh->atlas_width == _impl->atlas_width &&
                                fresh->atlas_height == _impl->atlas_height;
         if (extent_ok) {
-          RendererImpl::AtlasSlot& slot = _impl->atlas_slots[_impl->mesh_slot];
+          app::RendererImpl::AtlasSlot& slot =
+              _impl->atlas_slots[_impl->mesh_slot];
           const std::size_t bytes =
               static_cast<std::size_t>(_impl->atlas_width) *
               _impl->atlas_height * sizeof(std::uint32_t);
@@ -944,10 +938,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
           // until the next take_mesh, so it is consumed here, in the same call
           // that received it, rather than remembered.
           std::memcpy(slot.staging.mapped(), fresh->atlas, bytes);
-          record_atlas_upload(f.cmd, slot.staging.handle(),
-                              slot.texture.image(), _impl->atlas_width,
-                              _impl->atlas_height,
-                              !_impl->atlas_slot_written[_impl->mesh_slot]);
+          app::record_atlas_upload(
+              f.cmd, slot.staging.handle(), slot.texture.image(),
+              _impl->atlas_width, _impl->atlas_height,
+              !_impl->atlas_slot_written[_impl->mesh_slot]);
           _impl->atlas_slot_written[_impl->mesh_slot] = true;
         } else if (_impl->atlas_ready) {
           // A textured mesh whose keyframe could not be staged. Skipping the
@@ -1108,7 +1102,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // them is finished everywhere. release_through is a monotonic high-water
   // mark, so a repeated or lower value is harmless.
   const std::size_t recording =
-      _impl->frame_slot % RendererImpl::kFramesInFlight;
+      _impl->frame_slot % app::RendererImpl::kFramesInFlight;
   _impl->frame_generations[recording] =
       draw_mesh ? _impl->mesh_slots[_impl->mesh_slot].generation : 0;
   ++_impl->frame_slot;
@@ -1134,6 +1128,41 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   }
   trace.released_through = released_through;
 
+  // Fusion's half of the entry, outside the draw branch.
+  //
+  // Ten of the twelve fields were written only when a mesh was drawn, and the
+  // dump's format is fixed -- so a frame that never sampled the allocator
+  // printed `alloc=ok arena=0 blocks=0 occ=0.0%`, byte-identical to one that
+  // measured an idle allocator and an empty arena. Those are the regimes a
+  // device-lost dump is *read* in: before the first successful take, after a
+  // latched upload failure, or under VI_INCREMENTAL_BENCHMARK, which publishes
+  // no geometry for the whole session. `arena_bytes` carries a reading
+  // instruction on FrameTrace::Entry -- compare it against the previous entry
+  // -- and a phantom drop to 0 at every drew=1 -> drew=0 boundary breaks
+  // exactly the comparison that would find the use-after-free described above.
+  //
+  // The same placement mistake as the release logic thirty lines up, which sat
+  // inside this branch until it stopped recon reusing anything at all.
+  //
+  // The narrow accessor, not stats(): this runs every frame, and FusionStats
+  // carries a std::string whose copy would malloc inside the mutex the fuse
+  // thread takes on every one of its own frames. A handful of scalars is all
+  // the ring holds. See Fusion::trace_stats.
+  const app::FusionTraceStats fused = _impl->fusion.trace_stats();
+  trace.triangles = fused.triangles;
+  trace.triangle_capacity = fused.triangle_capacity;
+  trace.arena_bytes = fused.arena_bytes;
+  trace.active_blocks = fused.active_blocks;
+  trace.occupancy = fused.occupancy;
+  trace.occupancy_known = fused.occupancy_known;
+  // Latched rather than passed through reportable_allocation_stop, unlike the
+  // three live renderings: this is the forensic copy, and `ms_since_fuse`
+  // beside it is what qualifies the cause. Discarding what the cause *was* is
+  // the wrong trade in the one artifact a device loss leaves behind.
+  trace.stop = fused.allocation_stop;
+  trace.ms_since_fuse = fused.ms_since_fuse;
+  trace.extract_ms = fused.extract_ms;
+
   if (draw_mesh) {
     // recon's buffers, named rather than copied. LiveMesh owns nothing and
     // reads the index count GPU-side out of the indirect command, so the count
@@ -1145,21 +1174,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     live.indirect = live_src.indirect;
     const vg::pipelines::HybridMeshDraw draw{live};
 
-    // The narrow accessor, not stats(): this runs every frame, and FusionStats
-    // carries a std::string whose copy would malloc inside the mutex the fuse
-    // thread takes on every one of its own frames. A handful of scalars is all
-    // the ring holds. See Fusion::trace_stats.
-    const app::FusionTraceStats s = _impl->fusion.trace_stats();
+    // The three fields that are genuinely about the mesh this frame drew.
     trace.drew_mesh = true;
     trace.generation = live_src.generation;
     trace.mesh_slot = _impl->mesh_slot;
-    trace.triangles = s.triangles;
-    trace.triangle_capacity = s.triangle_capacity;
-    trace.arena_bytes = s.arena_bytes;
-    trace.active_blocks = s.active_blocks;
-    trace.occupancy = s.occupancy;
-    trace.stop = s.allocation_stop;
-    trace.extract_ms = s.extract_ms;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is
     // just as reachable as a zero height -- an orientation change, an iPad
@@ -1261,7 +1279,14 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // A stale swapchain is the normal signal that the drawable changed size;
     // the next begin_frame rebuilds. Only a genuine error propagates.
     if (!vg::windowing::swapchain_stale(end)) {
-      set_error(error, end, "end_frame");
+      // Dumped here as well as out of begin_frame. gfx reports a vkQueueSubmit
+      // or present failure from this call, and a VK_ERROR_DEVICE_LOST is a
+      // normal way MoltenVK surfaces one -- `swapchain_stale` matches only
+      // OUT_OF_DATE and SUBOPTIMAL, so a lost device took this path and threw
+      // the whole ring away in silence. ScannerViewController suspends the
+      // loop on the NO below, so the 24 entries would die with _impl.
+      _impl->trace.dump(app::describe(end, "end_frame").c_str());
+      app::set_error(error, end, "end_frame");
       return NO;
     }
     return YES;
@@ -1296,7 +1321,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // -> lambda -> renderer, a cycle nothing outside the loop can break, and
   // -dealloc would never run at all. The impl outlives the thread by
   // construction: ~RendererImpl joins before destroying anything.
-  RendererImpl* impl = _impl.get();
+  app::RendererImpl* impl = _impl.get();
   _impl->fuse_thread = std::thread([impl] {
     while (impl->fusing.load()) {
       // Contained here rather than allowed to escape. A throw out of a thread
@@ -1777,10 +1802,15 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // The cause, not one of the four causes. See `allocation_stop_text`: the
     // advice for a full volume is actively wrong for the other two, and this
     // row used to assert it for all of them.
-    if (s.allocation_stop != app::AllocationStop::None) {
+    // Through reportable_allocation_stop like the banner and the `table` row:
+    // ALLOCATION STOPPED is a present-tense claim, and the latch behind it
+    // outlives the fuse loop that set it.
+    if (const app::AllocationStop stop =
+            app::reportable_allocation_stop(s.allocation_stop, s.ms_since_fuse);
+        stop != app::AllocationStop::None) {
       add(r, @"state",
           fmt("ALLOCATION STOPPED — %s",
-              allocation_stop_text(s.allocation_stop).headline),
+              app::allocation_stop_text(stop).headline),
           VolumetricStatToneCritical);
     }
     // The other capacity, with its own partner and its own cadence stated. Two
@@ -2198,26 +2228,20 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                     100.0 * static_cast<double>(s.occupancy), s.table_blocks);
     }
     table_row = cell;
-    // A stopped scan is a present-tense claim, so it has to stop being made
-    // when the fuse loop stops running. `allocation_stop` and `occupancy` are
-    // per-frame values latched into a snapshot that outlives the frame, and an
-    // ARKit interruption -- a call, Control Centre, the app switcher -- stops
-    // frames without stopping the display link, so the panel went on announcing
-    // a full volume for the length of a phone call, about a scan that was not
-    // allocating because it was not scanning.
-    //
-    // A second is generous against a 60 Hz capture decimated to whatever
-    // `fuse_every` is, and deliberately so: this should fire on an
-    // interruption, not on a slow frame.
-    constexpr float kFuseStaleAfterMs = 1000.0f;
-    if (s.ms_since_fuse > kFuseStaleAfterMs) {
+    // The freshness rule, and the threshold with it, are in
+    // Core/AllocationStop.hpp -- this row was the only place that had them,
+    // which is how the banner and the panel's `state` row came to go on
+    // announcing a full volume for the length of a phone call. This rendering
+    // says how long instead of merely dropping the claim, because it is the
+    // one with room for it.
+    if (!app::fuse_loop_running(s.ms_since_fuse)) {
       char note[96];
       std::snprintf(note, sizeof(note),
                     "  -- not fusing (%.1f s since a frame)",
                     static_cast<double>(s.ms_since_fuse) / 1000.0);
       table_row += note;
     } else {
-      table_row += allocation_stop_note(s.allocation_stop);
+      table_row += app::allocation_stop_note(s.allocation_stop);
     }
   }
 
@@ -2716,7 +2740,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // buffer carries a library message, and `fusionSummary` is imported as a
   // non-optional Swift String that traps on the nil `stringWithUTF8String:`
   // returns for invalid UTF-8.
-  return to_ns_string(buf);
+  return app::to_ns_string(buf);
 }
 
 - (void)noteMemoryWarning {
@@ -2759,17 +2783,17 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
 - (NSString*)deviceName {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return to_ns_string(props.deviceName);
+  return app::to_ns_string(props.deviceName);
 }
 
 - (NSString*)apiVersion {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(_impl->app.device().physical_device(), &props);
-  return to_ns_string(api_version_string(props.apiVersion));
+  return app::to_ns_string(api_version_string(props.apiVersion));
 }
 
 - (NSString*)sharedDeviceSummary {
-  return to_ns_string(_impl->shared.summary());
+  return app::to_ns_string(_impl->shared.summary());
 }
 
 - (BOOL)sharesOneDevice {

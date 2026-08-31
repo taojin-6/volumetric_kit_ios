@@ -6,11 +6,10 @@
 /// @file FrameTrace.hpp
 /// @brief What the last few frames drew, kept so a device loss can say so.
 
-#import "AllocationStopDisplay.hpp"
-#import "Fusion.hpp"
-
 #include <cstddef>
 #include <cstdint>
+
+#include "AllocationStop.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -20,11 +19,17 @@ namespace volumetric_kit::ios_app {
 /// error surfaces the frame that faulted is already gone and nothing on the
 /// stack says what it did. This keeps the last few frames' worth of the state
 /// that could plausibly cause a GPU fault and dumps it when the loss is
-/// detected.
+/// detected -- at whichever call notices, since `end_frame` reports one just as
+/// readily as `begin_frame` does.
 ///
 /// A ring rather than per-frame logging: at 60 Hz an os_log per frame is both
 /// noise and a perturbation, and only the frames immediately before the fault
 /// matter.
+///
+/// Plain C++, deliberately. This is a POD ring and some wrap arithmetic; it was
+/// Objective-C-only because of one import it did not use, which cost every
+/// includer 13.5 MB of preprocessed text and put the wrap arithmetic out of
+/// reach of the host tests.
 ///
 /// @warning **Render thread only.** Written and read from the render thread, so
 ///          nothing here locks.
@@ -46,7 +51,24 @@ struct FrameTrace {
     // guard `active_blocks` is exactly the frozen number the guard stopped
     // trusting. `stop` says whether the guard was engaged at the time.
     float occupancy = 0.0f;
+    /// Whether @ref occupancy is a reading rather than a fallback.
+    ///
+    /// Carried, because a failed `load_factor` makes Fusion publish a
+    /// deliberately fabricated 1.0 so the allocate guard fails safe -- and
+    /// this ring printed that as `occ=100.0%`, inventing a measurement in the
+    /// one artifact a device loss leaves behind. Both the live read-out and
+    /// `FusionStats::occupancy` say in as many words that the figure must not
+    /// be shown as a reading; the dump was the last place still doing it.
+    bool occupancy_known = true;
     AllocationStop stop = AllocationStop::None;
+    /// How long since the fuse loop published, at this frame.
+    ///
+    /// The qualifier `stop` needs and nothing else here carries. Fusion never
+    /// clears the latch, so an ARKit interruption leaves a stale cause sitting
+    /// on frames that allocated nothing -- and unlike the live renderings,
+    /// which drop the claim (see @ref reportable_allocation_stop), a forensic
+    /// dump wants both numbers: what the cause was, and how old it is.
+    float ms_since_fuse = 0.0f;
     bool drew_mesh = false;
   };
 
@@ -65,6 +87,12 @@ struct FrameTrace {
   /// @brief Dump the ring, oldest-first, naming @p why.
   ///
   /// Oldest-first, so the last line is the frame closest to the fault.
+  ///
+  /// @p why should name the `VkResult`, not just the call that returned it --
+  /// `describe` in RendererErrors.hpp is what builds that line. gfx puts the
+  /// stringified call in `Status::message()` and the result in
+  /// `Status::code()`, so a banner built from the message alone cannot tell a
+  /// lost device from a slow one.
   ///
   /// Both channels on purpose: os_log is what survives a run with no debugger
   /// attached (readable afterwards via `log collect`), and stderr is what
