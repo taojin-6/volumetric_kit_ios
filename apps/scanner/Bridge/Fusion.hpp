@@ -1273,6 +1273,14 @@ class Fusion {
   /// @brief The keyframe images published meshes index into; see
   ///        @ref Published::atlas.
   ///
+  /// @warning Not the renderer's ring of the same name. `AtlasRing.hpp` holds a
+  ///          second `atlas ring` in this namespace -- `kRingSlots` VkImages
+  ///          plus mapped staging buffers, written on the render thread, one
+  ///          per mesh slot. This is the producer side and that is the consumer
+  ///          side; the depth argument below is about `take_mesh` handing out
+  ///          an entry while the next remesh fills the other, and says nothing
+  ///          at all about how deep that one has to be.
+  ///
   /// Two, alternating, and the argument for two rather than one is the whole
   /// reason this is a ring at all. `take_mesh` marks the mesh taken and returns
   /// while the consumer is still copying out of the entry it was handed, so a

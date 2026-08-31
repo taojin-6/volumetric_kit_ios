@@ -11,12 +11,14 @@
 
 #import "AllocationStop.hpp"
 #import "AllocationStopDisplay.hpp"
+#import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
 #import "FrameTrace.hpp"
 #import "Fusion.hpp"
 #import "MemoryQuery.hpp"
 #import "OrbitCamera.hpp"
 #import "RendererErrors.hpp"
+#import "RendererImpl.hpp"
 #import "SharedDevice.hpp"
 #import "StatTone.hpp"
 #import "ViewOrientation.hpp"
@@ -188,446 +190,6 @@ static_assert(
     static_cast<NSInteger>(VolumetricViewOrientationPortraitUpsideDown) ==
         static_cast<NSInteger>(app::ViewOrientation::PortraitUpsideDown),
     "VolumetricViewOrientation and app::ViewOrientation disagree: upside-down");
-
-/// The turn for the orientation Swift handed us, in radians about the **GL**
-/// camera's +Z. See `app::viewport_turn`, which defines it and which the tests
-/// pin.
-float viewport_turn(VolumetricViewOrientation orientation) {
-  return app::viewport_turn(static_cast<app::ViewOrientation>(orientation));
-}
-
-/// Record the buffer -> image copy that publishes a staged keyframe, with the
-/// barriers either side of it.
-///
-/// Recorded into the frame's own command buffer rather than submitted on its
-/// own, which is the whole reason the atlas ring is affordable at remesh rate:
-/// no second submit, no fence, and no contention for the submit mutex recon and
-/// gfx share on this platform (see the warning at the top of Fusion.hpp).
-///
-/// @param first_write  True when @p image has never been written, so it is
-///                     still in `VK_IMAGE_LAYOUT_UNDEFINED`. Naming the wrong
-///                     old layout is undefined rather than diagnosed here --
-///                     this build ships without validation layers -- and
-///                     UNDEFINED is also the correct choice on a first write
-///                     for the reason it exists: its contents need not be
-///                     preserved, so the driver may discard rather than move
-///                     them.
-void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
-                         std::uint32_t width, std::uint32_t height,
-                         bool first_write) {
-  // Zero-initialised and then stamped, like every other Vulkan struct in this
-  // file. Naming sType in the braces leaves the remaining fields to aggregate
-  // initialisation, which -Wextra reports as a missing initialiser -- and this
-  // target now builds with -Wall -Wextra.
-  VkImageMemoryBarrier to_dst{};
-  to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  to_dst.srcAccessMask = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
-  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_dst.oldLayout = first_write ? VK_IMAGE_LAYOUT_UNDEFINED
-                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_dst.image = image;
-  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  // The source scope is the FRAGMENT shader, not TOP_OF_PIPE: the previous
-  // frame that bound this slot sampled it there, and this copy must not begin
-  // until that read has finished. The slot ring makes that frame an old one in
-  // the steady state, but "old" is not a dependency -- gfx exposes no fence to
-  // wait on and no semaphore may cross this seam, so the barrier is what
-  // orders them.
-  vkCmdPipelineBarrier(cmd,
-                       first_write ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                                   : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &to_dst);
-
-  VkBufferImageCopy region{};
-  region.bufferOffset = 0;
-  // Zero means "tightly packed to imageExtent", which the staging buffer is:
-  // it is sized exactly width * height * 4 and written by one memcpy from a
-  // vector of the same shape. Stating the row length instead would be a second
-  // place for the packing to be described, and so a second place to be wrong.
-  region.bufferRowLength = 0;
-  region.bufferImageHeight = 0;
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageOffset = {0, 0, 0};
-  region.imageExtent = {width, height, 1};
-  vkCmdCopyBufferToImage(cmd, staging, image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-  VkImageMemoryBarrier to_read = to_dst;
-  to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &to_read);
-}
-
-}  // namespace
-
-// Everything C++ lives here so the header stays Objective-C only and Swift
-// never sees a move-only type.
-//
-// --- Teardown ----------------------------------------------------------------
-// Two rules, and they pull in opposite directions, which is why the order below
-// is written out rather than left to intuition:
-//
-//   1. A gfx Buffer/Texture's producing Allocator must outlive it, and that
-//      allocator belongs to `app`. So the atlas image and the mesh ring, both
-//      allocated from it, must be declared *after* `app` to be destroyed
-//      *before* it.
-//   2. gfx warns that resources destroyed while the frame loop still has frames
-//      in flight referencing them is VUID-vkDestroyPipeline-pipeline-00765 and
-//      friends. Rule 1 puts them in exactly that position.
-//
-// gfx resolves this by prescribing an explicit `wait_idle()` after the render
-// loop and before anything unwinds -- not by declaration order. So that is what
-// ~RendererImpl does: a destructor *body* runs before any member is destroyed,
-// which makes the drain structural in the one place that can actually order it.
-// An earlier attempt made it structural by declaring `app` last so it tore down
-// first; that cannot work once anything is allocated from its allocator, and
-// appending seven such members after it had already inverted it.
-struct RendererImpl {
-  // Declared first, destroyed last: everything below borrows the VkDevice this
-  // owns and destroys nothing, so it has to outlive all of them.
-  volumetric_kit::ios_app::SharedDevice shared;
-  // recon's view of the same VkDevice -- what the volume, the integrator and
-  // marching cubes below all allocate and dispatch on. Adopted at bring-up
-  // rather than lazily, so a mismatch between what the bootstrap enabled and
-  // what recon requires fails where the message is actionable.
-  // optional, not a plain member: recon's Device is create-or-adopt only and
-  // has no public default constructor -- which is the invariant working, not an
-  // inconvenience. There is no such thing as an empty one to default-construct.
-  std::optional<volumetric_kit::recon::Device> recon_device;
-  std::optional<volumetric_kit::recon::Allocator> recon_allocator;
-
-  // --- Reconstruction ------------------------------------------------------
-  app::Fusion fusion;
-  std::thread fuse_thread;
-  std::atomic<bool> fusing{false};
-  // Borrowed, not owned -- but the owning VolumetricCapture is retained by the
-  // renderer for exactly as long as this is non-null, and the thread that reads
-  // it is joined before that retain is dropped. See -startFusionWithCapture:.
-  vr::sensor::ICameraCapture* capture = nullptr;
-
-  // --- Render state (plain values; destruction order does not matter) -------
-  std::uint64_t frames_presented = 0;
-  std::uint32_t uploaded_version = 0;
-  bool have_mesh = false;
-  bool draw_mesh = true;
-  // Failures of the mesh upload, which is the one stage with no Status to
-  // propagate: it happens on the render thread, after fusion has already
-  // reported success. Without these a mesh that never reaches the GPU reads as
-  // a rising vertex count next to a frozen screen.
-  std::uint64_t mesh_upload_failures = 0;
-  std::string mesh_upload_error;
-  // The atlas path's own counter and reason, deliberately NOT the pair above.
-  //
-  // They report opposite things and sharing one channel made them
-  // indistinguishable. `mesh_upload_failures` has exactly one other writer,
-  // which latches `mesh_unusable` first, so it fires once per process and means
-  // "the geometry can never be drawn". The atlas path does not latch -- a ring
-  // refusal is degraded rendering, not a dead one -- so on a persistent failure
-  // it counts at frame rate, and every iteration overwrote the shared message.
-  // A genuine unbindable-mesh fault arriving afterwards had its reason erased
-  // on the very next frame, and on the Alerts card, which prints the count
-  // without the message, a retryable atlas refusal and a permanently fatal
-  // mesh were the same red row.
-  //
-  // Separate counters, and the atlas one carries its reason to the panel rather
-  // than only into the text summary.
-  std::uint64_t atlas_failures = 0;
-  std::string atlas_error;
-  // Memory warnings the OS pushed at us, and what the process was holding the
-  // last time one arrived. See -noteMemoryWarning. Plain values rather than
-  // atomics for the same reason the counter above is: UIKit delivers the
-  // warning on the main thread and `fusionSummary` is built on it too.
-  std::uint64_t memory_warnings = 0;
-  std::uint64_t memory_warning_footprint_bytes = 0;
-  // The pose the newest mesh was fused at; the camera follows the scan until
-  // the user's fingers take it over.
-  vr::Mat4f camera_to_world{1.0f};
-  app::OrbitCamera camera;
-  VolumetricViewOrientation view_orientation =
-      VolumetricViewOrientationPortrait;
-
-  // --- gfx, and everything built on its device + allocator ------------------
-  // `app` comes first here and the resources it backs follow, so reverse
-  // destruction frees them before the allocator that produced them. The queue
-  // drain that makes that safe is in ~RendererImpl, not in this ordering.
-  vg::app::WindowedApp app;
-  // CPU-ahead depth, named rather than defaulted: kMeshSlots below is only
-  // correct relative to it.
-  static constexpr std::uint32_t kFramesInFlight = 2;
-
-  vg::ShaderModule vertex_shader;
-  vg::ShaderModule fragment_shader;
-  vg::GraphicsPipeline pipeline;
-  std::optional<vg::pipelines::HybridMeshPipeline> mesh_pipeline;
-  // The atlas binding the hybrid pipeline requires of every frame. Its fragment
-  // shader samples set 0 unconditionally, so submit() records *nothing at all*
-  // without one -- see the bring-up comment where these are filled in.
-  //
-  // 1x1 white, and still here: it is what a frame binds before the first
-  // textured mesh arrives, whenever a remesh published no keyframe (a colour
-  // the capture refused, a texture pass that failed), and whenever this frame's
-  // mesh slot holds an atlas image nothing has written yet. That last case is
-  // what `atlas_slot_written` decides -- see where frame_info.atlas is chosen,
-  // because binding an unwritten slot is undefined behaviour rather than merely
-  // a wrong colour.
-  //
-  // Never *selected* by the shader on those frames, because Fusion leaves every
-  // uv0 at the sentinel when it does not texture -- but the set must be
-  // non-null regardless or the frame records no draw at all.
-  vg::Texture atlas_texture;
-  // optional for the same reason recon's Device is: Sampler keeps its default
-  // constructor private, so it is create-only and there is no empty one to
-  // default-construct. The other three do expose an empty state.
-  std::optional<vg::Sampler> atlas_sampler;
-  vg::DescriptorPool atlas_pool;
-  vg::DescriptorSet atlas_set;
-
-  // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
-  // use-after-free, and at per-frame meshing that would be every frame. One
-  // slot more than the frames in flight means a mesh uploaded now is untouched
-  // again by the time the ring comes back round -- the cheap version of the
-  // mesh-slot ring the interop decision describes, and no wait_idle per frame.
-  //
-  // Derived from kFramesInFlight rather than written as a literal, which is the
-  // whole correctness argument: a mesh must outlive every frame that can still
-  // be reading it. The literal 3 held only because gfx's WindowedAppConfig
-  // happens to default frames_in_flight to 2 -- a value in another repo that
-  // this file neither set nor read. It sets it now (see -initWithLayer:), so
-  // the two cannot drift.
-  // +1, which is both what recon's `slot_count` prescribes ("the consumer's
-  // frames in flight plus one") and what the ring now needs. The extra slot was
-  // buying headroom around two ordering faults on the producing side, since
-  // fixed in Fusion::remesh: the consumer's release was applied *after* the
-  // extract it exists to make room for, so the ring always ran a slot shallower
-  // than its depth, and a mesh nobody had collected was published over rather
-  // than left alone, which put a third generation outstanding at once.
-  //
-  // With both gone the outstanding set is exactly the generations named in
-  // frame_generations plus the one being extracted. Each slot is a full vertex
-  // arena that never shrinks, so the padding was not free -- against the arena
-  // sizes this app reaches, it was a few hundred megabytes resident to cover an
-  // ordering choice.
-  static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
-  // The meshes in flight -- borrowed views of recon's buffers, not storage.
-  // Copying one is copying a few handles.
-  vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
-  // The generation each in-flight frame drew. Read as a *set*: what may be
-  // released is everything older than the oldest entry, not the entry belonging
-  // to the frame that just retired -- one generation is normally drawn by
-  // several consecutive frames, so the retired frame's generation is often
-  // still being read by a newer one. begin_frame's fence wait is the only
-  // completion signal gfx gives (no fence is exposed, and no semaphore may
-  // cross the seam), and it says a frame finished, not that a generation did.
-  std::uint64_t frame_generations[kFramesInFlight] = {};
-  std::size_t frame_slot = 0;
-  std::size_t mesh_slot = 0;
-
-  /// @brief One keyframe image, paired with the mesh slot whose `uv0` index it.
-  ///
-  /// Persistent, and that is the design rather than an optimisation. gfx's
-  /// `upload_texture` creates a fresh image plus a staging buffer and blocks on
-  /// a fence -- right for an asset loaded once, wrong at remesh rate.
-  /// `FusionConfig::remesh_every` is 1, so that shape would mean an 11 MB image
-  /// creation and a blocking graphics submit *every frame*, on the queue whose
-  /// submit mutex the warning at the top of Fusion.hpp is entirely about. These
-  /// are built once at the colour camera's size and rewritten in place: one
-  /// host memcpy into a mapped staging buffer, then a copy recorded into the
-  /// frame's own command buffer. Nothing is allocated, submitted or waited on
-  /// per frame.
-  struct AtlasSlot {
-    vg::Texture texture;
-    /// Host-visible and persistently mapped: the render thread writes here and
-    /// the GPU copies out inside the frame already being recorded, so there is
-    /// no second submit and no fence.
-    vg::Buffer staging;
-    vg::DescriptorSet set;
-  };
-  /// Indexed by @ref mesh_slot, deliberately: a mesh and the keyframe its `uv0`
-  /// address are one value, so slot i's atlas belongs to slot i's mesh. Binding
-  /// them crossed samples the wrong place on every textured triangle -- and
-  /// looks like a plausible image, not like an error.
-  AtlasSlot atlas_slots[kMeshSlots];
-  /// The colour camera's dimensions the ring was built for, or 0 before the
-  /// first textured mesh arrives. ARKit does not change `imageResolution`
-  /// mid-session, but a ring built for one size and fed another would read past
-  /// the staged image; the upload checks this rather than assuming it.
-  std::uint32_t atlas_width = 0;
-  std::uint32_t atlas_height = 0;
-  /// Whether @ref atlas_slots hold real images yet; until then every frame
-  /// binds the 1x1 white set.
-  bool atlas_ready = false;
-  /// Which slots have been written at least once. A slot that has not is still
-  /// in `VK_IMAGE_LAYOUT_UNDEFINED`, so its first barrier must not claim to
-  /// transition *from* `SHADER_READ_ONLY_OPTIMAL` -- undefined behaviour that a
-  /// validation layer would name and that MoltenVK, which this ships without,
-  /// simply acts on.
-  bool atlas_slot_written[kMeshSlots] = {};
-  // The newest generation take_mesh has handed over, drawn or not. What the
-  // release logic falls back to when *no* frame is holding a generation: the
-  // per-frame minimum says nothing then, and without this the generations taken
-  // while drawing was off were never released at all -- `drawMesh = NO`
-  // exhausted recon's ring within kMeshSlots extracts and turning drawing back
-  // on could not recover, because the renderer only released what it drew and
-  // could no longer obtain anything to draw.
-  std::uint64_t newest_taken_generation = 0;
-  // Latched when a published mesh cannot be bound as geometry. That is a
-  // configuration fault, not a transient: the usage bits come from two
-  // constants in Fusion::start and the sharing mode from the queue plan, so a
-  // mesh that is unusable once is unusable every time. Latching stops the
-  // renderer collecting meshes it cannot draw -- which at 60 Hz was a storm of
-  // failure counts, and which would otherwise walk recon's ring to exhaustion
-  // one uncollectable generation at a time.
-  bool mesh_unusable = false;
-  // Diagnostic only: what the last few frames drew, dumped when a device loss
-  // (or any begin_frame failure) is detected. See FrameTrace.
-  app::FrameTrace trace;
-
-  ~RendererImpl() {
-    // Before anything else, and before any member is destroyed: the fuse thread
-    // polls `capture` and submits recon work on the shared queue, so it has to
-    // be stopped while everything it touches is still alive. A joinable
-    // std::thread reaching a member destructor would be std::terminate.
-    stop_fusing();
-    // Then drain. gfx idles only the queues it was assigned and recon's Device
-    // exposes no wait at all, so the bootstrap -- which owns both -- is what
-    // makes this cover the whole device.
-    if (app.valid()) {
-      (void)app.wait_idle();
-    }
-    shared.wait_idle();
-  }
-
-  void stop_fusing() {
-    fusing.store(false);
-    if (fuse_thread.joinable()) {
-      fuse_thread.join();
-    }
-    capture = nullptr;
-  }
-
-  RendererImpl() = default;
-  RendererImpl(const RendererImpl&) = delete;
-  RendererImpl& operator=(const RendererImpl&) = delete;
-};
-
-namespace {
-
-/// @brief Give every atlas slot a real image at the colour camera's size.
-///
-/// **All or nothing.** Everything is built into locals and moved into `impl`
-/// only once every slot has succeeded, so a refusal partway through leaves the
-/// renderer exactly as it found it and frees what it had already taken on the
-/// way out. The previous shape wrote each slot as it went and returned early on
-/// the first failure, which left up to two 11 MB images and two 11 MB mapped
-/// staging buffers owned by slots nothing would ever bind -- `atlas_ready`
-/// stays false -- and nothing would ever free, because the only writer of those
-/// slots is a later successful call. ~44 MB converted to unreachable resident
-/// memory by a transient allocation failure, on the device where MemoryBudget
-/// exists precisely because the working set is the binding constraint, and it
-/// made the *next* allocation likelier to fail for the same reason.
-///
-/// Allocates no descriptor sets. They are handed out once at bring-up, and that
-/// is what makes the retry this function's caller advertises actually possible:
-/// gfx's `DescriptorPool::create` passes no flags and its header states the kit
-/// does not free sets individually, so a set consumed by a slot built before a
-/// mid-way failure was gone for good. Against a pool sized at exactly
-/// `kMeshSlots + 1`, the second attempt then failed at `allocate` with
-/// `VK_ERROR_OUT_OF_POOL_MEMORY` -- and so did every attempt after it, for the
-/// life of the process. The white fallback stayed bound, every textured
-/// triangle sampled one white texel, and the read-out called it transient.
-///
-/// Writing the descriptors here is safe only because `atlas_ready` is false for
-/// the whole time this runs, including across a retry: no frame binds a slot
-/// set until the flag goes up, so nothing is reading what this writes.
-vg::Status build_atlas_ring(RendererImpl& impl, std::uint32_t width,
-                            std::uint32_t height) {
-  if (width == 0 || height == 0) {
-    return vg::Status::invalid_argument("atlas ring: zero colour extent");
-  }
-  const VkDeviceSize bytes =
-      static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
-
-  // Staged here, committed below. Destroying these on an early return is the
-  // whole point -- see the note above.
-  vg::Texture textures[RendererImpl::kMeshSlots];
-  vg::Buffer stagings[RendererImpl::kMeshSlots];
-
-  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
-    vg::TextureDesc tex_desc;
-    tex_desc.extent = {width, height};
-    // _SRGB, matching `fuse_render`'s atlas and for its two reasons.
-    //
-    // The atlas holds canonical-encoded 8-bit R'G'B' -- what ARKitCapture
-    // publishes and what the TSDF fuses -- while `Vertex::color`, the other
-    // albedo source the shader picks between per triangle, is **linear**:
-    // marching cubes decodes the encoded voxel attribute at the corner gather
-    // (recon's mesh.hpp says so where it declares the field). An _SRGB view
-    // makes the sampler decode too, so both sources arrive linear and a surface
-    // does not change brightness at the seam where texturing stops. _UNORM
-    // leaves the atlas encoded, which reads lighter and flatter than the voxel
-    // colour beside it -- a real mismatch, not a subtle one.
-    //
-    // It also fixes the filtering, which is the half easy to miss: bilinear on
-    // an _UNORM view averages ENCODED values, and an average of encoded values
-    // is not the encoding of the average. _SRGB decodes before filtering.
-    tex_desc.format = VK_FORMAT_R8G8B8A8_SRGB;
-    tex_desc.usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    vg::Result<vg::Texture> tex = impl.app.allocator().create_image(tex_desc);
-    if (!tex) {
-      return tex.status();
-    }
-
-    vg::BufferDesc buf_desc;
-    buf_desc.size = bytes;
-    buf_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    buf_desc.memory = vg::MemoryUsage::HostVisible;
-    buf_desc.mapped = true;
-    // Sequential: this is written by one memcpy front to back and never read
-    // back, which on a write-combined mapping is the difference between a
-    // streaming store and a read-modify-write per cache line.
-    buf_desc.host_access = vg::HostAccess::SequentialWrite;
-    vg::Result<vg::Buffer> staging =
-        impl.app.allocator().create_buffer(buf_desc);
-    if (!staging) {
-      return staging.status();
-    }
-
-    textures[i] = std::move(tex).value();
-    stagings[i] = std::move(staging).value();
-  }
-
-  // --- Commit. Nothing below can fail ---------------------------------------
-  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
-    impl.atlas_slots[i].texture = std::move(textures[i]);
-    impl.atlas_slots[i].staging = std::move(stagings[i]);
-    // Written once, here: the image the set points at never changes, only its
-    // contents. That is what makes the per-frame path a copy rather than a
-    // descriptor update. The set itself was allocated at bring-up.
-    impl.atlas_slots[i].set.write_combined_image_sampler(
-        0, impl.atlas_slots[i].texture.view(), impl.atlas_sampler->handle(),
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Fresh images, so every slot is back in VK_IMAGE_LAYOUT_UNDEFINED and its
-    // first upload must transition from there rather than from
-    // SHADER_READ_ONLY_OPTIMAL. This is also what the *bind* consults: a slot
-    // that has not been written yet is not bindable, whatever `atlas_ready`
-    // says. See where frame_info.atlas is chosen.
-    impl.atlas_slot_written[i] = false;
-  }
-
-  impl.atlas_width = width;
-  impl.atlas_height = height;
-  impl.atlas_ready = true;
-  return vg::Status();
-}
 
 }  // namespace
 
@@ -918,7 +480,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
 @end
 
 @implementation VolumetricRenderer {
-  std::unique_ptr<RendererImpl> _impl;
+  std::unique_ptr<app::RendererImpl> _impl;
   // Retained, not borrowed. The fuse thread dereferences the raw
   // ICameraCapture* this object owns, and the two are siblings on the view
   // controller with no specified destruction order -- so "must outlive the
@@ -934,7 +496,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   if (self == nil) {
     return nil;
   }
-  _impl = std::make_unique<RendererImpl>();
+  _impl = std::make_unique<app::RendererImpl>();
 
   // --- One VkDevice, adopted by both libraries ------------------------------
   // Not an optimisation: a VkBuffer is valid only on the VkDevice that created
@@ -966,7 +528,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // Set rather than left at gfx's default: RendererImpl::kMeshSlots is sized
   // against this number, and a default that changed in the other repo would
   // silently turn the mesh ring into a use-after-free.
-  config.frames_in_flight = RendererImpl::kFramesInFlight;
+  config.frames_in_flight = app::RendererImpl::kFramesInFlight;
 
   vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
       _impl->shared.gfx_payload(), config,
@@ -1105,7 +667,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // thread that is recording -- and the sets it hands out are bound by frames
   // still in flight, so freeing one is a use-after-free with no diagnostic on
   // this configuration.
-  const std::uint32_t kAtlasSets = RendererImpl::kMeshSlots + 1;
+  const std::uint32_t kAtlasSets = app::RendererImpl::kMeshSlots + 1;
   const VkDescriptorPoolSize atlas_pool_size{
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kAtlasSets};
   vg::Result<vg::DescriptorPool> atlas_pool =
@@ -1145,7 +707,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // fixed, small allocation made before the first frame, so it not being
   // available is a configuration fault rather than the transient the per-frame
   // path has to tolerate.
-  for (std::size_t i = 0; i < RendererImpl::kMeshSlots; ++i) {
+  for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
     vg::Result<vg::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
         _impl->mesh_pipeline->descriptor_set_layout(0));
     if (!slot_set) {
@@ -1153,7 +715,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                      "atlas ring DescriptorPool::allocate");
       return nil;
     }
-    _impl->atlas_slots[i].set = std::move(slot_set).value();
+    _impl->atlas.slots[i].set = std::move(slot_set).value();
   }
 
   app::FusionConfig fusion_config;
@@ -1161,7 +723,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // buffers in place now, so an extract must never land on geometry a pending
   // frame is still reading -- and the ring is what makes that impossible rather
   // than merely unlikely.
-  fusion_config.mesh_slots = RendererImpl::kMeshSlots;
+  fusion_config.mesh_slots = app::RendererImpl::kMeshSlots;
   // Both families, always. Under the two-families plan a phone actually gets,
   // recon writes these buffers on one and gfx reads them on the other, and an
   // EXCLUSIVE buffer read by a family that does not own it is undefined with no
@@ -1299,7 +861,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // A slot per frame in flight, holding the *generation* rather than the
       // geometry: the buffers are recon's, and this only has to remember which
       // one to release once this frame's fence has signalled.
-      _impl->mesh_slot = (_impl->mesh_slot + 1) % RendererImpl::kMeshSlots;
+      _impl->mesh_slot = (_impl->mesh_slot + 1) % app::RendererImpl::kMeshSlots;
       _impl->mesh_slots[_impl->mesh_slot] = m;
       _impl->have_mesh = true;
 
@@ -1323,7 +885,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // Skipping is safe only together with the slot bookkeeping below: a slot
       // left unwritten while drawing is off must not be bound when drawing
       // comes back on, or the first frame after the switch samples a keyframe
-      // several meshes stale. `atlas_slot_written` is what carries that, and
+      // several meshes stale. `atlas.slot_written` is what carries that, and
       // clearing it is why the else-branch exists rather than the skip being a
       // bare `if`.
       if (_impl->draw_mesh && fresh->atlas != nullptr) {
@@ -1331,11 +893,16 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // size is ARKit's to state: `imageResolution` is not known until a
         // frame has arrived, and guessing 1920x1440 would be a constant that
         // silently mis-sizes the ring on any device that reports otherwise.
-        if (!_impl->atlas_ready) {
-          const vg::Status built = [&] {
-            return build_atlas_ring(*_impl, fresh->atlas_width,
-                                    fresh->atlas_height);
-          }();
+        if (!_impl->atlas.ready) {
+          // The sampler is engaged from bring-up onwards -- a failure there
+          // returns nil -- but it is passed rather than reached for, so the
+          // ring never dereferences an optional it cannot see being filled,
+          // and its null check is a real guard rather than a decorative one.
+          const vg::Status built = app::build_atlas_ring(
+              _impl->atlas, _impl->app.allocator(),
+              _impl->atlas_sampler ? _impl->atlas_sampler->handle()
+                                   : VK_NULL_HANDLE,
+              fresh->atlas_width, fresh->atlas_height);
           if (!built.ok()) {
             // Not fatal to the frame, and deliberately not latched: the ring is
             // an allocation of ~kMeshSlots * 11 MB of images plus as much again
@@ -1356,24 +923,37 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // another would read past the staged image. ARKit does not change
         // `imageResolution` mid-session, which is exactly why an unchecked
         // mismatch would be a latent read overrun rather than a visible bug.
-        const bool extent_ok = _impl->atlas_ready &&
-                               fresh->atlas_width == _impl->atlas_width &&
-                               fresh->atlas_height == _impl->atlas_height;
+        const bool extent_ok = _impl->atlas.ready &&
+                               fresh->atlas_width == _impl->atlas.width &&
+                               fresh->atlas_height == _impl->atlas.height;
         if (extent_ok) {
-          RendererImpl::AtlasSlot& slot = _impl->atlas_slots[_impl->mesh_slot];
-          const std::size_t bytes =
-              static_cast<std::size_t>(_impl->atlas_width) *
-              _impl->atlas_height * sizeof(std::uint32_t);
+          app::AtlasSlot& slot = _impl->atlas.slots[_impl->mesh_slot];
+          // The same expression that sized the buffer, called rather than
+          // restated: the two live in different translation units now, and a
+          // format change applied to only one of them writes past the mapping.
+          const VkDeviceSize bytes =
+              app::atlas_staging_bytes(_impl->atlas.width, _impl->atlas.height);
           // The one host copy on this path. `Published::atlas` is valid only
           // until the next take_mesh, so it is consumed here, in the same call
           // that received it, rather than remembered.
-          std::memcpy(slot.staging.mapped(), fresh->atlas, bytes);
-          record_atlas_upload(f.cmd, slot.staging.handle(),
-                              slot.texture.image(), _impl->atlas_width,
-                              _impl->atlas_height,
-                              !_impl->atlas_slot_written[_impl->mesh_slot]);
-          _impl->atlas_slot_written[_impl->mesh_slot] = true;
-        } else if (_impl->atlas_ready) {
+          std::memcpy(slot.staging.mapped(), fresh->atlas,
+                      static_cast<std::size_t>(bytes));
+          // Recorded here, above `f.target->begin` below, and that position is
+          // load-bearing rather than incidental: vkCmdCopyBufferToImage may not
+          // be recorded inside a render pass instance, and this build ships
+          // without the validation layer that would say so. See the
+          // precondition on record_atlas_upload.
+          app::record_atlas_upload(
+              f.cmd, slot.staging.handle(), slot.texture.image(),
+              _impl->atlas.width, _impl->atlas.height,
+              _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot]);
+          // Two flags, deliberately: the image has now been written, so it is
+          // no longer in UNDEFINED and never will be again until the ring is
+          // rebuilt -- while `slot_written`, which is about bindability, gets
+          // cleared below for reasons that leave the layout exactly as it is.
+          _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot] = false;
+          _impl->atlas.slot_written[_impl->mesh_slot] = true;
+        } else if (_impl->atlas.ready) {
           // A textured mesh whose keyframe could not be staged. Skipping the
           // upload alone is not enough and was the bug: `fresh->atlas` being
           // non-null means Fusion *did* texture this mesh, so every vertex
@@ -1392,13 +972,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
           // that must not stall. ARKit does not resize mid-session, so this
           // path is defensive; if it ever fires it stays degraded for the rest
           // of the scan, and says so rather than recovering quietly.
-          _impl->atlas_slot_written[_impl->mesh_slot] = false;
+          _impl->atlas.slot_written[_impl->mesh_slot] = false;
           ++_impl->atlas_failures;
           _impl->atlas_error =
               "keyframe is " + std::to_string(fresh->atlas_width) + "x" +
               std::to_string(fresh->atlas_height) + " but the ring was built " +
-              std::to_string(_impl->atlas_width) + "x" +
-              std::to_string(_impl->atlas_height) +
+              std::to_string(_impl->atlas.width) + "x" +
+              std::to_string(_impl->atlas.height) +
               "; textured meshes render white for the rest of this scan";
         }
       } else if (fresh->atlas != nullptr) {
@@ -1406,7 +986,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // slot still has real uv0, so the slot must not stay bindable -- see
         // the gate's note. The next remesh reaching it while drawing is on
         // writes it again.
-        _impl->atlas_slot_written[_impl->mesh_slot] = false;
+        _impl->atlas.slot_written[_impl->mesh_slot] = false;
       }
       // The message is deliberately NOT cleared here. `mesh_upload_failures` is
       // a running total like every other counter on this read-out, and clearing
@@ -1484,7 +1064,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // *value*, which was the same test only while the zero sat at raw 0 -- so
   // moving the zero would have silently skipped the one orientation that now
   // needs the largest turn of the four.
-  if (const float turn = viewport_turn(_impl->view_orientation); turn != 0.0f) {
+  // app::viewport_turn defines this and the host tests pin it; the renderer
+  // holds the pure-C++ enum, so there is nothing to convert here.
+  if (const float turn = app::viewport_turn(_impl->view_orientation);
+      turn != 0.0f) {
     device_pose = glm::rotate(device_pose, turn, glm::vec3(0.0f, 0.0f, 1.0f));
   }
   _impl->camera.set_device_pose(device_pose);
@@ -1532,7 +1115,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // them is finished everywhere. release_through is a monotonic high-water
   // mark, so a repeated or lower value is harmless.
   const std::size_t recording =
-      _impl->frame_slot % RendererImpl::kFramesInFlight;
+      _impl->frame_slot % app::RendererImpl::kFramesInFlight;
   _impl->frame_generations[recording] =
       draw_mesh ? _impl->mesh_slots[_impl->mesh_slot].generation : 0;
   ++_impl->frame_slot;
@@ -1659,7 +1242,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // build_atlas_ring creates all kMeshSlots images at once and each starts in
     // VK_IMAGE_LAYOUT_UNDEFINED, but only the slot a textured mesh lands in is
     // ever uploaded -- so between the first textured mesh and the ring coming
-    // fully round, `atlas_ready` is true for slots that have never been
+    // fully round, `atlas.ready` is true for slots that have never been
     // written. Binding one declares SHADER_READ_ONLY_OPTIMAL for an image in
     // UNDEFINED, and gfx's hybrid_mesh.frag samples the atlas before it
     // branches, so the read happens unconditionally: undefined behaviour, with
@@ -1671,9 +1254,9 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // Fusion did not texture has every uv0 at recon's sentinel, so the shader
     // takes the vertex-colour branch and never looks at what is bound here.
     const bool atlas_bindable =
-        _impl->atlas_ready && _impl->atlas_slot_written[_impl->mesh_slot];
+        _impl->atlas.ready && _impl->atlas.slot_written[_impl->mesh_slot];
     frame_info.atlas = atlas_bindable
-                           ? _impl->atlas_slots[_impl->mesh_slot].set.handle()
+                           ? _impl->atlas.slots[_impl->mesh_slot].set.handle()
                            : _impl->atlas_set.handle();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
@@ -1751,7 +1334,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // -> lambda -> renderer, a cycle nothing outside the loop can break, and
   // -dealloc would never run at all. The impl outlives the thread by
   // construction: ~RendererImpl joins before destroying anything.
-  RendererImpl* impl = _impl.get();
+  app::RendererImpl* impl = _impl.get();
   _impl->fuse_thread = std::thread([impl] {
     while (impl->fusing.load()) {
       // Contained here rather than allowed to escape. A throw out of a thread
@@ -1843,12 +1426,17 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   _impl->camera.follow_device();
 }
 
+// The one seam between the Objective-C enum Swift sets and the pure-C++ one the
+// renderer holds. A cast rather than a switch because the two mirror each other
+// value for value -- which is not an assumption: the static_asserts above pin
+// all four, so a reordering of either enum is a build failure here rather than
+// a scan silently turned by a multiple of 90 degrees.
 - (VolumetricViewOrientation)viewOrientation {
-  return _impl->view_orientation;
+  return static_cast<VolumetricViewOrientation>(_impl->view_orientation);
 }
 
 - (void)setViewOrientation:(VolumetricViewOrientation)viewOrientation {
-  _impl->view_orientation = viewOrientation;
+  _impl->view_orientation = static_cast<app::ViewOrientation>(viewOrientation);
 }
 
 - (BOOL)followingDevice {
