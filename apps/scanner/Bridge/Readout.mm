@@ -5,6 +5,13 @@
 
 #import "AllocationStopDisplay.hpp"
 #import "BridgeStrings.hpp"
+// `stages_stale` and `kSurveyStaleAfter`, on the same rule as <vector> below:
+// they arrive today through Readout.hpp -> Fusion.hpp, and nothing Fusion.hpp
+// declares uses either -- so the include-pruning pass that correctly drops them
+// from that header would break three lines here that have nothing to do with
+// it. Before these moved out of Fusion.hpp the include really was the
+// dependency; now it is a coincidence.
+#import "Freshness.hpp"
 #import "StatTone.hpp"
 
 #include <os/log.h>
@@ -148,6 +155,9 @@ NS_ASSUME_NONNULL_END
     // without the second is what left the panel unable to make the comparison
     // the transcript makes three hundred lines away in this same file.
     _msSinceFuse = stats.ms_since_fuse;
+    _stagesStale = app::stages_stale(stats.ms_since_stages, stats.ms_since_fuse)
+                       ? YES
+                       : NO;
     _stagesTruncated = stats.stages_truncated ? YES : NO;
     _gpuTimingRetired = stats.gpu_timing_retired ? YES : NO;
 
@@ -172,18 +182,6 @@ namespace {
 
 // Small helpers so building a section reads as a list of figures rather than a
 // wall of alloc/init.
-
-// How many fused frames a survey may be missing for before the read-out calls
-// it a failure rather than a first window.
-//
-// A window and a half, the same margin `Fusion` uses to stop presenting a
-// *published* sample as current: the first survey is due at
-// `kSurveyEveryFrames`, and naming a fault the moment that frame goes by would
-// name one on the frame the sample is being taken. Derived from Fusion's own
-// constant rather than restated, because a second 60 here is a number that
-// drifts the first time the real one moves.
-constexpr std::uint64_t kSurveyFirstWindowFrames =
-    app::kSurveyEveryFrames + app::kSurveyEveryFrames / 2;
 
 // A row's value: measured rather than truncated, and never nil.
 //
@@ -288,8 +286,8 @@ static_assert(static_cast<NSInteger>(VolumetricStatToneCritical) ==
                   static_cast<NSInteger>(app::StatTone::Critical),
               "VolumetricStatTone and app::StatTone disagree: critical");
 
-VolumetricStatTone panel_tone(double fraction, double warn, double crit) {
-  return static_cast<VolumetricStatTone>(app::tone_for(fraction, warn, crit));
+VolumetricStatTone panel_tone(double fraction, app::ToneThresholds t) {
+  return static_cast<VolumetricStatTone>(app::tone_for(fraction, t));
 }
 
 }  // namespace
@@ -453,7 +451,7 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
     // the difference isolates the other case, frames arriving and none
     // completing. A second of it, generous against a 60 Hz capture, so this
     // fires on a failing stage rather than on a slow frame.
-    if (s.ms_since_stages > s.ms_since_fuse + kFuseStaleAfterMs) {
+    if (stages_stale(s.ms_since_stages, s.ms_since_fuse)) {
       out += sfmt("   (%.1f s old)\n", s.ms_since_stages / 1000.0);
     }
     if (s.stages_truncated) {
@@ -599,6 +597,35 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
               : fmt("x%llu", (unsigned long long)in.memory_warnings),
           VolumetricStatToneCritical);
     }
+    // Growth turned away for headroom: a state, not a fault, and the one row
+    // on this card that is not counted.
+    //
+    // Here because a reader consults Alerts to find out why a scan is not
+    // behaving, and "the block table has stopped growing" is that -- but Warn
+    // rather than Critical, and without a count, because the scan is still
+    // fusing every block it already holds and the condition lifts on its own
+    // when the pressure does. It reached this card through the error counter
+    // once, which made a momentary shortfall a permanent critical card.
+    if (s.growth_declined_for_memory) {
+      // The headroom half only when this poll's reading carries one. The
+      // decline itself was taken against a valid reading with a real ceiling --
+      // `plan_growth` declines on nothing else -- but that was on the fuse
+      // thread and this is a fresh `task_info` up to half a second later, which
+      // can come back invalid or ceiling-less. Printing a clamped or absent
+      // remainder as "MB before the limit" would put a fabricated number beside
+      // a real one in the row a reader consults to judge the decision.
+      const bool headroom_known = budget.valid && budget.limit_known;
+      add(r, @"volume growth",
+          headroom_known
+              ? fmt("declined — doubling to %d buckets needs %.0f MB, %.0f MB "
+                    "before the limit  (existing surface still fusing)",
+                    s.growth_declined_to, s.growth_declined_bytes / mb,
+                    budget.available_bytes / mb)
+              : fmt("declined — doubling to %d buckets needs %.0f MB  "
+                    "(existing surface still fusing)",
+                    s.growth_declined_to, s.growth_declined_bytes / mb),
+          VolumetricStatToneWarn);
+    }
     // The fusion's own error counter, here rather than on the section that
     // describes the geometry. It was a row on `Fusion` -- beside the frame and
     // vertex counts, in a card a reader consults for scale rather than for
@@ -676,7 +703,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
                               100.0 * fill, s.extract.triangle_capacity)
                         : fmt("%.1f%% of %u tris", 100.0 * fill,
                               s.extract.triangle_capacity),
-        panel_tone(fill, 0.9, 0.98));
+        panel_tone(fill, kArenaFillThresholds));
     // recon folds the per-block span table into `arena_bytes` -- grid-sized,
     // and doubling on every VoxelHashMap::resize -- so this figure is not
     // comparable with a normal build's. The table is the measurement's own
@@ -933,9 +960,15 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     // whose next remesh skips, and freezes for the session under a persistent
     // extract failure while the map doubles beneath it.
     if (s.occupancy_known) {
+      // Derived from the guard and from recon's threshold rather than read from
+      // a pair of literals -- see `occupancy_thresholds`. This row and the
+      // headline meter are both on screen at once, drawn from this measurement,
+      // so the two numbers deciding their colour have to be the two numbers
+      // deciding the behaviour.
       add(r, @"occupied",
           fmt("%.1f%% of %u blocks", 100.0 * s.occupancy, s.table_blocks),
-          panel_tone(s.occupancy, 0.7, 0.85));
+          panel_tone(s.occupancy,
+                     occupancy_thresholds(Fusion::grow_threshold())));
     } else {
       add(r, @"occupied", fmt("unreadable  (of %u blocks)", s.table_blocks),
           VolumetricStatToneWarn);
@@ -1018,7 +1051,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       // That case used to read as the neutral first-window state forever.
       if (s.incremental_benchmark) {
         add(r, @"survey", @"not run under the measurement mode");
-      } else if (s.frames_fused < kSurveyFirstWindowFrames) {
+      } else if (s.frames_fused < app::kSurveyStaleAfter) {
         add(r, @"survey", @"no sample yet");
       } else {
         add(r, @"survey",
@@ -1166,8 +1199,8 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
           fmt("%.0f / %.0f MB jetsam  (%.0f%%)", budget.footprint_bytes / mb,
               budget.limit_bytes / mb,
               100.0 * budget.footprint_bytes / budget.limit_bytes),
-          panel_tone((double)budget.footprint_bytes / budget.limit_bytes, 0.7,
-                     0.85),
+          panel_tone((double)budget.footprint_bytes / budget.limit_bytes,
+                     kMemoryThresholds),
           /*drawn_as_gauge=*/true);
     }
     // The lower of the two ceilings on this hardware, and the one the voxel
@@ -1182,9 +1215,9 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
               ? fmt("%.0f / %.0f MB  (%.0f%%)", budget.footprint_bytes / mb,
                     ws / mb, 100.0 * budget.footprint_bytes / ws)
               : fmt("%.0f MB recommended", ws / mb),
-          budget.valid
-              ? panel_tone((double)budget.footprint_bytes / ws, 0.7, 0.85)
-              : VolumetricStatToneNeutral,
+          budget.valid ? panel_tone((double)budget.footprint_bytes / ws,
+                                    kMemoryThresholds)
+                       : VolumetricStatToneNeutral,
           /*drawn_as_gauge=*/gpu_gauge);
     }
     // The high-water mark. The panel ticks it onto whichever bars it draws,

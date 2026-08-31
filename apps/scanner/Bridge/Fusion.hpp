@@ -36,6 +36,13 @@
 // the device, and this header cannot be reached from a host build: it pulls in
 // all of recon.
 #include "AllocationStop.hpp"
+// @ref kSurveyEveryFrames and the staleness rules the read-out shares with the
+// fuse loop, and @ref plan_growth / @ref guard_allocation -- the two decisions
+// `fuse` makes about the block table. All pure, all on the far side of the same
+// boundary and for the same reason: a threshold decided without the device
+// belongs where a host test can reach it.
+#include "Freshness.hpp"
+#include "GrowthPolicy.hpp"
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -50,25 +57,6 @@
 namespace volumetric_kit::ios_app {
 
 namespace vr = volumetric_kit::recon;
-
-/// @brief How many *fused* frames between dirty-block surveys.
-///
-/// Fused rather than captured, which is the unit the window is reported in and
-/// the one @ref FusionConfig::fuse_every does not distort: keying the survey
-/// off the capture counter made the real period 60/gcd(60, fuse_every) fused
-/// frames, so every value sharing a factor with 60 shortened the window
-/// silently and `fuse_every == 60` collapsed it to *every* fused frame -- a
-/// full compaction, fence and readback per fuse, on the knob someone reaches
-/// for precisely to buy frame budget back.
-///
-/// Public because the read-out needs it to tell a survey that has not happened
-/// yet from one that is failing. Both leave @ref
-/// FusionStats::survey_active_blocks at 0 and the gate on it is a one-way
-/// latch, so the *only* thing separating them is whether enough fused frames
-/// have gone by for a sample to have been due -- and a panel that hardcoded its
-/// own 60 to find that out would be the second copy of this number, drifting
-/// the first time it moved.
-constexpr std::uint64_t kSurveyEveryFrames = 60;
 
 /// @brief Per-scan tuning. Defaults target *first light* rather than room
 ///        coverage: a small map that fills quickly and grows through
@@ -777,9 +765,9 @@ struct FusionStats {
   /// "remesh 4900 (v0)" is otherwise indistinguishable from a wedged publish
   /// path. It is also what lets the panel explain an empty view.
   bool incremental_benchmark = false;
-  /// Block-table capacity (`num_buckets * kBlocksPerBucket`) **as of the
-  /// extract that measured `extract.active_blocks`**, so the read-out's
-  /// occupancy divides two figures taken at one instant.
+  /// Block-table capacity (@ref volumetric_kit::ios_app::table_blocks_for)
+  /// **as of the extract that measured `extract.active_blocks`**, so the
+  /// read-out's occupancy divides two figures taken at one instant.
   ///
   /// Stamped beside the block count deliberately, and that placement is load
   /// bearing. It briefly lived in `fuse`, refreshed every frame, on the theory
@@ -845,6 +833,32 @@ struct FusionStats {
   /// "volume full" string on that path for exactly this reason; naming the
   /// cause here is what lets the panel honour that instead of undoing it.
   AllocationStop allocation_stop = AllocationStop::None;
+  /// Whether a preemptive doubling is *currently* being turned away because the
+  /// headroom will not cover it.
+  ///
+  /// Present tense, and that is the whole reason it is a field rather than a
+  /// line in @ref last_error. The decline used to be reported by setting the
+  /// per-frame stage-failure flag, which reaches @ref errors -- a monotonic
+  /// counter this struct documents as stage failures only, and which the panel
+  /// renders as a permanent critical Alerts card. One momentary shortfall at a
+  /// doubling boundary, from some other app briefly holding the memory, then
+  /// left a healthy scan reporting a fault for the rest of its life.
+  ///
+  /// It is not a fault: the existing surface keeps fusing, more slowly, into a
+  /// denser table. It is a *state*, it lifts on its own when the pressure does,
+  /// and a reader wants to know it is happening now rather than that it once
+  /// happened. Cleared by any successful grow and by the backoff lapsing; see
+  /// `kMemoryDeclineRetryFrames`.
+  bool growth_declined_for_memory = false;
+  /// The size that declined doubling targets, and what it would commit.
+  /// Meaningful only while @ref growth_declined_for_memory.
+  ///
+  /// Published because "not growing" without them leaves a reader no way to
+  /// judge the decision -- and because the figures are the actionable half: the
+  /// commit against the headroom on the Memory card is what says whether this
+  /// is a device under momentary pressure or a scan that has outgrown it.
+  std::int32_t growth_declined_to = 0;
+  std::uint64_t growth_declined_bytes = 0;
   /// Milliseconds since @ref Fusion::fuse last published, computed when the
   /// snapshot is taken.
   ///
@@ -1223,6 +1237,17 @@ class Fusion {
 
   bool valid() const noexcept { return grid_.has_value(); }
 
+  /// @brief recon's `VoxelHashMap::kGrowThreshold`.
+  ///
+  /// Re-exported so the read-out can tone the occupancy figure against the same
+  /// number the map grows at without restating it -- see GrowthPolicy.hpp's
+  /// note, and @ref volumetric_kit::ios_app::occupancy_thresholds, which is
+  /// what this feeds. A function returning a `float` rather than a constant, so
+  /// the recon header stays in Fusion.mm: two more bridge translation units
+  /// taking `voxel_hash_map.hpp` to read one threshold is the header fanout
+  /// this target has been trimming, and neither of them needs the type.
+  static float grow_threshold() noexcept;
+
  private:
   /// @brief Extract the mesh, and texture it when @ref FusionConfig::texture is
   ///        on.
@@ -1326,6 +1351,30 @@ class Fusion {
   // any successful grow, since a resize that failed at N may well succeed at N
   // once the pressure that refused it has passed.
   std::int32_t preemptive_grow_failed_at_ = 0;
+  // Whether a preemptive doubling was turned away by the *headroom check*, and
+  // the `stats_.frames_fused` it was turned away at.
+  //
+  // A second pair rather than more work for the one above, because the two
+  // refusals expire differently and collapsing them capped scans permanently.
+  // `preemptive_grow_failed_at_` records an allocator that said no, so it is
+  // pinned to the size that was asked for. This records a reading of the
+  // device's headroom, which nothing about the table can make stale: pinned to
+  // a size it never lifts, because `config_.num_buckets` advances only on a
+  // successful resize, growth is the only thing that lowers occupancy, and once
+  // occupancy passes kRefuseAllocateAtOccupancy the allocate guard
+  // short-circuits the overflow count the reactive backstop would have grown
+  // on. One momentary shortfall then held the table at its current size for the
+  // rest of the scan. Backs off on kMemoryDeclineRetryFrames instead, and is
+  // cleared by any successful grow.
+  bool memory_declined_ = false;
+  std::uint64_t memory_declined_at_frame_ = 0;
+  // The figures that decline is about, held so the read-out can print them for
+  // as long as it stands. `plan_growth` recomputes them on every frame that
+  // reaches it, but the frames in between are exactly the ones the backoff
+  // exists to keep out of `plan_growth` -- so the values have to be kept here
+  // or the row would blank between re-asks.
+  std::int32_t declined_grow_to_ = 0;
+  std::uint64_t declined_grow_bytes_ = 0;
   // steady_clock nanoseconds at `fuse`'s last entry, for
   // FusionStats::ms_since_fuse. Wall clock rather than a frame count because
   // the case it exists to name is the one where the frame count stops

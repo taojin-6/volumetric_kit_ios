@@ -15,11 +15,13 @@
 #import "ARKitCapture.h"
 
 #import "AllocationStop.hpp"
-#import "AllocationStopDisplay.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
 #import "FrameTrace.hpp"
 #import "Fusion.hpp"
+// `occupancy_thresholds` and the constants behind it. Named rather than left
+// to Fusion.hpp's copy, on this file's own rule about transitive includes.
+#import "GrowthPolicy.hpp"
 #import "MemoryQuery.hpp"
 #import "OrbitCamera.hpp"
 #import "Readout.hpp"
@@ -1201,6 +1203,37 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 
 + (NSUInteger)frameHistoryCapacity {
   return static_cast<NSUInteger>(app::Fusion::kHistoryCapacity);
+}
+
++ (VolumetricGaugeThresholds)gaugeThresholds {
+  // Transcribed field by field rather than cast from the C++ pairs. The two
+  // structs are laid out identically today and a reinterpret_cast would work
+  // today, which is exactly the kind of coupling that survives a field being
+  // inserted on one side and starts painting the memory bar with the arena's
+  // thresholds -- a wrong colour that looks like a right one.
+  //
+  // Assigned by name rather than positionally, which is the half that was
+  // missing: all three members are the same type, so a brace list is as
+  // order-dependent as the cast it replaced. Swapping `arenaFill` and `memory`
+  // in the header, or `warn` and `critical` in the pair, compiled with no
+  // diagnostic and drew each bar against the other's tiers.
+  const auto pair = [](app::ToneThresholds t) {
+    return VolumetricToneThresholds{t.warn, t.critical};
+  };
+  VolumetricGaugeThresholds out;
+  // The one pair that is not a constant on this side: its critical tier is the
+  // allocate guard and its warn tier is recon's, so it is derived from both.
+  out.occupancy =
+      pair(app::occupancy_thresholds(app::Fusion::grow_threshold()));
+  out.arenaFill = pair(app::kArenaFillThresholds);
+  out.memory = pair(app::kMemoryThresholds);
+  return out;
+}
+
++ (VolumetricStatTone)toneForFraction:(double)fraction
+                           thresholds:(VolumetricToneThresholds)thresholds {
+  return static_cast<VolumetricStatTone>(app::tone_for(
+      fraction, app::ToneThresholds(thresholds.warn, thresholds.critical)));
 }
 
 - (uint32_t)blockCapacity {
