@@ -1776,7 +1776,19 @@ FusionTraceStats Fusion::trace_stats() const {
   // is read in -- reported a frozen count and could not say whether the
   // occupancy guard was engaged. See FusionTraceStats.
   out.occupancy = stats_.occupancy;
+  out.occupancy_known = stats_.occupancy_known;
   out.allocation_stop = stats_.allocation_stop;
+  // Computed here rather than published, for the reason `stats()` gives above
+  // its own copy: the question is how long ago the fuse thread last ran, which
+  // it cannot answer about a frame it has not had. Without it the ring stamped
+  // a latched cause onto frames with nothing to say how old it was.
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  const std::int64_t stamped = last_fuse_ns_.load(std::memory_order_relaxed);
+  out.ms_since_fuse = stamped == 0
+                          ? 0.0f
+                          : std::chrono::duration<float, std::milli>(
+                                now - std::chrono::nanoseconds(stamped))
+                                .count();
   return out;
 }
 
