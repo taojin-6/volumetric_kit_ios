@@ -10,19 +10,26 @@
 /// Internal to the bridge: nothing here crosses into Swift, and
 /// VolumetricRenderer.h stays Objective-C only. It is a header rather than a
 /// detail of VolumetricRenderer.mm because a function that takes a
-/// `RendererImpl&` -- building the atlas ring, bringing the device up -- cannot
-/// be compiled in another translation unit otherwise, and those are exactly the
-/// units worth moving out of the renderer.
+/// `RendererImpl&` -- bringing the device up, for one -- cannot be compiled in
+/// another translation unit otherwise, and those are exactly the units worth
+/// moving out of the renderer.
+///
+/// Plain C++, deliberately, and it is worth keeping that way. The orientation
+/// below is @ref ViewOrientation rather than the Objective-C enum Swift sees,
+/// so nothing here pulls in Foundation, QuartzCore or ARKit -- which is what
+/// lets a unit that includes this be a `.cpp`, the way FrameTrace and the atlas
+/// ring are. VolumetricRenderer.mm converts at the property boundary, where the
+/// two enums are already static_asserted to agree.
 ///
 /// @warning The member **order** below is load-bearing. See the teardown note
 ///          on @ref RendererImpl.
 
-#import "VolumetricRenderer.h"
-
-#import "FrameTrace.hpp"
-#import "Fusion.hpp"
-#import "OrbitCamera.hpp"
-#import "SharedDevice.hpp"
+#include "AtlasRing.hpp"
+#include "FrameTrace.hpp"
+#include "Fusion.hpp"
+#include "OrbitCamera.hpp"
+#include "SharedDevice.hpp"
+#include "ViewOrientation.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -38,6 +45,11 @@
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/core/texture.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
+#include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/recon/mesh/device_mesh.hpp"
+#include "volumetric_kit/recon/sensor/camera_capture.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -52,9 +64,12 @@ namespace vr = volumetric_kit::recon;
 // is written out rather than left to intuition:
 //
 //   1. A gfx Buffer/Texture's producing Allocator must outlive it, and that
-//      allocator belongs to `app`. So the atlas image and the mesh ring, both
-//      allocated from it, must be declared *after* `app` to be destroyed
-//      *before* it.
+//      allocator belongs to `app`. So `atlas_texture` and `atlas`, whose slots
+//      each hold a Texture and a Buffer created from `app.allocator()`, must be
+//      declared *after* `app` to be destroyed *before* it. Those two, and the
+//      pipelines and shaders above them -- not `mesh_slots`, which is borrowed
+//      views of recon's buffers and allocates nothing here, so its position is
+//      unconstrained either way.
 //   2. gfx warns that resources destroyed while the frame loop still has frames
 //      in flight referencing them is VUID-vkDestroyPipeline-pipeline-00765 and
 //      friends. Rule 1 puts them in exactly that position.
@@ -127,8 +142,13 @@ struct RendererImpl {
   // the user's fingers take it over.
   vr::Mat4f camera_to_world{1.0f};
   OrbitCamera camera;
-  VolumetricViewOrientation view_orientation =
-      VolumetricViewOrientationPortrait;
+  /// Which way up the interface is. The pure-C++ enum, not the Objective-C
+  /// mirror Swift sees: that one lives in VolumetricRenderer.h and would drag
+  /// Foundation, QuartzCore and ARKit into every consumer of this header for
+  /// one value. -viewOrientation / -setViewOrientation: convert at the property
+  /// boundary, and VolumetricRenderer.mm static_asserts the two agree value for
+  /// value, so the conversion cannot silently rotate a scan.
+  ViewOrientation view_orientation = ViewOrientation::Portrait;
 
   // --- gfx, and everything built on its device + allocator ------------------
   // `app` comes first here and the resources it backs follow, so reverse
@@ -151,7 +171,7 @@ struct RendererImpl {
   // textured mesh arrives, whenever a remesh published no keyframe (a colour
   // the capture refused, a texture pass that failed), and whenever this frame's
   // mesh slot holds an atlas image nothing has written yet. That last case is
-  // what `atlas_slot_written` decides -- see where frame_info.atlas is chosen,
+  // what `atlas.slot_written` decides -- see where frame_info.atlas is chosen,
   // because binding an unwritten slot is undefined behaviour rather than merely
   // a wrong colour.
   //
@@ -176,8 +196,7 @@ struct RendererImpl {
   // whole correctness argument: a mesh must outlive every frame that can still
   // be reading it. The literal 3 held only because gfx's WindowedAppConfig
   // happens to default frames_in_flight to 2 -- a value in another repo that
-  // this file neither set nor read. It sets it now (see -initWithLayer:), so
-  // the two cannot drift.
+  // nothing here set or read.
   // +1, which is both what recon's `slot_count` prescribes ("the consumer's
   // frames in flight plus one") and what the ring now needs. The extra slot was
   // buying headroom around two ordering faults on the producing side, since
@@ -191,7 +210,22 @@ struct RendererImpl {
   // arena that never shrinks, so the padding was not free -- against the arena
   // sizes this app reaches, it was a few hundred megabytes resident to cover an
   // ordering choice.
+  //
+  // What binds gfx to kFramesInFlight is one assignment in a *different*
+  // translation unit: `config.frames_in_flight = RendererImpl::kFramesInFlight`
+  // in VolumetricRenderer.mm's -initWithLayer:. Reading this header alone does
+  // not show it, and deleting it as redundant hands the depth silently back to
+  // gfx's default -- so a sibling raising that default then overwrites a mesh
+  // slot a frame is still reading. Nothing here can check that the assignment
+  // exists; the static_assert below covers the half that is visible, which is
+  // that the two rings stay as deep as the pipeline they serve.
   static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
+  // The atlas ring is indexed by `mesh_slot`, so the two rings are one depth.
+  // AtlasRing.hpp declares its arrays and so has to state that depth; this is
+  // what stops the two drifting apart silently, in either direction.
+  static_assert(kMeshSlots == kRingSlots,
+                "the atlas ring is indexed by mesh_slot, so it must be exactly "
+                "as deep as the mesh ring");
   // The meshes in flight -- borrowed views of recon's buffers, not storage.
   // Copying one is copying a few handles.
   vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
@@ -206,46 +240,18 @@ struct RendererImpl {
   std::size_t frame_slot = 0;
   std::size_t mesh_slot = 0;
 
-  /// @brief One keyframe image, paired with the mesh slot whose `uv0` index it.
+  /// The keyframe images the textured mesh samples, one per @ref mesh_slot,
+  /// together with the state saying which of them may be bound.
   ///
-  /// Persistent, and that is the design rather than an optimisation. gfx's
-  /// `upload_texture` creates a fresh image plus a staging buffer and blocks on
-  /// a fence -- right for an asset loaded once, wrong at remesh rate.
-  /// `FusionConfig::remesh_every` is 1, so that shape would mean an 11 MB image
-  /// creation and a blocking graphics submit *every frame*, on the queue whose
-  /// submit mutex the warning at the top of Fusion.hpp is entirely about. These
-  /// are built once at the colour camera's size and rewritten in place: one
-  /// host memcpy into a mapped staging buffer, then a copy recorded into the
-  /// frame's own command buffer. Nothing is allocated, submitted or waited on
-  /// per frame.
-  struct AtlasSlot {
-    vg::Texture texture;
-    /// Host-visible and persistently mapped: the render thread writes here and
-    /// the GPU copies out inside the frame already being recorded, so there is
-    /// no second submit and no fence.
-    vg::Buffer staging;
-    vg::DescriptorSet set;
-  };
-  /// Indexed by @ref mesh_slot, deliberately: a mesh and the keyframe its `uv0`
-  /// address are one value, so slot i's atlas belongs to slot i's mesh. Binding
-  /// them crossed samples the wrong place on every textured triangle -- and
-  /// looks like a plausible image, not like an error.
-  AtlasSlot atlas_slots[kMeshSlots];
-  /// The colour camera's dimensions the ring was built for, or 0 before the
-  /// first textured mesh arrives. ARKit does not change `imageResolution`
-  /// mid-session, but a ring built for one size and fed another would read past
-  /// the staged image; the upload checks this rather than assuming it.
-  std::uint32_t atlas_width = 0;
-  std::uint32_t atlas_height = 0;
-  /// Whether @ref atlas_slots hold real images yet; until then every frame
-  /// binds the 1x1 white set.
-  bool atlas_ready = false;
-  /// Which slots have been written at least once. A slot that has not is still
-  /// in `VK_IMAGE_LAYOUT_UNDEFINED`, so its first barrier must not claim to
-  /// transition *from* `SHADER_READ_ONLY_OPTIMAL` -- undefined behaviour that a
-  /// validation layer would name and that MoltenVK, which this ships without,
-  /// simply acts on.
-  bool atlas_slot_written[kMeshSlots] = {};
+  /// Its own type in AtlasRing.hpp, with the functions that build and write it,
+  /// because those take the ring rather than the whole renderer -- which is
+  /// what lets that unit be plain C++ and lets this header not have to know
+  /// about it in return. Eleven `atlas_*` members spread across this struct
+  /// were what pointed the dependency the other way.
+  ///
+  /// Declared here, after `app`, because its slots own gfx images and buffers:
+  /// rule 1 of the teardown note above.
+  AtlasRing atlas;
   // The newest generation take_mesh has handed over, drawn or not. What the
   // release logic falls back to when *no* frame is holding a generation: the
   // per-frame minimum says nothing then, and without this the generations taken

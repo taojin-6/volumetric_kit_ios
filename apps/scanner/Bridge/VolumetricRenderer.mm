@@ -191,13 +191,6 @@ static_assert(
         static_cast<NSInteger>(app::ViewOrientation::PortraitUpsideDown),
     "VolumetricViewOrientation and app::ViewOrientation disagree: upside-down");
 
-/// The turn for the orientation Swift handed us, in radians about the **GL**
-/// camera's +Z. See `app::viewport_turn`, which defines it and which the tests
-/// pin.
-float viewport_turn(VolumetricViewOrientation orientation) {
-  return app::viewport_turn(static_cast<app::ViewOrientation>(orientation));
-}
-
 }  // namespace
 
 // The stage-row value type. At file scope, not inside the renderer's
@@ -722,7 +715,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
                      "atlas ring DescriptorPool::allocate");
       return nil;
     }
-    _impl->atlas_slots[i].set = std::move(slot_set).value();
+    _impl->atlas.slots[i].set = std::move(slot_set).value();
   }
 
   app::FusionConfig fusion_config;
@@ -892,7 +885,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
       // Skipping is safe only together with the slot bookkeeping below: a slot
       // left unwritten while drawing is off must not be bound when drawing
       // comes back on, or the first frame after the switch samples a keyframe
-      // several meshes stale. `atlas_slot_written` is what carries that, and
+      // several meshes stale. `atlas.slot_written` is what carries that, and
       // clearing it is why the else-branch exists rather than the skip being a
       // bare `if`.
       if (_impl->draw_mesh && fresh->atlas != nullptr) {
@@ -900,11 +893,16 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // size is ARKit's to state: `imageResolution` is not known until a
         // frame has arrived, and guessing 1920x1440 would be a constant that
         // silently mis-sizes the ring on any device that reports otherwise.
-        if (!_impl->atlas_ready) {
-          const vg::Status built = [&] {
-            return app::build_atlas_ring(*_impl, fresh->atlas_width,
-                                         fresh->atlas_height);
-          }();
+        if (!_impl->atlas.ready) {
+          // The sampler is engaged from bring-up onwards -- a failure there
+          // returns nil -- but it is passed rather than reached for, so the
+          // ring never dereferences an optional it cannot see being filled,
+          // and its null check is a real guard rather than a decorative one.
+          const vg::Status built = app::build_atlas_ring(
+              _impl->atlas, _impl->app.allocator(),
+              _impl->atlas_sampler ? _impl->atlas_sampler->handle()
+                                   : VK_NULL_HANDLE,
+              fresh->atlas_width, fresh->atlas_height);
           if (!built.ok()) {
             // Not fatal to the frame, and deliberately not latched: the ring is
             // an allocation of ~kMeshSlots * 11 MB of images plus as much again
@@ -925,25 +923,37 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // another would read past the staged image. ARKit does not change
         // `imageResolution` mid-session, which is exactly why an unchecked
         // mismatch would be a latent read overrun rather than a visible bug.
-        const bool extent_ok = _impl->atlas_ready &&
-                               fresh->atlas_width == _impl->atlas_width &&
-                               fresh->atlas_height == _impl->atlas_height;
+        const bool extent_ok = _impl->atlas.ready &&
+                               fresh->atlas_width == _impl->atlas.width &&
+                               fresh->atlas_height == _impl->atlas.height;
         if (extent_ok) {
-          app::RendererImpl::AtlasSlot& slot =
-              _impl->atlas_slots[_impl->mesh_slot];
-          const std::size_t bytes =
-              static_cast<std::size_t>(_impl->atlas_width) *
-              _impl->atlas_height * sizeof(std::uint32_t);
+          app::AtlasSlot& slot = _impl->atlas.slots[_impl->mesh_slot];
+          // The same expression that sized the buffer, called rather than
+          // restated: the two live in different translation units now, and a
+          // format change applied to only one of them writes past the mapping.
+          const VkDeviceSize bytes =
+              app::atlas_staging_bytes(_impl->atlas.width, _impl->atlas.height);
           // The one host copy on this path. `Published::atlas` is valid only
           // until the next take_mesh, so it is consumed here, in the same call
           // that received it, rather than remembered.
-          std::memcpy(slot.staging.mapped(), fresh->atlas, bytes);
+          std::memcpy(slot.staging.mapped(), fresh->atlas,
+                      static_cast<std::size_t>(bytes));
+          // Recorded here, above `f.target->begin` below, and that position is
+          // load-bearing rather than incidental: vkCmdCopyBufferToImage may not
+          // be recorded inside a render pass instance, and this build ships
+          // without the validation layer that would say so. See the
+          // precondition on record_atlas_upload.
           app::record_atlas_upload(
               f.cmd, slot.staging.handle(), slot.texture.image(),
-              _impl->atlas_width, _impl->atlas_height,
-              !_impl->atlas_slot_written[_impl->mesh_slot]);
-          _impl->atlas_slot_written[_impl->mesh_slot] = true;
-        } else if (_impl->atlas_ready) {
+              _impl->atlas.width, _impl->atlas.height,
+              _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot]);
+          // Two flags, deliberately: the image has now been written, so it is
+          // no longer in UNDEFINED and never will be again until the ring is
+          // rebuilt -- while `slot_written`, which is about bindability, gets
+          // cleared below for reasons that leave the layout exactly as it is.
+          _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot] = false;
+          _impl->atlas.slot_written[_impl->mesh_slot] = true;
+        } else if (_impl->atlas.ready) {
           // A textured mesh whose keyframe could not be staged. Skipping the
           // upload alone is not enough and was the bug: `fresh->atlas` being
           // non-null means Fusion *did* texture this mesh, so every vertex
@@ -962,13 +972,13 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
           // that must not stall. ARKit does not resize mid-session, so this
           // path is defensive; if it ever fires it stays degraded for the rest
           // of the scan, and says so rather than recovering quietly.
-          _impl->atlas_slot_written[_impl->mesh_slot] = false;
+          _impl->atlas.slot_written[_impl->mesh_slot] = false;
           ++_impl->atlas_failures;
           _impl->atlas_error =
               "keyframe is " + std::to_string(fresh->atlas_width) + "x" +
               std::to_string(fresh->atlas_height) + " but the ring was built " +
-              std::to_string(_impl->atlas_width) + "x" +
-              std::to_string(_impl->atlas_height) +
+              std::to_string(_impl->atlas.width) + "x" +
+              std::to_string(_impl->atlas.height) +
               "; textured meshes render white for the rest of this scan";
         }
       } else if (fresh->atlas != nullptr) {
@@ -976,7 +986,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
         // slot still has real uv0, so the slot must not stay bindable -- see
         // the gate's note. The next remesh reaching it while drawing is on
         // writes it again.
-        _impl->atlas_slot_written[_impl->mesh_slot] = false;
+        _impl->atlas.slot_written[_impl->mesh_slot] = false;
       }
       // The message is deliberately NOT cleared here. `mesh_upload_failures` is
       // a running total like every other counter on this read-out, and clearing
@@ -1054,7 +1064,10 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   // *value*, which was the same test only while the zero sat at raw 0 -- so
   // moving the zero would have silently skipped the one orientation that now
   // needs the largest turn of the four.
-  if (const float turn = viewport_turn(_impl->view_orientation); turn != 0.0f) {
+  // app::viewport_turn defines this and the host tests pin it; the renderer
+  // holds the pure-C++ enum, so there is nothing to convert here.
+  if (const float turn = app::viewport_turn(_impl->view_orientation);
+      turn != 0.0f) {
     device_pose = glm::rotate(device_pose, turn, glm::vec3(0.0f, 0.0f, 1.0f));
   }
   _impl->camera.set_device_pose(device_pose);
@@ -1229,7 +1242,7 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // build_atlas_ring creates all kMeshSlots images at once and each starts in
     // VK_IMAGE_LAYOUT_UNDEFINED, but only the slot a textured mesh lands in is
     // ever uploaded -- so between the first textured mesh and the ring coming
-    // fully round, `atlas_ready` is true for slots that have never been
+    // fully round, `atlas.ready` is true for slots that have never been
     // written. Binding one declares SHADER_READ_ONLY_OPTIMAL for an image in
     // UNDEFINED, and gfx's hybrid_mesh.frag samples the atlas before it
     // branches, so the read happens unconditionally: undefined behaviour, with
@@ -1241,9 +1254,9 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
     // Fusion did not texture has every uv0 at recon's sentinel, so the shader
     // takes the vertex-colour branch and never looks at what is bound here.
     const bool atlas_bindable =
-        _impl->atlas_ready && _impl->atlas_slot_written[_impl->mesh_slot];
+        _impl->atlas.ready && _impl->atlas.slot_written[_impl->mesh_slot];
     frame_info.atlas = atlas_bindable
-                           ? _impl->atlas_slots[_impl->mesh_slot].set.handle()
+                           ? _impl->atlas.slots[_impl->mesh_slot].set.handle()
                            : _impl->atlas_set.handle();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
@@ -1413,12 +1426,17 @@ VolumetricStatTone tone_for(double fraction, double warn, double crit) {
   _impl->camera.follow_device();
 }
 
+// The one seam between the Objective-C enum Swift sets and the pure-C++ one the
+// renderer holds. A cast rather than a switch because the two mirror each other
+// value for value -- which is not an assumption: the static_asserts above pin
+// all four, so a reordering of either enum is a build failure here rather than
+// a scan silently turned by a multiple of 90 degrees.
 - (VolumetricViewOrientation)viewOrientation {
-  return _impl->view_orientation;
+  return static_cast<VolumetricViewOrientation>(_impl->view_orientation);
 }
 
 - (void)setViewOrientation:(VolumetricViewOrientation)viewOrientation {
-  _impl->view_orientation = viewOrientation;
+  _impl->view_orientation = static_cast<app::ViewOrientation>(viewOrientation);
 }
 
 - (BOOL)followingDevice {
