@@ -9,9 +9,13 @@
 
 #import <Metal/Metal.h>
 
+#import "AllocationStopDisplay.hpp"
+#import "BridgeStrings.hpp"
+#import "FrameTrace.hpp"
 #import "Fusion.hpp"
 #import "MemoryQuery.hpp"
 #import "OrbitCamera.hpp"
+#import "RendererErrors.hpp"
 #import "SharedDevice.hpp"
 #import "StatTone.hpp"
 #import "ViewOrientation.hpp"
@@ -77,6 +81,24 @@ namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
 namespace app = volumetric_kit::ios_app;
 
+// What this file was split into, brought in by name.
+//
+// Named individually rather than with a `using namespace`, so this list *is*
+// the inventory of what left: a symbol that stops resolving names itself, and
+// adding one back here is a deliberate line rather than an invisible
+// consequence of a wildcard.
+//
+// Needed at all because the call sites are inside `@implementation`, which is
+// global scope. These used to sit in this file's anonymous namespace, where
+// unqualified lookup found them; they now live in a real namespace, where it
+// does not.
+using volumetric_kit::ios_app::allocation_stop_note;
+using volumetric_kit::ios_app::allocation_stop_text;
+using volumetric_kit::ios_app::allocation_stop_value;
+using volumetric_kit::ios_app::FrameTrace;
+using volumetric_kit::ios_app::set_error;
+using volumetric_kit::ios_app::to_ns_string;
+
 // --- The recon/gfx vertex layout, pinned across repos ------------------------
 // This TU is the only place `recon::mesh::Vertex` and `gfx::assets::Vertex` are
 // both visible, which makes it the only place they can be compared. Each repo
@@ -120,22 +142,6 @@ NSErrorUserInfoKey const VolumetricRendererVulkanResultKey =
 
 namespace {
 
-// Never nil, so a `nonnull` property cannot hand Swift a null it traps on:
-// `stringWithUTF8String:` returns nil for invalid UTF-8, and Vulkan promises
-// only that VkPhysicalDeviceProperties::deviceName is a NUL-terminated
-// char[256] -- a driver may put any bytes in it, and Swift imports the property
-// as a non-optional String.
-NSString* to_ns_string(const std::string& text) {
-  if (NSString* utf8 = [NSString stringWithUTF8String:text.c_str()]) {
-    return utf8;
-  }
-  // Latin-1 maps every byte to a code point, so this cannot fail in turn.
-  NSString* latin1 = [[NSString alloc] initWithBytes:text.data()
-                                              length:text.size()
-                                            encoding:NSISOLatin1StringEncoding];
-  return latin1 != nil ? latin1 : @"(unprintable)";
-}
-
 // Metal's recommended working-set ceiling in bytes, or 0 when unavailable.
 //
 // The third of the three ceilings this app runs under, and by the numbers in
@@ -166,274 +172,11 @@ std::uint64_t gpu_working_set_bytes() {
   return cached;
 }
 
-VolumetricRendererError error_code(vg::Status::Code domain) {
-  switch (domain) {
-    case vg::Status::Code::Ok:
-      return VolumetricRendererErrorUnknown;
-    case vg::Status::Code::InvalidArgument:
-      return VolumetricRendererErrorInvalidArgument;
-    case vg::Status::Code::NotFound:
-      return VolumetricRendererErrorNotFound;
-    case vg::Status::Code::Unsupported:
-      return VolumetricRendererErrorUnsupported;
-    case vg::Status::Code::OutOfMemory:
-      return VolumetricRendererErrorOutOfMemory;
-    case vg::Status::Code::IoError:
-      return VolumetricRendererErrorIoError;
-    case vg::Status::Code::Vulkan:
-      return VolumetricRendererErrorVulkan;
-  }
-  return VolumetricRendererErrorUnknown;
-}
-
-VolumetricRendererError error_code(vr::Status::Code domain) {
-  switch (domain) {
-    case vr::Status::Code::Ok:
-      return VolumetricRendererErrorUnknown;
-    case vr::Status::Code::InvalidArgument:
-      return VolumetricRendererErrorInvalidArgument;
-    case vr::Status::Code::NotFound:
-      return VolumetricRendererErrorNotFound;
-    case vr::Status::Code::Unsupported:
-      return VolumetricRendererErrorUnsupported;
-    case vr::Status::Code::OutOfMemory:
-      return VolumetricRendererErrorOutOfMemory;
-    case vr::Status::Code::IoError:
-      return VolumetricRendererErrorIoError;
-    // recon keeps its backend neutral, but here the backend *is* Vulkan and the
-    // detail code is the VkResult.
-    case vr::Status::Code::Backend:
-      return VolumetricRendererErrorVulkan;
-  }
-  return VolumetricRendererErrorUnknown;
-}
-
-// Surface a library Status as an NSError so Swift sees a native failure instead
-// of a status code it would have to interpret. The two libraries' Status types
-// are structurally alike (domain + optional backend code + message) but neither
-// imports the other, so each overload below reduces its own to these values.
-void set_error(NSError** error, const char* stage, VolumetricRendererError code,
-               std::optional<VkResult> vk_result, const std::string& message) {
-  if (error == nullptr) {
-    return;
-  }
-  NSMutableDictionary* info = [NSMutableDictionary dictionary];
-  std::string described = std::string(stage) + ": " + message;
-  if (vk_result) {
-    described += " (";
-    described += std::string(vg::to_string(*vk_result));
-    described += ")";
-    info[VolumetricRendererVulkanResultKey] = @(static_cast<int>(*vk_result));
-  }
-  info[NSLocalizedDescriptionKey] = to_ns_string(described);
-  *error = [NSError errorWithDomain:VolumetricRendererErrorDomain
-                               code:code
-                           userInfo:info];
-}
-
-void set_error(NSError** error, const vg::Status& status, const char* stage) {
-  const bool vulkan = status.domain() == vg::Status::Code::Vulkan;
-  set_error(error, stage, error_code(status.domain()),
-            vulkan ? std::optional<VkResult>(status.code()) : std::nullopt,
-            status.message());
-}
-
-// Carried through rather than flattened into `unsupported`: a device-creation
-// failure on a user's phone should name its VkResult, not read as a capability
-// the driver lacks.
-void set_error(NSError** error, const vr::Status& status, const char* stage) {
-  const bool backend = status.domain() == vr::Status::Code::Backend;
-  set_error(
-      error, stage, error_code(status.domain()),
-      backend ? std::optional<VkResult>(static_cast<VkResult>(status.detail()))
-              : std::nullopt,
-      status.message());
-}
-
 std::string api_version_string(std::uint32_t v) {
   return std::to_string(VK_API_VERSION_MAJOR(v)) + "." +
          std::to_string(VK_API_VERSION_MINOR(v)) + "." +
          std::to_string(VK_API_VERSION_PATCH(v));
 }
-
-/// The read-out's word for an @ref app::AllocationStop, and the only place one
-/// is turned into English.
-///
-/// A lookup rather than a literal at each site, because the read-out's job here
-/// is to report a cause, not to guess one. The `table` row used to append a
-/// hard-coded "(volume full)" to a flag that meant only "not allocating this
-/// frame", so a failed `load_factor` -- which fabricates a full table to fail
-/// safe -- printed a full volume directly beneath the banner naming the real
-/// upstream fault, and told the user to coarsen their voxels over it. Fusion
-/// deliberately withholds its own "volume full" string on that path; this is
-/// what stops the panel undoing that.
-const char* allocation_stop_note(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return "";
-    case app::AllocationStop::VolumeFull:
-      return "  -- NOT TAKING NEW GEOMETRY (volume full)";
-    case app::AllocationStop::OccupancyUnknown:
-      return "  -- NOT TAKING NEW GEOMETRY (occupancy unreadable, see error)";
-    case app::AllocationStop::BlocksDropped:
-      return "  -- NOT TAKING NEW GEOMETRY (blocks dropped, see error)";
-  }
-  return "";
-}
-
-/// The same cause, abbreviated for the frame trace's fixed-width line.
-const char* allocation_stop_tag(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return "ok";
-    case app::AllocationStop::VolumeFull:
-      return "full";
-    case app::AllocationStop::OccupancyUnknown:
-      return "unknown";
-    case app::AllocationStop::BlocksDropped:
-      return "dropped";
-  }
-  return "ok";
-}
-
-/// The same cause, as a dashboard row and as the banner's own sentence.
-///
-/// A fourth rendering of one value, and each medium genuinely differs: the log
-/// gets a suffix on a fixed-width line, the trace gets one word in a column,
-/// the bridge gets an enum, and this gets a phrase a person reads once and acts
-/// on. What they must not differ about is *which* cause, which is why they are
-/// all exhaustive switches on the same enum and sit together.
-///
-/// `advice` is the part that made this necessary. It was one hardcoded string
-/// -- coarsen the voxels, or raise `max_buckets` -- which is the right answer
-/// for `VolumeFull` and actively wrong for the other two: `OccupancyUnknown` is
-/// a failed `load_factor` read on a volume with room left, and `BlocksDropped`
-/// fires with occupancy far below the guard. Both sent the reader after a limit
-/// they had not reached.
-struct AllocationStopText {
-  const char* headline;
-  const char* advice;
-};
-AllocationStopText allocation_stop_text(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return {"", ""};
-    case app::AllocationStop::VolumeFull:
-      return {"volume full",
-              "Existing surface keeps refining, but new areas will not be "
-              "added. Finish here, or restart with a coarser voxel size."};
-    case app::AllocationStop::OccupancyUnknown:
-      return {"occupancy unreadable",
-              "The volume is not known to be full -- the table's load factor "
-              "could not be read, and allocation refused on a fabricated "
-              "figure. The cause is on the errors row."};
-    case app::AllocationStop::BlocksDropped:
-      return {"blocks dropped",
-              "The allocate hit a capacity limit and dropped this frame's "
-              "blocks. This can fire well below the occupancy guard -- at the "
-              "bucket ceiling, or with the frame's grow budget spent."};
-  }
-  return {"", ""};
-}
-
-/// The same cause, as the Swift-facing enum.
-///
-/// Switched rather than cast, though the two enumerations are declared in the
-/// same order: a cast makes that order load-bearing across two files that no
-/// build step compares, and the failure is a sample reporting the
-/// *neighbouring* cause -- a wrong answer that looks exactly like a right one.
-/// This way a value added on one side stops the compile.
-VolumetricAllocationStop allocation_stop_value(app::AllocationStop stop) {
-  switch (stop) {
-    case app::AllocationStop::None:
-      return VolumetricAllocationStopNone;
-    case app::AllocationStop::VolumeFull:
-      return VolumetricAllocationStopVolumeFull;
-    case app::AllocationStop::OccupancyUnknown:
-      return VolumetricAllocationStopOccupancyUnknown;
-    case app::AllocationStop::BlocksDropped:
-      return VolumetricAllocationStopBlocksDropped;
-  }
-  return VolumetricAllocationStopNone;
-}
-
-// --- Frame trace -------------------------------------------------------------
-// A device loss is reported by the *next* vkWaitForFences, so by the time the
-// error surfaces the frame that faulted is already gone and nothing on the
-// stack says what it did. This keeps the last few frames' worth of the state
-// that could plausibly cause a GPU fault and dumps it when the loss is
-// detected.
-//
-// A ring rather than per-frame logging: at 60 Hz an os_log per frame is both
-// noise and a perturbation, and only the frames immediately before the fault
-// matter. Written from the render thread and read from the render thread, so no
-// locking.
-struct FrameTrace {
-  struct Entry {
-    std::uint64_t frame = 0;
-    std::uint64_t generation = 0;  // recon generation this frame drew
-    std::size_t mesh_slot = 0;
-    std::uint64_t released_through = 0;  // what we told recon it may reuse
-    std::uint32_t triangles = 0;
-    std::uint32_t triangle_capacity = 0;
-    std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry
-    std::uint32_t active_blocks = 0;
-    float extract_ms = 0.0f;
-    // The table as the *map* reported it, beside `active_blocks` as the last
-    // successful extract reported it. Both, because the gap between them is
-    // often the fault: this ring is dumped on a device-lost, which is what the
-    // occupancy guard exists to prevent, and in the regime that fires the
-    // guard `active_blocks` is exactly the frozen number the guard stopped
-    // trusting. `stop` says whether the guard was engaged at the time.
-    float occupancy = 0.0f;
-    app::AllocationStop stop = app::AllocationStop::None;
-    bool drew_mesh = false;
-  };
-
-  static constexpr std::size_t kCapacity = 24;
-  Entry entries[kCapacity];
-  std::uint64_t next = 0;
-
-  Entry& begin_frame_entry() {
-    Entry& e = entries[next % kCapacity];
-    e = Entry{};
-    e.frame = next;
-    ++next;
-    return e;
-  }
-
-  // Oldest-first, so the last line is the frame closest to the fault.
-  //
-  // Both channels on purpose: os_log is what survives a run with no debugger
-  // attached (readable afterwards via `log collect`), and stderr is what
-  // reaches `devicectl process launch --console` live. os_log alone goes
-  // nowhere near the console, which is the mistake worth not repeating.
-  void dump(const char* why) const {
-    const std::uint64_t count = std::min<std::uint64_t>(next, kCapacity);
-    os_log_error(OS_LOG_DEFAULT,
-                 "vk-trace: %{public}s -- last %llu frames:", why,
-                 static_cast<unsigned long long>(count));
-    std::fprintf(stderr, "vk-trace: %s -- last %llu frames:\n", why,
-                 static_cast<unsigned long long>(count));
-    for (std::uint64_t i = 0; i < count; ++i) {
-      const Entry& e = entries[(next - count + i) % kCapacity];
-      char line[256];
-      std::snprintf(
-          line, sizeof(line),
-          "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
-          "arena=%llu blocks=%u occ=%.1f%% alloc=%s extract=%.1fms",
-          static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
-          static_cast<unsigned long long>(e.generation), e.mesh_slot,
-          static_cast<unsigned long long>(e.released_through), e.triangles,
-          e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
-          e.active_blocks, 100.0 * static_cast<double>(e.occupancy),
-          allocation_stop_tag(e.stop), static_cast<double>(e.extract_ms));
-      os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);
-      std::fprintf(stderr, "vk-trace: %s\n", line);
-    }
-    std::fflush(stderr);
-  }
-};
 
 // --- Viewport orientation ----------------------------------------------------
 // The turn itself is in Core/ViewOrientation.hpp, where it is pure and host

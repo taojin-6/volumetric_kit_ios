@@ -23,8 +23,14 @@ set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
 add_library(
   scanner_bridge STATIC
-  Bridge/VolumetricRenderer.mm Bridge/ARKitCapture.mm Bridge/SharedDevice.mm
-  Bridge/Fusion.mm Bridge/MemoryQuery.cpp)
+  Bridge/VolumetricRenderer.mm
+  Bridge/AllocationStopDisplay.mm
+  Bridge/ARKitCapture.mm
+  Bridge/FrameTrace.mm
+  Bridge/Fusion.mm
+  Bridge/MemoryQuery.cpp
+  Bridge/RendererErrors.mm
+  Bridge/SharedDevice.mm)
 
 # ARC, selected by language rather than by a second copy of the source list.
 #
