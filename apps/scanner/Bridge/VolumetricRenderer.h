@@ -17,7 +17,22 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/CAMetalLayer.h>
 
-#import "ARKitCapture.h"
+/// Forward-declared rather than imported. `VolumetricCapture` appears in this
+/// header exactly once -- the pointer parameter of @ref startFusionWithCapture:
+/// -- and a pointer parameter needs no definition.
+///
+/// Importing ARKitCapture.h here pulled `<ARKit/ARKit.h>` into every
+/// translation unit that includes this one, which is most of the bridge -- and
+/// the ones paying most for it had no business knowing ARKit exists.
+/// RendererErrors.mm turns a library `Status` into an `NSError`;
+/// AllocationStopDisplay.mm turns a stopped scan into a sentence. Neither
+/// mentions a capture. They were 289k and 262k preprocessed lines; they are
+/// 108k and 80k now, and the target is 4.20s -> 3.29s.
+///
+/// Swift is unaffected: Scanner-Bridging-Header.h imports ARKitCapture.h in its
+/// own right, which is what puts `VolumetricCapture` in front of Swift, and it
+/// always did -- this header was never the reason that worked.
+@class VolumetricCapture;
 
 NS_ASSUME_NONNULL_BEGIN
 

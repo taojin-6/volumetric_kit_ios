@@ -9,6 +9,11 @@
 
 #import <Metal/Metal.h>
 
+// The definition, which the header above deliberately does not carry: this is
+// the one unit that sends `VolumetricCapture` a message (-captureHandle) rather
+// than just naming the pointer type.
+#import "ARKitCapture.h"
+
 #import "AllocationStop.hpp"
 #import "AllocationStopDisplay.hpp"
 #import "AtlasRing.hpp"
