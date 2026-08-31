@@ -273,6 +273,21 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 @property(nonatomic, readonly, copy) NSString* value;
 /// Semantic, not decorative -- set only where a reader is meant to act.
 @property(nonatomic, readonly) VolumetricStatTone tone;
+/// @brief Whether the panel draws this figure as a gauge, and so should not
+///        also list it as a row.
+///
+/// A rendering fact, carried on the row so that only the rendering it describes
+/// acts on it. The bridge used to *withhold* these rows instead, on the
+/// reasoning that a bar would carry them -- which is true of the panel and
+/// false of the log, and the log is the copy that survives a jetsam kill. In
+/// the healthy state that left the whole Memory block in the transcript reading
+/// a single `device RAM` row, with the footprint, both ceilings and the peak
+/// nowhere in the artefact they exist for.
+///
+/// So the model carries every figure and each rendering decides how to draw it:
+/// the panel skips the marked rows because its gauges are the same numbers, and
+/// the log prints them because it has no gauges.
+@property(nonatomic, readonly) BOOL drawnAsGauge;
 @end
 
 /// @brief A named group of figures.
@@ -313,6 +328,16 @@ typedef NS_ENUM(NSInteger, VolumetricStatTone) {
 @property(nonatomic, readonly, copy) NSArray<VolumetricStatSection*>* sections;
 /// The fused-frame history, oldest first.
 @property(nonatomic, readonly, copy) NSArray<VolumetricFrameSample*>* history;
+/// @brief This same panel as the log's text.
+///
+/// Rendered from the @ref sections and @ref stages above -- the objects, not a
+/// second read of the fusion -- so the transcript and the screen describe one
+/// frame rather than two. Reading @ref VolumetricRenderer.fusionSummary beside
+/// @ref VolumetricRenderer.dashboardSnapshot takes two `FusionStats` copies and
+/// two `task_info` traps a tick apart, and the fuse thread writes between them:
+/// the log said `v37` while the panel next to it drew v38's arena fill. It also
+/// built the whole read-out twice per tick on the main thread.
+@property(nonatomic, readonly, copy) NSString* summary;
 /// Live block-table occupancy -- the same figure the Volume section prints,
 /// from the same copy, so the headline and the card cannot disagree.
 @property(nonatomic, readonly) double occupancy;
@@ -623,6 +648,12 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// writes between -- see @ref VolumetricDashboardSnapshot.
 @property(nonatomic, readonly) VolumetricDashboardSnapshot* dashboardSnapshot;
 
+/// @brief The read-out as the log's text.
+///
+/// @note Takes its own snapshot, so a caller that also reads
+///       @ref dashboardSnapshot on the same tick builds the read-out twice from
+///       two instants. Use @ref VolumetricDashboardSnapshot.summary instead --
+///       it is this text, rendered from the rows that snapshot carries.
 @property(nonatomic, readonly, copy) NSString* fusionSummary;
 
 /// @brief The last fused frame's stages, for charting.
@@ -634,17 +665,20 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Empty when nothing has fused yet, and empty for the whole run when
 /// `FusionConfig::measure_stages` is off. It is **not** emptied by a frame that
 /// failed: these are the last rows measured, however long ago that was, which
-/// is why the summary carries an age beside them.
+/// is why the summary carries an age beside them -- along with the two other
+/// facts a row cannot show, that the table was truncated and that device timing
+/// retired mid-run.
 ///
 /// Allocated per read, which is affordable because the read-out polls at a few
 /// hertz. It would not be at frame rate; a caller sampling faster wants a POD
 /// accessor rather than churning this.
 ///
 /// @note This and @ref fusionSummary each take their own snapshot, so reading
-///       both gives two instants of a struct the fuse thread is writing. They
-///       agree in practice at a few hertz against a 60 Hz producer, but a
-///       consumer that needs them to agree *exactly* should render the text
-///       from these rows rather than read both.
+///       both gives two instants of a struct the fuse thread is writing. The
+///       fix this note used to only prescribe is now built:
+///       @ref VolumetricDashboardSnapshot.summary is the text rendered from the
+///       rows that snapshot carries, so one read gives a panel and a transcript
+///       that agree exactly.
 @property(nonatomic, readonly, copy) NSArray<VolumetricStageRow*>* stageRows;
 
 /// @brief The fused-frame history, **oldest first** -- chart order.

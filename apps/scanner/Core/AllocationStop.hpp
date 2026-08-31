@@ -68,24 +68,37 @@ struct AllocationStopText {
 /// @brief The headline and advice for @p stop.
 AllocationStopText allocation_stop_text(AllocationStop stop) noexcept;
 
-/// @brief The read-out's suffix for the `table` row, empty for @ref
-///        AllocationStop::None.
+/// @brief The read-out's `state` row, empty for @ref AllocationStop::None.
+///
+/// A whole row rather than a suffix, which is what it was until the log became
+/// a rendering of the panel: it used to be appended to a `table` line that the
+/// collapse onto one model dissolved, and for a while afterwards nothing in the
+/// app called this at all while its tests went on passing over a path no
+/// rendering could reach.
 ///
 /// Composed from @ref AllocationStopText rather than written out again: the
 /// three cause phrases used to appear once here and once as a headline, thirty
 /// lines apart, so rewording one for clarity left the log and the panel naming
 /// the same cause differently -- read side by side exactly when a collected
-/// device log is compared against a screenshot.
+/// device log is compared against a screenshot. That is now enforced rather
+/// than merely intended, because this is the only composer either rendering
+/// has.
 ///
 /// A lookup rather than a literal at each site, because the read-out's job here
-/// is to report a cause, not to guess one. The `table` row used to append a
-/// hard-coded "(volume full)" to a flag that meant only "not allocating this
-/// frame", so a failed `load_factor` -- which fabricates a full table to fail
-/// safe -- printed a full volume directly beneath the banner naming the real
-/// upstream fault, and told the user to coarsen their voxels over it. Fusion
+/// is to report a cause, not to guess one. The row used to append a hard-coded
+/// "(volume full)" to a flag that meant only "not allocating this frame", so a
+/// failed `load_factor` -- which fabricates a full table to fail safe --
+/// printed a full volume directly beneath the banner naming the real upstream
+/// fault, and told the user to coarsen their voxels over it. Fusion
 /// deliberately withholds its own "volume full" string on that path; this is
 /// what stops the panel undoing that.
-std::string allocation_stop_note(AllocationStop stop);
+///
+/// Carries @ref AllocationStopText::on_errors_row as a pointer to the row that
+/// names the real fault. That half reached no rendering at all for a while: the
+/// panel printed the headline alone, so the two causes whose fault is upstream
+/// said only that allocation had stopped, with nothing sending the reader four
+/// cards left to the error that caused it.
+std::string allocation_stop_row(AllocationStop stop);
 
 /// @brief One word for the frame trace's `alloc=` column.
 ///
