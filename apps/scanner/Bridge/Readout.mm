@@ -186,14 +186,14 @@ namespace {
 // A row's value: measured rather than truncated, and never nil.
 //
 // Both halves were bugs. The longest value on this read-out is the error row,
-// which carries `FusionStats::last_error` -- and `Fusion::fuse` appends a ~215
-// character advisory to that on the `track_dirty_blocks` path, so a fixed 256
-// byte buffer cut it with the return value discarded. A cut lands wherever the
-// limit falls, including mid-UTF-8 in a driver or recon message, and
-// `stringWithUTF8String:` answers **nil** for the result -- which `[nil copy]`
-// then stores in a `nonnull` property, so the trap surfaces in Swift at the
-// first read rather than here. `to_ns_string` is this file's own answer to that
-// second half and simply was not being used; see its comment.
+// which carries `FusionStats::last_error`, a recon or driver message of no
+// fixed length, and a fixed 256 byte buffer cut it with the return value
+// discarded. A cut lands wherever the limit falls, including mid-UTF-8 in a
+// driver or recon message, and `stringWithUTF8String:` answers **nil** for the
+// result -- which `[nil copy]` then stores in a `nonnull` property, so the trap
+// surfaces in Swift at the first read rather than here. `to_ns_string` is this
+// file's own answer to that second half and simply was not being used; see its
+// comment.
 NSString* fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
 NSString* fmt(const char* format, ...) {
   // Sized for the common row, which is far shorter than this; the heap path is
@@ -367,11 +367,9 @@ std::string text_row(VolumetricStatRow* row) {
   }
   // Built rather than formatted into a fixed buffer, because the value on this
   // read-out has no fixed bound: the `fusion` alert row carries
-  // `FusionStats::last_error`, and `Fuse::fuse` appends a ~272-character
-  // advisory to that on the `track_dirty_blocks` path. 512 bytes put the worst
-  // case at 95% of a buffer whose overflow is silent -- snprintf's return
-  // discarded -- which is the same trade `fmt`'s heap path exists to refuse,
-  // reinstated one call later.
+  // `FusionStats::last_error`, which has no fixed length either. A fixed
+  // buffer's overflow is silent -- snprintf's return discarded -- which is the
+  // same trade `fmt`'s heap path exists to refuse, reinstated one call later.
   //
   // The cut is what makes it worse than a lost tail. It lands at a byte offset,
   // so one severed multi-byte sequence makes the *whole* joined read-out
@@ -746,10 +744,12 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
             : VolumetricStatToneNeutral);
     // The two rows the measurement mode exists to produce, and without which it
     // cannot be told from the thing it is measured against. recon falls back to
-    // a full extract silently and by design -- a topology change, a grown
-    // arena, flags it will not vouch for -- so "did this call re-mesh only the
-    // changed blocks" is reported rather than inferred. `dispatches` on the row
-    // above reads 1 on both paths and cannot answer it.
+    // a full extract silently and by design -- the first extract against a
+    // grid, an iso change, a remove or clear, an arena that grows or has
+    // drifted too far past its surface, a preceding culled extract -- so "did
+    // this call re-mesh only the changed blocks" is reported rather than
+    // inferred. `dispatches` on the row above reads 1 on both paths and cannot
+    // answer it.
     //
     // Shown only when the mode is on, because on the normal path `incremental`
     // is false by construction and a permanent "full" row is noise.
@@ -1041,14 +1041,11 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       // gate is a one-way latch and a single neutral "no sample yet" was the
       // sole output for three states that want three different responses.
       //
-      // Under the measurement mode the survey never runs at all: the block
-      // below is gated on `!incremental_benchmark`, so nothing is failing and
-      // nothing is coming. After the first window has had time to land and has
-      // not, the surveys are failing -- reachable at default config, and
-      // reachable indefinitely with `track_dirty_blocks` off, which the survey
-      // block is *not* gated on: it still pays for a compaction, a fence and a
-      // full readback every window, and `dirty_remesh_blocks` then refuses.
-      // That case used to read as the neutral first-window state forever.
+      // Under the measurement mode the survey never runs at all: the block in
+      // `Fusion::fuse` is gated on `!incremental_benchmark`, so nothing is
+      // failing and nothing is coming. After the first window has had time to
+      // land and has not, the surveys are failing, which used to read as the
+      // neutral first-window state forever.
       if (s.incremental_benchmark) {
         add(r, @"survey", @"not run under the measurement mode");
       } else if (s.frames_fused < app::kSurveyStaleAfter) {
@@ -1133,11 +1130,13 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       //
       // The one figure on this card that is NOT from the sample above it.
       // `survey_ms` is published on every attempt, including the failed ones --
-      // deliberately, since a failure still paid for the compaction -- while
-      // the three rows above refresh only when one succeeds. Unlabelled, a
-      // failing survey's partial time (the compaction alone; the O(num_blocks)
-      // host scan and the dilation walk never ran) sat under three rows
-      // describing a sample from four seconds earlier and read as its cost.
+      // deliberately, since a failure can still have paid for the compaction
+      // and the stamp readback -- while the three rows above refresh only when
+      // one succeeds. Unlabelled, a failing survey's partial time (whatever
+      // ran before the failure: nothing at all for a topology refusal, the
+      // compaction, or that and part of the stamp readback; never the dilation
+      // walk) sat under three rows describing a sample from four seconds
+      // earlier and read as its cost.
       add(r, @"cost",
           s.survey_stale ? fmt("%.2f ms  (last attempt)", s.survey_ms)
                          : fmt("%.2f ms", s.survey_ms),

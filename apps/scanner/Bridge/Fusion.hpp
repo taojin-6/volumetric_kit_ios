@@ -154,48 +154,16 @@ struct FusionConfig {
   /// a large enough volume will still outrun the frame budget -- but it starts
   /// at 1, because a reconstruction that updates every frame is the point.
   std::uint32_t remesh_every = 1;
-  /// Track which blocks each fuse actually changed.
-  ///
-  /// **On here, and not free anywhere.** recon's default is off and that
-  /// default costs nothing: no `num_blocks * 4` host-visible flag array (which
-  /// doubles with every map grow) and not one store in the fusion kernel. This
-  /// app pays it because the survey in @ref Fusion::fuse is the only instrument
-  /// that can say whether incremental extraction is worth building.
-  ///
-  /// The flags have **two possible consumers and never both at once**: that
-  /// survey, and the incremental extract under
-  /// @ref incremental_benchmark. Each reads the accumulated set and then resets
-  /// it, so running both would make the window each describes drift out of step
-  /// with the other's -- recon refuses the pairing outright in its own harness.
-  /// The survey stands down in the measurement mode; see its gate in
-  /// `Fusion::fuse`. That mode also *implies* this field, so
-  /// @ref Fusion::start normalizes it on the way in and everything downstream
-  /// reads the stored member rather than the request.
-  ///
-  /// A **field** rather than a constant at the create site, because the cost is
-  /// not confined to the diagnostic. recon sizes the flag array inside
-  /// `integrate`, rebuilding it beside the old one on every map grow, so a
-  /// frame that cannot get that allocation fails its *integrate* -- which @ref
-  /// Fusion::fuse treats as fatal to the frame, where before this was turned on
-  /// the same frame fused normally. The exposure is worst where it can least be
-  /// afforded: the frame after a doubling toward @ref max_buckets, which that
-  /// field prices at a ~1.1 GiB transient -- the largest single allocation
-  /// spike this app makes, and so the one most likely to be refused. (It was
-  /// described here as "the jetsam range", which it is not: that phrasing came
-  /// from a ceiling `scanner.entitlements` had recorded ~50% too low, and from
-  /// calling a transient cost a limit.) Nothing retries or falls back, so
-  /// turning the survey off must not need a source edit and a rebuild.
-  bool track_dirty_blocks = true;
   /// Ask each tier for its host/device stage rows -- @ref FusionStats::stages.
   ///
-  /// **A field for the same reason @ref track_dirty_blocks is one, and the rule
-  /// stated there applies verbatim: turning this off must not need a source
-  /// edit and a rebuild.** A non-null `StageMetrics*` is not merely somewhere
-  /// to write timings; it routes every dispatch behind it onto recon's *timed*
-  /// submit path, which resets a query pool, writes two timestamps and reads
-  /// them back per command buffer. On a fused frame that is the allocate (once
-  /// per grow retry, so up to `kMaxGrowAttempts + 1` times), the fusion
-  /// dispatch, and the active-set compaction -- every frame, at capture rate.
+  /// **A field rather than a constant at the call site: turning this off must
+  /// not need a source edit and a rebuild.** A non-null `StageMetrics*` is not
+  /// merely somewhere to write timings; it routes every dispatch behind it onto
+  /// recon's *timed* submit path, which resets a query pool, writes two
+  /// timestamps and reads them back per command buffer. On a fused frame that
+  /// is the allocate (once per grow retry, so up to `kMaxGrowAttempts + 1`
+  /// times), the fusion dispatch, and the active-set compaction -- every frame,
+  /// at capture rate.
   ///
   /// On, because the numbers are the point: a host span around a fence-blocked
   /// submit cannot separate a slow kernel from a stalled queue, and that
@@ -331,8 +299,8 @@ struct FusionConfig {
   /// same app normally. That made the number it produced unrepresentative of
   /// anything shippable, which is the whole reason it is no longer done.
   ///
-  /// This mode changes **three** settings, not one, and the two that are easy
-  /// to overlook are the two that cost something:
+  /// This mode changes two settings beyond the extract it calls, and both cost
+  /// something:
   ///
   /// - `slot_count` drops to 1, because recon *refuses* a ring here: a
   ///   re-meshed block writes into the arena the last extract filled, and a
@@ -344,10 +312,16 @@ struct FusionConfig {
   ///   resident figure is **not comparable** with a normal build's. It also
   ///   charges the per-extract span stamping loop to `arena_alloc_ms`, which
   ///   this class publishes as the `..sizing` stage row.
-  /// - @ref track_dirty_blocks is implied, because the flags the incremental
-  ///   extract dilates on-device are exactly those. That allocation is rebuilt
-  ///   inside `integrate` on every map grow and can fail the *frame* rather
-  ///   than just the diagnostic; see that field for what it costs.
+  ///
+  /// What it re-meshes against costs fusion nothing: the `changed` stamps
+  /// recon's integrator writes on every fuse, which the extractor reads against
+  /// the tick of its own last extract.
+  ///
+  /// It also stands the dirty survey down. Not for correctness -- the survey
+  /// keeps a tick of its own -- but because its two fence waits would land on
+  /// the fuse thread this mode times, and the frames dropped meanwhile would
+  /// inflate the next `remeshed_blocks`. See the survey's gate in
+  /// @ref Fusion::fuse.
   ///
   /// It **does not publish a mesh**, and that is what makes one slot safe
   /// rather than the hazard @ref mesh_slots exists to refuse: nothing borrows
@@ -745,7 +719,8 @@ struct FusionStats {
   /// as the `..sizing` stage row. The read-out says so beside those figures
   /// rather than leaving them to be compared across builds.
   bool spans_tracked = false;
-  /// Fused frames the dirty set behind the last extract had accumulated over.
+  /// Fused frames of changes the last incremental extract re-meshed: those
+  /// since the extract before it.
   ///
   /// The denominator `extract.remeshed_blocks` is meaningless without: the
   /// fraction of the surface a fuse moved is a function of how much fusing
@@ -894,9 +869,12 @@ struct FusionStats {
   /// what say which of them stopped moving.
   ///
   /// Surveyed periodically, because one survey costs a full active-set
-  /// compaction (a dispatch, a fence wait and a readback of the whole set), an
-  /// O(active) dilation walk, and an O(num_blocks) host scan of the flag array.
-  /// @ref survey_ms is what that actually came to.
+  /// compaction (a dispatch, a fence wait and a readback of the whole set), a
+  /// second fence-waited readback of every block slot's stamps (12 bytes a
+  /// slot, free ones included), and an O(active) dilation walk.
+  /// @ref survey_ms is what that actually came to. Not surveyed at all under
+  /// @ref FusionConfig::incremental_benchmark, whose fuse thread that cost
+  /// would land on.
   std::uint32_t survey_active_blocks = 0;
   /// Blocks the fuse actually CHANGED in the window -- not "was dispatched"
   /// (the dispatch covers every active block and returns early for most) and
@@ -911,8 +889,8 @@ struct FusionStats {
   /// How many fused frames of changes this sample accumulated.
   ///
   /// **The sample is a union over this many integrates, not one frame's work.**
-  /// recon ORs the flags in and never clears them itself; @ref Fusion::fuse
-  /// re-arms once per survey. So with @ref FusionConfig::remesh_every at 1 --
+  /// It counts the blocks stamped changed after the tick the previous survey
+  /// sampled at. So with @ref FusionConfig::remesh_every at 1 --
   /// every fused frame extracts -- the share printed beside this is a *ceiling*
   /// on what one incremental extract would redo rather than that quantity: it
   /// is what a remesh running once per window would redo. The direction is the
@@ -1172,11 +1150,10 @@ class Fusion {
   ///
   /// Live rather than start-only because the value it replaces was a literal at
   /// the call site: tuning it meant a source edit and a rebuild, which is
-  /// exactly the shape @ref FusionConfig::track_dirty_blocks and
-  /// @ref FusionConfig::measure_stages are fields to avoid. A tolerance is
-  /// judged by looking at a scan, and a scan is not a thing you can hold still
-  /// across a rebuild -- the point is to turn it while pointing at the same
-  /// surface and watch where texturing stops.
+  /// exactly the shape @ref FusionConfig::measure_stages is a field to avoid. A
+  /// tolerance is judged by looking at a scan, and a scan is not a thing you
+  /// can hold still across a rebuild -- the point is to turn it while pointing
+  /// at the same surface and watch where texturing stops.
   ///
   /// Non-finite and negative values are refused rather than stored: both make
   /// `|d - z| <= threshold` false for every vertex (every comparison with NaN
@@ -1405,20 +1382,24 @@ class Fusion {
   // ordinary device without timestamp support, so the latch is exactly the term
   // that tells those two apart.
   bool gpu_timing_seen_ = false;
-  // `stats_.frames_fused` when the current dirty window opened -- the last time
-  // `fuse` called `reset_dirty`. The published window length is measured from
-  // this rather than assumed to be the survey cadence, because a frame that
-  // takes an error early-return never reaches the survey and the window then
-  // spans two cadences. Zero is the first window, the one that reads ~100% by
+  // `stats_.frames_fused` when the current survey window opened -- the last
+  // survey -- and the map's tick then, which the next survey counts the blocks
+  // stamped changed after. The published window length is measured from this
+  // rather than assumed to be the survey cadence, because a frame that takes
+  // an error early-return never reaches the survey and the window then spans
+  // two cadences. Zero is the first window, the one that reads ~100% by
   // construction; see FusionStats::survey_first_window.
-  std::uint64_t dirty_window_start_ = 0;
-  // The same idea for the OTHER consumer of those flags. `stats_.frames_fused`
-  // when the dirty set the next incremental extract will read began
-  // accumulating -- the last time `remesh` reset it. Separate from
-  // `dirty_window_start_` because the two never run in the same scan (see the
-  // survey's gate) and collapsing them would make each look like it had been
-  // maintained by the other. Published as FusionStats::extract_window_frames,
-  // which is the denominator `extract.remeshed_blocks` is meaningless without.
+  std::uint64_t survey_window_start_ = 0;
+  std::uint32_t survey_tick_ = 0;
+  // The map's topology_epoch() when the window opened. A remove or clear moves
+  // it, and the next survey then refuses rather than counting stamps that
+  // cannot see what the remove left to re-mesh; see the survey in `fuse`.
+  std::uint64_t survey_epoch_ = 0;
+  // The same idea for the incremental extract: `stats_.frames_fused` at the
+  // last one, whose tick recon's extractor keeps itself. Separate from the
+  // survey's, since the two run on cadences of their own. Published as
+  // FusionStats::extract_window_frames, which is the denominator
+  // `extract.remeshed_blocks` is meaningless without.
   std::uint64_t extract_window_start_ = 0;
   // `stats_.frames_fused` as of the last survey that actually published, and
   // whether one ever has. The same pair as active_blocks_at_frame_ /
