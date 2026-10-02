@@ -84,10 +84,42 @@ struct ChangedBlocks {
   std::uint32_t remesh = 0;
 };
 
-ChangedBlocks changed_since(const std::vector<vr::volume::BlockIndex>& active,
-                            const std::vector<vr::volume::BlockStamp>& stamps,
-                            std::uint32_t voxels_per_block,
-                            std::uint32_t since) {
+/// A copy of the helper of the same name in recon's
+/// `examples/fuse_replica/main.cpp`, which is what lets this survey claim the
+/// same number as that harness's `--dirty-every`. recon exports neither the
+/// helper nor a count, so the two are kept in step by hand: the guards, the
+/// slot rule and `tick_after` are recon's, and the early return and the
+/// `reserve` are this copy's own, neither of which changes the answer.
+vr::Result<ChangedBlocks> changed_since(
+    const vr::volume::VoxelBlockGrid& grid,
+    const std::vector<vr::volume::BlockIndex>& active, std::uint32_t since) {
+  const auto vpb = static_cast<std::uint32_t>(grid.grid().voxels_per_block);
+  if (vpb == 0) {
+    return vr::Status::invalid_argument("changed_since: voxels_per_block is 0");
+  }
+  vr::Result<std::vector<vr::volume::BlockStamp>> read =
+      grid.map().read_block_stamps();
+  if (!read) {
+    return read.status();
+  }
+  const std::vector<vr::volume::BlockStamp>& stamps = read.value();
+  // A slot past the stamps counts as changed, as the extract's kernel has it.
+  const auto is_changed = [&](const vr::volume::BlockIndex& b) {
+    const std::size_t slot = static_cast<std::uint32_t>(b.ptr) / vpb;
+    return slot >= stamps.size() ||
+           vr::volume::tick_after(stamps[slot].changed, since);
+  };
+  // Counted first, so the set is sized once and the steady state on a
+  // converged surface -- nothing changed -- skips the dilation's eight lookups
+  // per active block outright.
+  std::size_t count = 0;
+  for (const vr::volume::BlockIndex& b : active) {
+    count += is_changed(b) ? 1 : 0;
+  }
+  ChangedBlocks out;
+  if (count == 0) {
+    return out;
+  }
   // 21 bits an axis, through unsigned casts since coordinates go negative.
   const auto key = [](const vr::Vec3i& c) {
     constexpr std::uint64_t kMask = (std::uint64_t{1} << 21) - 1;
@@ -96,15 +128,12 @@ ChangedBlocks changed_since(const std::vector<vr::volume::BlockIndex>& active,
            (std::uint64_t{static_cast<std::uint32_t>(c.z)} & kMask);
   };
   std::unordered_set<std::uint64_t> changed;
+  changed.reserve(count);
   for (const vr::volume::BlockIndex& b : active) {
-    const std::uint32_t tick =
-        stamps[static_cast<std::uint32_t>(b.ptr) / voxels_per_block].changed;
-    // Ticks compare modulo 2^32.
-    if (static_cast<std::int32_t>(tick - since) > 0) {
+    if (is_changed(b)) {
       changed.insert(key(b.coord));
     }
   }
-  ChangedBlocks out;
   out.changed = static_cast<std::uint32_t>(changed.size());
   for (const vr::volume::BlockIndex& b : active) {
     bool hit = false;
@@ -311,6 +340,10 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
     return made.status();
   }
   grid_.emplace(std::move(made).value());
+  // The topology the first survey window opens on, read from the grid just
+  // made: every grid draws a token of its own, so the last scan's matches
+  // nothing here.
+  survey_epoch_ = grid_->map().topology_epoch();
 
   vr::Result<vr::tsdf::TsdfIntegrator> integrator =
       vr::tsdf::TsdfIntegrator::create(device, allocator);
@@ -1168,73 +1201,91 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // --- Dirty-block survey ---------------------------------------------------
   //
   // Throttled hard: one compaction -- a dispatch, a fence wait and a readback
-  // of the whole active set -- plus a readback of every block slot's stamps and
-  // an O(active) dilation walk. Once per kSurveyEveryFrames is
-  // enough to characterise a scan; `survey_ms` is what it actually cost, rather
-  // than this comment's word for it. See FusionStats::survey_active_blocks for
-  // what the number does and does not prove.
+  // of the whole active set -- then a second fence-waited readback, of every
+  // block slot's stamps (12 bytes a slot, free ones included, through a staging
+  // buffer the batch allocates), and an O(active) dilation walk. Once per
+  // kSurveyEveryFrames is enough to characterise a scan; `survey_ms` is what it
+  // actually cost, rather than this comment's word for it. See
+  // FusionStats::survey_active_blocks for what the number does and does not
+  // prove.
   //
   // Keyed on frames_fused, matching the remesh gate above and the unit the
   // window is reported in -- see kSurveyEveryFrames for what keying it off the
   // capture counter did to `fuse_every`.
   //
-  // Run under the measurement mode too: the survey counts the blocks stamped
-  // changed after the tick it last sampled at, and the incremental extract
-  // keeps a tick of its own, so neither moves the other's window.
-  if (stats_.frames_fused % kSurveyEveryFrames == 0) {
+  // NOT RUN under the measurement mode. Not for correctness -- the survey
+  // counts the blocks stamped changed after the tick it last sampled at, and
+  // the incremental extract keeps a tick of its own, so neither moves the
+  // other's window -- but by the rule the texture pass in `remesh` follows:
+  // work whose only effect is on the fuse thread this mode exists to time moves
+  // the number. Both fence waits above stall this thread, capture keeps only
+  // the newest frame while it is stalled, and the next extract then re-meshes
+  // the larger camera move those dropped frames covered -- so
+  // `remeshed_blocks`, the figure this mode reports, reads high on every
+  // window a survey lands in.
+  if (!config_.incremental_benchmark &&
+      stats_.frames_fused % kSurveyEveryFrames == 0) {
     const auto t_survey = Clock::now();
     // Sampled into locals first, published in one short critical section below.
-    // The stamp walk in particular reads back the whole num_blocks stamp array
-    // -- 262144 records at the max_buckets ceiling -- and mutex_ is
-    // the lock the *main* thread takes four times per rendered frame. This file
-    // already declined to malloc under it (see FusionTraceStats); a 262k-entry
-    // scan is not a smaller ask than that one.
+    // The stamp readback in particular copies the whole num_blocks stamp array
+    // -- 262144 records, 3 MiB, at the max_buckets ceiling -- and mutex_ is the
+    // lock the *main* thread takes four times per rendered frame. This file
+    // already declined to malloc under it (see FusionTraceStats); a 262k-record
+    // readback is not a smaller ask than that one.
     //
-    // That figure doubled with the ceiling and this sentence did not follow it,
-    // which matters because it is the sentence justifying the
-    // sample-outside-the-mutex exception: the scan this paragraph prices is now
-    // twice what it says. kSurveyEveryFrames was set against the old size and
-    // has not been revisited; at 60 fused frames the survey is ~1 s apart, so
-    // the doubled walk is still affordable, but that is the check, not an
-    // assumption -- `survey_ms` is what it actually costs.
+    // kSurveyEveryFrames has not been revisited for this readback, which
+    // replaced a host scan of a 4-byte flag a slot. At 60 fused frames the
+    // survey is ~1 s apart, which should leave it affordable, but that is the
+    // check `survey_ms` makes rather than an assumption.
     std::uint32_t active = 0;
     std::uint32_t changed = 0;
     std::uint32_t to_remesh = 0;
     bool sampled = false;
     std::string survey_error;
-    // The tick this sample is taken at, which the next window counts from.
+    // The tick and topology this sample is taken at, which the next window
+    // counts from.
     const std::uint32_t tick = grid_->map().tick();
-    vr::Result<std::vector<vr::volume::BlockIndex>> all =
-        grid_->map().compact_active_blocks();
-    vr::Result<std::vector<vr::volume::BlockStamp>> stamps =
-        all ? grid_->map().read_block_stamps()
-            : vr::Result<std::vector<vr::volume::BlockStamp>>(all.status());
-    if (!all) {
+    const std::uint64_t epoch = grid_->map().topology_epoch();
+    if (epoch != survey_epoch_) {
+      // Refused rather than counted, as the flags' dirty_remesh_blocks refused
+      // before the stamps replaced them -- and checked first, so a refusal
+      // costs no compaction. A remove or clear zeroes the freed block's record,
+      // and its neighbours, whose +{0,1}^3 neighbourhood just lost a block,
+      // carry no stamp for it: the count would come out short and read as an
+      // ordinary sample, while the extractor falls back to a full pass on the
+      // same event. Nothing in this file removes a block, so this guards
+      // against the first thing that does; the window below starts over either
+      // way, so it costs one sample.
+      survey_error =
+          "dirty survey: blocks were removed in this window, so the stamps do "
+          "not cover every block a remove leaves to re-mesh";
+    } else if (vr::Result<std::vector<vr::volume::BlockIndex>> all =
+                   grid_->map().compact_active_blocks();
+               !all) {
       survey_error = "dirty survey (compact): " + all.status().message();
-    } else if (!stamps) {
-      survey_error = "dirty survey (stamps): " + stamps.status().message();
+    } else if (vr::Result<ChangedBlocks> sample =
+                   changed_since(*grid_, all.value(), survey_tick_);
+               !sample) {
+      survey_error = "dirty survey (stamps): " + sample.status().message();
     } else {
-      const ChangedBlocks sample = changed_since(
-          all.value(), stamps.value(),
-          static_cast<std::uint32_t>(grid_->grid().voxels_per_block),
-          survey_tick_);
       active = static_cast<std::uint32_t>(all.value().size());
-      changed = sample.changed;
-      to_remesh = sample.remesh;
+      changed = sample.value().changed;
+      to_remesh = sample.value().remesh;
       sampled = true;
     }
     const float survey_ms = ms_since(t_survey);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // Published either way: what the survey cost is worth knowing most on the
-      // frame where it failed, since a failure still paid for the compaction.
+      // frame where it failed, since a failure can still have paid for the
+      // compaction and the stamp readback.
       stats_.survey_ms = survey_ms;
       if (sampled) {
         stats_.survey_active_blocks = active;
         stats_.survey_changed_blocks = changed;
         stats_.survey_remesh_blocks = to_remesh;
-        // Measured from the last re-arm, not assumed to be the cadence: see
-        // FusionStats::survey_window_frames.
+        // Measured from the previous survey, not assumed to be the cadence:
+        // see FusionStats::survey_window_frames.
         stats_.survey_window_frames =
             stats_.frames_fused - survey_window_start_;
         stats_.survey_first_window = survey_window_start_ == 0;
@@ -1243,19 +1294,21 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         stats_.frames_since_survey = 0;
         stats_.survey_stale = false;
       } else {
-        // Counted and named, like every other stage in this function. These two
-        // calls were the only fallible ones here that reported nothing at all
-        // -- and the read-out's gate on the survey is a one-way latch, so a
-        // survey that fails from here on leaves its last good sample on screen
-        // forever. See FusionStats::frames_since_survey.
+        // Counted and named, like every other stage in this function. The
+        // survey's calls were once the only fallible ones here that reported
+        // nothing at all -- and the read-out's gate on the survey is a one-way
+        // latch, so a survey that fails from here on leaves its last good
+        // sample on screen forever. See FusionStats::frames_since_survey.
         ++stats_.errors;
         stats_.last_error = survey_error;
       }
     }
     // A new window every survey, so each sample is ONE window's changes rather
     // than everything since the scan began -- on the failure path too, so a
-    // failed sample costs one window rather than doubling the next.
+    // failed sample costs one window rather than doubling the next, and a
+    // topology refusal clears with the window it happened in.
     survey_tick_ = tick;
+    survey_epoch_ = epoch;
     survey_window_start_ = stats_.frames_fused;
   }
 }

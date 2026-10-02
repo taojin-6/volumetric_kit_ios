@@ -744,10 +744,12 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
             : VolumetricStatToneNeutral);
     // The two rows the measurement mode exists to produce, and without which it
     // cannot be told from the thing it is measured against. recon falls back to
-    // a full extract silently and by design -- a topology change, a grown
-    // arena, flags it will not vouch for -- so "did this call re-mesh only the
-    // changed blocks" is reported rather than inferred. `dispatches` on the row
-    // above reads 1 on both paths and cannot answer it.
+    // a full extract silently and by design -- the first extract against a
+    // grid, an iso change, a remove or clear, an arena that grows or has
+    // drifted too far past its surface, a preceding culled extract -- so "did
+    // this call re-mesh only the changed blocks" is reported rather than
+    // inferred. `dispatches` on the row above reads 1 on both paths and cannot
+    // answer it.
     //
     // Shown only when the mode is on, because on the normal path `incremental`
     // is false by construction and a permanent "full" row is noise.
@@ -1037,10 +1039,16 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       // A row rather than a missing card -- a card that simply is not there
       // reflows the grid the moment one lands. But *which* row, because the
       // gate is a one-way latch and a single neutral "no sample yet" was the
-      // sole output for two states that want different responses. After the
-      // first window has had time to land and has not, the surveys are
-      // failing, which used to read as the neutral first-window state forever.
-      if (s.frames_fused < app::kSurveyStaleAfter) {
+      // sole output for three states that want three different responses.
+      //
+      // Under the measurement mode the survey never runs at all: the block in
+      // `Fusion::fuse` is gated on `!incremental_benchmark`, so nothing is
+      // failing and nothing is coming. After the first window has had time to
+      // land and has not, the surveys are failing, which used to read as the
+      // neutral first-window state forever.
+      if (s.incremental_benchmark) {
+        add(r, @"survey", @"not run under the measurement mode");
+      } else if (s.frames_fused < app::kSurveyStaleAfter) {
         add(r, @"survey", @"no sample yet");
       } else {
         add(r, @"survey",
@@ -1122,11 +1130,13 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       //
       // The one figure on this card that is NOT from the sample above it.
       // `survey_ms` is published on every attempt, including the failed ones --
-      // deliberately, since a failure still paid for the compaction -- while
-      // the three rows above refresh only when one succeeds. Unlabelled, a
-      // failing survey's partial time (the compaction alone; the O(num_blocks)
-      // host scan and the dilation walk never ran) sat under three rows
-      // describing a sample from four seconds earlier and read as its cost.
+      // deliberately, since a failure can still have paid for the compaction
+      // and the stamp readback -- while the three rows above refresh only when
+      // one succeeds. Unlabelled, a failing survey's partial time (whatever
+      // ran before the failure: nothing at all for a topology refusal, the
+      // compaction, or that and part of the stamp readback; never the dilation
+      // walk) sat under three rows describing a sample from four seconds
+      // earlier and read as its cost.
       add(r, @"cost",
           s.survey_stale ? fmt("%.2f ms  (last attempt)", s.survey_ms)
                          : fmt("%.2f ms", s.survey_ms),

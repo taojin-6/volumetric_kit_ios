@@ -317,6 +317,12 @@ struct FusionConfig {
   /// recon's integrator writes on every fuse, which the extractor reads against
   /// the tick of its own last extract.
   ///
+  /// It also stands the dirty survey down. Not for correctness -- the survey
+  /// keeps a tick of its own -- but because its two fence waits would land on
+  /// the fuse thread this mode times, and the frames dropped meanwhile would
+  /// inflate the next `remeshed_blocks`. See the survey's gate in
+  /// @ref Fusion::fuse.
+  ///
   /// It **does not publish a mesh**, and that is what makes one slot safe
   /// rather than the hazard @ref mesh_slots exists to refuse: nothing borrows
   /// the extractor's buffers, so nothing is drawing an arena the next extract
@@ -864,8 +870,11 @@ struct FusionStats {
   ///
   /// Surveyed periodically, because one survey costs a full active-set
   /// compaction (a dispatch, a fence wait and a readback of the whole set), a
-  /// readback of every block slot's stamps, and an O(active) dilation walk.
-  /// @ref survey_ms is what that actually came to.
+  /// second fence-waited readback of every block slot's stamps (12 bytes a
+  /// slot, free ones included), and an O(active) dilation walk.
+  /// @ref survey_ms is what that actually came to. Not surveyed at all under
+  /// @ref FusionConfig::incremental_benchmark, whose fuse thread that cost
+  /// would land on.
   std::uint32_t survey_active_blocks = 0;
   /// Blocks the fuse actually CHANGED in the window -- not "was dispatched"
   /// (the dispatch covers every active block and returns early for most) and
@@ -1382,6 +1391,10 @@ class Fusion {
   // construction; see FusionStats::survey_first_window.
   std::uint64_t survey_window_start_ = 0;
   std::uint32_t survey_tick_ = 0;
+  // The map's topology_epoch() when the window opened. A remove or clear moves
+  // it, and the next survey then refuses rather than counting stamps that
+  // cannot see what the remove left to re-mesh; see the survey in `fuse`.
+  std::uint64_t survey_epoch_ = 0;
   // The same idea for the incremental extract: `stats_.frames_fused` at the
   // last one, whose tick recon's extractor keeps itself. Separate from the
   // survey's, since the two run on cadences of their own. Published as
