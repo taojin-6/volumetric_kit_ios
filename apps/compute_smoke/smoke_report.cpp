@@ -523,9 +523,9 @@ void stage_vertical_slice(Report& report, vr::Device& device,
   }
   mesh::MarchingCubes mc = std::move(mc_result).value();
 
-  vr::Result<mesh::Mesh> extracted = mc.extract(vbg);
+  vr::Result<mesh::Mesh> extracted = mc.extract_host(vbg);
   if (!extracted) {
-    report.abort_stage("extract: " + extracted.status().message());
+    report.abort_stage("extract_host: " + extracted.status().message());
     return;
   }
   const std::size_t triangles = extracted.value().indices.size() / 3;
