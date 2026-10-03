@@ -2,6 +2,9 @@
 build*/
 DerivedData/
 
+# Local task worktrees; see AGENTS.md.
+/.worktrees/
+
 # MoltenVK is fetched, not vendored: a 34 MB upstream binary artifact with a
 # stable release URL. tools/fetch_moltenvk.sh populates this.
 #
