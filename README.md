@@ -9,6 +9,10 @@ This repo holds only what is genuinely iOS: the cross-compilation toolchain, the
 app targets, and the Xcode packaging. The libraries stay independent siblings —
 neither needed a single source change to build for iOS.
 
+[AGENTS.md](AGENTS.md) is the shared working guide for Codex and Claude Code;
+`CLAUDE.md` imports it. Use its task map for the relevant build, architecture,
+and platform sections below.
+
 ## Why there is a repo here at all
 
 The family's rule is that `recon` and `gfx` each build and release on their own.
