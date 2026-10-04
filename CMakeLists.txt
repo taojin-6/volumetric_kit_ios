@@ -142,11 +142,16 @@ if(NOT VI_IOS)
   return()
 endif()
 
+# recon and gfx are pinned by commit, and adopted deliberately: a PR bumps a
+# pin, and CI builds exactly that pair. Tracking `main` let an upstream change
+# break this build with no commit here -- and the family's shared core is about
+# to change both siblings' Status (volumetric_kit_core's DECISIONS.md,
+# "Consumers pin"). A commit hash rules out GIT_SHALLOW, which takes only a
+# branch or tag.
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG main
-  GIT_SHALLOW TRUE)
+  GIT_TAG a6a5e43781182df69d9b7fbd77f09dc7ccb57ebe) # main, 2026-10-03
 
 # recon's VR_BUILD_EXAMPLES / VR_BUILD_TESTS default to PROJECT_IS_TOP_LEVEL, so
 # a fetched copy builds the library tiers only -- no gtest, no example
@@ -163,8 +168,7 @@ FetchContent_MakeAvailable(volumetric_kit_recon)
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG main
-  GIT_SHALLOW TRUE)
+  GIT_TAG e15aed44b382597185d6c36b0293e1c93468ec29) # main, 2026-10-03
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)

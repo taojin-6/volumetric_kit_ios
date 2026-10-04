@@ -97,9 +97,10 @@ cmake --build "$ios_root/build-ios" --config Debug -- \
 
 ## Dependency and documentation upkeep
 
-- recon and gfx are consumed through moving `main` refs. CI's dependency cache
-  must account for both resolved commits; do not claim a cached build tested
-  newer sibling sources without verifying what it used.
+- recon and gfx are pinned by commit in `CMakeLists.txt`. Adopt upstream
+  changes by bumping a pin in its own PR, and say which commits the build used.
+  When recon and gfx depend on `volumetric_kit_core`, declare the core first so
+  both build against one pinned copy (the core's README).
 - Local sibling source overrides use CMake's
   `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON` / `_VOLUMETRIC_KIT_GFX` options;
   keep machine-specific paths out of committed build configuration.

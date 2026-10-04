@@ -50,40 +50,16 @@ jobs:
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
         run: tools/fetch_moltenvk.sh
 
-      # recon and gfx are both declared with GIT_TAG main -- moving refs, not
-      # pins. So CMakeLists.txt is byte-identical when either advances, and
-      # hashing it alone would hold the cache key steady at exactly the moment
-      # the cached sources went stale. Resolve both tips and fold them into the
-      # key.
-      #
-      # Both, not just recon: a key covering one sibling still goes stale when
-      # the other moves, and an exact hit on a stale key is worse than a miss --
-      # FetchContent will not re-clone over a populated _deps, so the build
-      # compiles the pre-drift sources and reports green. That is not
-      # hypothetical; gfx's HybridMeshDraw rename (#8) would have sailed through
-      # on a gfx-only day and was caught only because recon happened to move the
-      # same day and force a clean miss.
-      #
-      # Deps that really are pinned (glm at 1.0.3) stay covered by the hash.
-      - name: Resolve moving sibling refs
-        id: pins
-        run: |
-          set -euo pipefail
-          for repo in recon gfx; do
-            url="https://github.com/taojin-6/volumetric_kit_${repo}.git"
-            sha=$(git ls-remote "${url}" main | cut -f1)
-            test -n "${sha}"
-            echo "${repo}=${sha}" >>"${GITHUB_OUTPUT}"
-            echo "volumetric_kit_${repo} main is at ${sha}"
-          done
-
+      # Every FetchContent dependency is pinned in CMakeLists.txt -- recon and
+      # gfx by commit, glm by tag -- so hashing that file keys the cache on
+      # exactly the sources a run compiles: a pin bump changes the hash and
+      # forces a clean miss. (Before the siblings were pinned, they tracked
+      # `main`, and a step folded both resolved tips into this key.)
       - name: Cache FetchContent dependencies
         uses: actions/cache@v6
         with:
           path: build-ios/_deps
-          key: >-
-            deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}-${{
-            steps.pins.outputs.recon }}-${{ steps.pins.outputs.gfx }}
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
           # No restore-keys, deliberately. A partial hit would restore the
           # source tree from before the ref moved, and FetchContent does not
           # reliably re-clone over an already-populated _deps -- so the build

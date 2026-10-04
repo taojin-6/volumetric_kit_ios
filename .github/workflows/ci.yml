@@ -7,15 +7,12 @@ name: ci
 # never silently leaves an old required context unreported and blocking every
 # PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
 #
-# No scheduled trigger, deliberately. CMakeLists.txt tracks volumetric_kit_recon
-# and volumetric_kit_gfx at `main`, not a fixed tag, so an upstream change can
-# break the iOS cross-compile with no commit here -- and a nightly reported that
-# as a red `main` every morning, on days with no work queued against it, until
-# someone got to it. The breakage is still caught; it is caught on the next
-# push/PR, when there is a change in hand to fix it against. What a trigger
-# cannot do is remove the drift itself -- only pinning the siblings to a SHA
-# does that, at the cost of adopting upstream deliberately rather than
-# continuously.
+# No scheduled trigger: nothing changes between commits here. CMakeLists.txt
+# pins volumetric_kit_recon and volumetric_kit_gfx by commit, so an upstream
+# change reaches this build only through a PR that bumps a pin -- adopted
+# deliberately, with a change in hand to fix it against. (They used to track
+# `main`, and a nightly then reported upstream drift as a red `main` on mornings
+# with no work queued against it.)
 on:
   push:
     branches: [main]

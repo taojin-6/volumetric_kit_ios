@@ -155,14 +155,18 @@ that no longer compiles, all of which happened while standing this repo up. A
 final step asserts each bundle is really iOS arm64 (`LC_BUILD_VERSION`
 `platform 2`), since a host-vs-target mixup would otherwise pass silently.
 
-It runs on push and pull request only — there is **no scheduled run**. recon is
-consumed at `GIT_TAG main` rather than a fixed tag, so the sibling breakage above
-arrives on upstream's schedule, not on ours; a nightly turned that into a red
-`main` on mornings with no work queued against it, so drift is now surfaced by
-the next push here instead, when there is a change in hand to fix it against. The
-dependency cache is still keyed on recon's resolved tip commit and carries no
-`restore-keys`: a key that ignored the moving ref would go on hitting a pre-drift
-source tree and report green against stale sources.
+It runs on push and pull request only — there is **no scheduled run**. recon and
+gfx are pinned by commit in `CMakeLists.txt`, so sibling changes arrive only when
+a PR here bumps a pin, and CI builds exactly that pair. The dependency cache is
+keyed on the hash of `CMakeLists.txt`, which holds every pin, and carries no
+`restore-keys`, so a bumped pin always re-fetches.
+
+Until 2026-10-03 the siblings were consumed at `GIT_TAG main`. Upstream breakage
+then arrived on upstream's schedule, with no commit here to fix it against, and
+a nightly reported it as a red `main`. Pinning ends that drift at the cost of
+adopting upstream deliberately; it also lets the family's shared
+`volumetric_kit_core` change recon's and gfx's `Status` without breaking this
+build mid-migration.
 
 ## Language split
 
