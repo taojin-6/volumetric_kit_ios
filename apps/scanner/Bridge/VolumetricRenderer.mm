@@ -149,10 +149,17 @@ namespace {
 //
 // Deliberately not in Bridge/MemoryQuery: that file reads the jetsam ledger
 // through Mach and stays plain C++, and these are separate subsystems that
-// scanner.entitlements is explicit about keeping apart. Read from Metal rather
-// than from VMA's HeapStats::budget_bytes, which is a heuristic until
-// VK_EXT_memory_budget is enabled -- an open TODO in both sibling libraries,
-// and exactly the kind of estimate this read-out exists to stop relying on.
+// scanner.entitlements is explicit about keeping apart.
+//
+// It is also now where allocation stops, not only a figure to watch. The
+// core's Device enables VK_EXT_memory_budget wherever it is offered, and its
+// Allocator refuses new device memory past a heap's budget. MoltenVK 1.4.2
+// reports this value as the unified heap's budget on iOS 16+, against
+// `currentAllocatedSize` as its usage (read off the linked libMoltenVK.a), so
+// recon's and gfx's allocations fail as over-budget when Metal's total would
+// cross it -- a `vkc::Status` on the stage that asked, not a jetsam. Read from
+// Metal rather than from the allocators' HeapStats all the same: the same
+// number, without needing a device to exist.
 //
 // Cached: iOS has one GPU and this value does not move, so the device is
 // created once rather than at the polling rate. `recommendedMaxWorkingSetSize`
@@ -268,6 +275,14 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // linked MoltenVK does not.
   shared_config.instance.extensions = {VK_KHR_SURFACE_EXTENSION_NAME,
                                        VK_EXT_METAL_SURFACE_EXTENSION_NAME};
+  // Object names and command labels in Debug only. recon labels its kernel
+  // dispatches, and MoltenVK turns each label into a Metal debug group and
+  // each name into a Metal label, captured or not. An Xcode GPU capture is
+  // what reads them -- worth it while developing, not in a Release build,
+  // which the app's own bootstrap never enabled them in.
+#ifdef NDEBUG
+  shared_config.instance.request_debug_utils = false;
+#endif
   // Neither library is consulted about the other: each states its needs, and
   // the shared device satisfies the union. gfx presents; recon computes.
   shared_config.compute = vr::device_requirements();
@@ -354,9 +369,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   vkc::Result<vkc::Allocator> recon_allocator = vkc::Allocator::create(
       _impl->shared->instance().handle(), *_impl->recon_device);
   if (!recon_allocator) {
-    // The vkc::Status overload, not a flatten through vkc::Status::unsupported:
-    // an allocator failure on a user's phone is out-of-memory or a VkResult,
-    // and reporting it as "unsupported" reads as a capability the driver lacks.
+    // Its own Status, unflattened: an allocator failure on a user's phone is
+    // out-of-memory or a VkResult, and reporting it as "unsupported" would read
+    // as a capability the driver lacks.
     app::set_error(error, recon_allocator.status(), "recon Allocator::create");
     return nil;
   }
@@ -729,15 +744,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
           // be recorded inside a render pass instance, and this build ships
           // without the validation layer that would say so. See the
           // precondition on record_atlas_upload.
-          app::record_atlas_upload(
-              f.cmd, slot.staging.handle(), slot.texture.handle(),
-              _impl->atlas.width, _impl->atlas.height,
-              _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot]);
-          // Two flags, deliberately: the image has now been written, so it is
-          // no longer in UNDEFINED and never will be again until the ring is
-          // rebuilt -- while `slot_written`, which is about bindability, gets
-          // cleared below for reasons that leave the layout exactly as it is.
-          _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot] = false;
+          app::record_atlas_upload(f.cmd, slot.staging.handle(), slot.texture);
+          // Two records, deliberately: the image's own layout, which the upload
+          // just moved out of UNDEFINED for good until the ring is rebuilt --
+          // and `slot_written`, which is about bindability and gets cleared
+          // below for reasons that leave the layout exactly as it is.
           _impl->atlas.slot_written[_impl->mesh_slot] = true;
         } else if (_impl->atlas.ready) {
           // A textured mesh whose keyframe could not be staged. Skipping the
@@ -1386,7 +1397,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // gfx idles only the queues it was assigned, and recon's Device exposes no
   // wait at all -- so on a two-family plan recon's queue is one nobody else
   // would ever drain. The bootstrap owns them both and waits on both.
-  _impl->shared->wait_idle();
+  if (_impl->shared) {
+    _impl->shared->wait_idle();
+  }
 }
 
 - (NSString*)deviceName {
@@ -1402,11 +1415,14 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (NSString*)sharedDeviceSummary {
+  if (!_impl->shared) {
+    return @"";
+  }
   return app::to_ns_string(_impl->shared->summary());
 }
 
 - (BOOL)sharesOneDevice {
-  if (!_impl->app.valid() || !_impl->recon_device) {
+  if (!_impl->shared || !_impl->app.valid() || !_impl->recon_device) {
     return NO;
   }
   const VkDevice bootstrap = _impl->shared->device();

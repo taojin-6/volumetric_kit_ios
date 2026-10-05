@@ -108,8 +108,10 @@ cmake --build "$ios_root/build-ios" --config Debug -- \
   against one pinned copy (the core's README); bump it with, or at or after,
   recon's and gfx's core pins.
 - Local sibling source overrides use CMake's
-  `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON` / `_VOLUMETRIC_KIT_GFX` options;
-  keep machine-specific paths out of committed build configuration.
+  `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON` / `_VOLUMETRIC_KIT_GFX` /
+  `_VOLUMETRIC_KIT_CORE` options; a local recon or gfx needing a newer core
+  needs the core override too. Keep machine-specific paths out of committed
+  build configuration.
 - Keep shared rules here concise (roughly 100–200 lines). Detailed build,
   architecture, and platform rationale belong in the relevant README section
   or a dedicated supporting document, linked from the task map.

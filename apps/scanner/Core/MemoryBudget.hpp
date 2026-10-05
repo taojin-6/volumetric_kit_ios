@@ -46,8 +46,10 @@ namespace volumetric_kit::ios_app {
 ///       - The **GPU working set** (`MTLDevice.recommendedMaxWorkingSetSize`,
 ///         two thirds of physical RAM on this hardware) is *lower* than the
 ///         jetsam ceiling, and the voxel grid and mesh arenas are Metal buffers
-///         charged against it. `VolumetricRenderer` reads that one separately
-///         and prints it directly beneath this reading; see
+///         charged against it. The core's allocators refuse new memory past
+///         it (MoltenVK reports it as the heap budget), so reaching it
+///         surfaces as a `vkc::Status` too. `VolumetricRenderer` reads that
+///         one separately and prints it directly beneath this reading; see
 ///         `scanner.entitlements`.
 ///       - **Virtual address space**, lifted by
 ///         `com.apple.developer.kernel.extended-virtual-addressing`, which this

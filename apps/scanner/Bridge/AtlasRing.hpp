@@ -106,29 +106,23 @@ struct AtlasRing {
   /// Whether @ref slots hold real images yet; until then every frame binds the
   /// 1x1 white set.
   bool ready = false;
-  /// Which slots may be *bound*. Not a statement about image layout -- see
-  /// @ref slot_in_undefined_layout, which is.
+  /// Which slots may be *bound*. Not a statement about image layout: each
+  /// slot's `texture.layout()` is that, recorded by @ref record_atlas_upload.
   ///
   /// Cleared whenever a slot must stop being bindable for a reason that leaves
   /// its image exactly as it was: a keyframe that could not be staged, or
   /// `drawMesh` switched off while meshes keep arriving. A slot that is not
   /// bindable binds the 1x1 white set instead, which is wrong-looking and
   /// honest rather than a plausible photograph of somewhere else.
-  bool slot_written[kRingSlots] = {};
-  /// Which slots are still in `VK_IMAGE_LAYOUT_UNDEFINED` -- never uploaded
-  /// since their image was created.
   ///
-  /// Separate from @ref slot_written, and not interchangeable with it even
-  /// though the two start out equal. That one is a bindability flag and is
-  /// cleared for reasons that do not touch the image, so deriving
-  /// `first_write` from it eventually claims UNDEFINED for an image sitting in
-  /// `SHADER_READ_ONLY_OPTIMAL`. Legal in itself -- UNDEFINED merely discards
-  /// contents -- but it also drops the upload barrier's source scope to
-  /// `TOP_OF_PIPE` with an empty access mask, deleting the dependency on the
-  /// fragment-shader read that @ref record_atlas_upload's barrier exists to
-  /// order. Only @ref build_atlas_ring sets this, because only it creates
-  /// images; only a completed upload clears it.
-  bool slot_in_undefined_layout[kRingSlots] = {};
+  /// Not interchangeable with the layout even though the two start out equal.
+  /// Treating an unbindable slot as unwritten eventually claims UNDEFINED for
+  /// an image sitting in `SHADER_READ_ONLY_OPTIMAL`. Legal in itself --
+  /// UNDEFINED merely discards contents -- but it also drops the upload
+  /// barrier's source scope to `TOP_OF_PIPE` with an empty access mask,
+  /// deleting the dependency on the fragment-shader read that
+  /// @ref record_atlas_upload's barrier exists to order.
+  bool slot_written[kRingSlots] = {};
 };
 
 /// @brief The staging-buffer size for a @p width x @p height keyframe, and the
@@ -156,22 +150,18 @@ constexpr VkDeviceSize atlas_staging_bytes(std::uint32_t width,
 /// @param cmd          The frame's command buffer, recording, and outside any
 ///                     render pass instance -- see the precondition below.
 /// @param staging      A mapped host-visible buffer holding at least
-///                     @ref atlas_staging_bytes bytes for @p width x @p height,
+///                     @ref atlas_staging_bytes bytes for @p image's extent,
 ///                     already filled with the keyframe.
-/// @param image        The slot's image, created `TRANSFER_DST | SAMPLED` at
-///                     exactly @p width x @p height, one mip and one layer.
-/// @param width        The keyframe's width, which must equal the image's.
-/// @param height       The keyframe's height, which must equal the image's.
-/// @param first_write  True when @p image has never been written, so it is
-///                     still in `VK_IMAGE_LAYOUT_UNDEFINED`. Naming the wrong
-///                     old layout is undefined rather than diagnosed here --
-///                     this build ships without validation layers -- and
-///                     UNDEFINED is also the correct choice on a first write
-///                     for the reason it exists: its contents need not be
-///                     preserved, so the driver may discard rather than move
-///                     them. Take it from `AtlasRing::slot_in_undefined_layout`
-///                     and not from `slot_written`, which answers a different
-///                     question; that member says why.
+/// @param image        The slot's image, created `TRANSFER_DST | SAMPLED`, one
+///                     mip and one layer. Its recorded layout is the barrier's
+///                     old layout, and it records `SHADER_READ_ONLY_OPTIMAL`
+///                     on return. Still UNDEFINED means never written, and
+///                     UNDEFINED is also the correct old layout then for the
+///                     reason it exists: the contents need not be preserved,
+///                     so the driver may discard rather than move them. A wrong
+///                     record is undefined rather than diagnosed here -- this
+///                     build ships without validation layers -- so transition
+///                     the image only through this function.
 ///
 /// @pre @p cmd is **outside a render pass instance**. `vkCmdCopyBufferToImage`
 ///      is an outside-only command, so recording this below the frame's
@@ -181,9 +171,8 @@ constexpr VkDeviceSize atlas_staging_bytes(std::uint32_t width,
 ///      than as an error. The renderer satisfies this by position, uploading
 ///      above `begin` while nearly every other `vkCmd*` in that file is below
 ///      it, so a new caller has nothing local to copy.
-void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
-                         std::uint32_t width, std::uint32_t height,
-                         bool first_write);
+void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
+                         vkc::Image& image);
 
 /// @brief Give every atlas slot a real image at the colour camera's size.
 ///

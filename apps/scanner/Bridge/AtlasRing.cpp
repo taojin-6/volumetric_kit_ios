@@ -14,18 +14,21 @@ namespace volumetric_kit::ios_app {
 
 namespace vg = volumetric_kit::gfx;
 
-void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
-                         std::uint32_t width, std::uint32_t height,
-                         bool first_write) {
+void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
+                         vkc::Image& image) {
+  // Never written since it was created: no read to order against, and no
+  // contents to preserve.
+  const bool first_write = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED;
+
   // gfx's helper rather than a hand-rolled VkImageMemoryBarrier: it owns the
   // sType, the two VK_QUEUE_FAMILY_IGNORED defaults (a mistyped real family
   // index here is a silent ownership transfer on a build with no validation
   // layers) and the whole-image subresource range, and it is unit-tested
   // upstream where this was not tested at all. It also carries the one
-  // diagnostic this path had none of: `cmd_image_barrier` VG_CHECKs that
+  // diagnostic this path had none of: `cmd_image_barrier` checks that
   // new_layout is not UNDEFINED, with file and line, in every build.
   vg::ImageBarrierDesc to_dst;
-  to_dst.image = image;
+  to_dst.image = image.handle();
   // The source scope is the FRAGMENT shader, not TOP_OF_PIPE: the previous
   // frame that bound this slot sampled it there, and this copy must not begin
   // until that read has finished. The slot ring makes that frame an old one in
@@ -38,8 +41,7 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   to_dst.dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
   to_dst.src_access = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
   to_dst.dst_access = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_dst.old_layout = first_write ? VK_IMAGE_LAYOUT_UNDEFINED
-                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  to_dst.old_layout = image.layout();
   to_dst.new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   vg::cmd_image_barrier(cmd, to_dst);
 
@@ -54,12 +56,12 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   region.bufferImageHeight = 0;
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.imageOffset = {0, 0, 0};
-  region.imageExtent = {width, height, 1};
-  vkCmdCopyBufferToImage(cmd, staging, image,
+  region.imageExtent = {image.width(), image.height(), 1};
+  vkCmdCopyBufferToImage(cmd, staging, image.handle(),
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
   vg::ImageBarrierDesc to_read;
-  to_read.image = image;
+  to_read.image = image.handle();
   to_read.src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
   to_read.dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
   to_read.src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -67,6 +69,9 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   to_read.old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   to_read.new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   vg::cmd_image_barrier(cmd, to_read);
+  // Recorded, so the next upload's barrier starts from here -- and so does
+  // anything else handed this image, which reads the same record.
+  image.set_layout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
@@ -163,10 +168,8 @@ vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
     ring.slots[i].set.write_combined_image_sampler(
         0, ring.slots[i].texture.view(), sampler,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Fresh images, so every slot is back in VK_IMAGE_LAYOUT_UNDEFINED and its
-    // first upload must transition from there rather than from
-    // SHADER_READ_ONLY_OPTIMAL.
-    ring.slot_in_undefined_layout[i] = true;
+    // Fresh images record VK_IMAGE_LAYOUT_UNDEFINED, so each slot's first
+    // upload transitions from there rather than from SHADER_READ_ONLY_OPTIMAL.
     // Not bindable either, which is a separate question with the same answer
     // right now: nothing has been written into these images yet, so binding one
     // would sample undefined contents. See where frame_info.atlas is chosen.

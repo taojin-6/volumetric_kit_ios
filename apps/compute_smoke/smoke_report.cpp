@@ -7,9 +7,9 @@
 // real driver on real hardware, in four stages that fail independently so a
 // late failure still leaves the earlier evidence on screen.
 //
-// Everything here is plain C++ against recon's public headers; nothing is
-// iOS-specific except that it happens to be running there. main.mm supplies the
-// app shell that displays the report.
+// Everything here is plain C++ against recon's and the core's public headers;
+// nothing is iOS-specific except that it happens to be running there. main.mm
+// supplies the app shell that displays the report.
 
 #include "smoke_report.hpp"
 
@@ -96,13 +96,14 @@ std::string api_version_string(std::uint32_t v) {
 // device later); is scalarBlockLayout there (recon's whole buffer ABI rests on
 // it); and are timeline semaphores there (the interop-seam handoff).
 //
-// IMPORTANT: this stage must NOT reuse recon's VkInstance. recon negotiates
-// VkApplicationInfo::apiVersion = 1.2 (it needs no more), and MoltenVK caps the
-// apiVersion a physical device *advertises* to what its instance asked for --
-// so querying through recon's instance can never report above 1.2 and would
-// make gfx's 1.3 floor look unsupported on hardware that in fact supports it.
-// The question here is "what can this GPU do", not "what did recon ask for", so
-// we probe through our own instance created at the implementation's maximum.
+// The version is read through a probe instance of its own, not the core's
+// instance the stages below run on. The core asks for Vulkan 1.3 (or the
+// loader's version when lower), and MoltenVK caps the apiVersion a physical
+// device *advertises* to what its instance asked for -- so through the core's
+// instance a 1.4 GPU reads 1.3. That still answers both floors checked here,
+// but the question is "what can this GPU do", not "what did the instance ask
+// for", so we probe through an instance created at the implementation's
+// maximum.
 struct ProbeInstance {
   VkInstance handle = VK_NULL_HANDLE;
   ~ProbeInstance() {
@@ -145,8 +146,10 @@ bool create_probe_instance(ProbeInstance& out, std::uint32_t api_version) {
   return vkCreateInstance(&ci, nullptr, &out.handle) == VK_SUCCESS;
 }
 
-void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
+void stage_device_caps(Report& report, const vkc::Instance& instance,
+                       VkPhysicalDevice instance_physical) {
   report.section("Stage 0: device capabilities");
+  const std::string asked = api_version_string(instance.api_version());
 
   // The instance-level ceiling: the most any instance on this implementation
   // may request.
@@ -157,7 +160,7 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   report.field("instance API ceiling", api_version_string(instance_version));
 
   ProbeInstance probe;
-  VkPhysicalDevice physical = recon_physical;
+  VkPhysicalDevice physical = instance_physical;
   bool probed = false;
   if (create_probe_instance(probe, instance_version)) {
     std::uint32_t count = 0;
@@ -173,8 +176,10 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   }
   report.field("capability source",
                probed ? "dedicated max-version probe instance"
-                      : "recon's 1.2 instance (probe failed; API version and "
-                        "1.3 features below are CAPPED and not conclusive)");
+                      : "the core's " + asked +
+                            " instance (probe failed; the API version below is "
+                            "capped at " +
+                            asked + ")");
 
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(physical, &props);
@@ -182,12 +187,13 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   report.field("Vulkan API", api_version_string(props.apiVersion));
   report.field("driver version", std::to_string(props.driverVersion));
 
-  // For contrast: what recon's own 1.2 instance sees. Expected to read 1.2 even
-  // on a 1.3+ device -- that is the cap described above, not a limitation.
-  VkPhysicalDeviceProperties recon_props{};
-  vkGetPhysicalDeviceProperties(recon_physical, &recon_props);
-  report.field("as advertised to recon's 1.2 instance",
-               api_version_string(recon_props.apiVersion));
+  // For contrast: what the core's instance sees, which the stages below run
+  // on. Expected to read 1.3 even on a 1.4 device -- that is the cap described
+  // above, not a limitation.
+  VkPhysicalDeviceProperties instance_props{};
+  vkGetPhysicalDeviceProperties(instance_physical, &instance_props);
+  report.field("as advertised to the core's " + asked + " instance",
+               api_version_string(instance_props.apiVersion));
 
   VkPhysicalDeviceVulkan12Features features12{};
   features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -553,18 +559,20 @@ std::string run_smoke_report() {
     report.abort_stage("Instance::create: " + instance.status().message());
     return report.text();
   }
-  // What recon's kernels need: a compute queue, timeline semaphores and
-  // scalar block layout, the ABI every recon shader declares.
-  const vkc::DeviceRequirements reqs = vr::device_requirements();
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance->select_physical_device(reqs);
+  // Any GPU, not one already filtered by recon's requirements: on hardware
+  // short of them, Stage 0's report of what it does have is the evidence this
+  // gate exists for, and Device::create below names the requirement it fails.
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu = instance->select_physical_device();
   if (!gpu) {
     report.abort_stage("select_physical_device: " + gpu.status().message());
     return report.text();
   }
 
-  stage_device_caps(report, gpu->handle());
+  stage_device_caps(report, instance.value(), gpu->handle());
 
+  // What recon's kernels need: a compute queue, timeline semaphores and
+  // scalar block layout, the ABI every recon shader declares.
+  const vkc::DeviceRequirements reqs = vr::device_requirements();
   vkc::Result<vkc::Device> device =
       vkc::Device::create(instance.value(), gpu.value(), reqs);
   if (!device) {

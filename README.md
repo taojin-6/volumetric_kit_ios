@@ -51,6 +51,11 @@ To build against a local checkout of a sibling instead of the pinned remote:
 -DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON=/path/to/volumetric_kit_recon
 ```
 
+The core is declared first, so its pin wins over the one a local recon or gfx
+names. A checkout that needs a newer core fails to configure or compile against
+this one; point the core at a matching checkout too, with
+`-DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_CORE=/path/to/volumetric_kit_core`.
+
 ### The measurement build
 
 `-DVI_INCREMENTAL_BENCHMARK=ON` builds the scanner as an instrument for recon's
@@ -129,7 +134,8 @@ pre-commit install     # once — formatting + hygiene hooks on every commit
 
 The hooks mirror the sibling repos — the same pinned `clang-format` (22.1.8),
 the same `cmake-format`, and the same rule that Vulkan is reached only through
-gfx's `core/vulkan.hpp` umbrella — plus two of this repo's own: `swift-format`
+the core's `volumetric_kit/core/vulkan/vulkan.hpp` umbrella — plus two of this
+repo's own: `swift-format`
 from the Xcode toolchain, and `shellcheck`.
 
 Two configuration notes specific to here:
@@ -236,6 +242,24 @@ shared queue. What stays here is what is the platform's:
 and makes the surface from the view's `CAMetalLayer` in the `make_surface`
 callback. The core requests portability enumeration only where a loader offers
 it, which the directly linked MoltenVK does not.
+
+Two behaviours come with the core's device that the app's own bootstrap did not
+have:
+
+- **Allocation stops at Metal's working set.** The core enables
+  `VK_EXT_memory_budget` wherever it is offered, and its `Allocator` refuses new
+  device memory past a heap's budget. MoltenVK 1.4.2 reports the unified heap's
+  budget on iOS 16+ as `MTLDevice.recommendedMaxWorkingSetSize` and its usage
+  as `currentAllocatedSize`, so a volume resize or mesh-arena allocation that
+  would take Metal past the working set now fails as an over-budget
+  `vkc::Status` on its stage, where before only jetsam stopped it. That is the
+  ceiling the read-out's GPU working-set row already shows. This comes from the
+  linked `libMoltenVK.a`; a long scan on a LiDAR device has yet to confirm
+  where it binds.
+- **Debug labels in Debug builds only.** The core's instance enables
+  `VK_EXT_debug_utils` by default, so recon's kernel labels and object names
+  reach an Xcode GPU capture as Metal debug groups and labels. A Release build
+  clears `request_debug_utils`, as the old bootstrap always did.
 
 ### `compute_smoke`
 
