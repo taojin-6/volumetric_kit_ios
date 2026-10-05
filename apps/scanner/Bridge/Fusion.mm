@@ -90,14 +90,15 @@ struct ChangedBlocks {
 /// helper nor a count, so the two are kept in step by hand: the guards, the
 /// slot rule and `tick_after` are recon's, and the early return and the
 /// `reserve` are this copy's own, neither of which changes the answer.
-vr::Result<ChangedBlocks> changed_since(
+vkc::Result<ChangedBlocks> changed_since(
     const vr::volume::VoxelBlockGrid& grid,
     const std::vector<vr::volume::BlockIndex>& active, std::uint32_t since) {
   const auto vpb = static_cast<std::uint32_t>(grid.grid().voxels_per_block);
   if (vpb == 0) {
-    return vr::Status::invalid_argument("changed_since: voxels_per_block is 0");
+    return vkc::Status::invalid_argument(
+        "changed_since: voxels_per_block is 0");
   }
-  vr::Result<std::vector<vr::volume::BlockStamp>> read =
+  vkc::Result<std::vector<vr::volume::BlockStamp>> read =
       grid.map().read_block_stamps();
   if (!read) {
     return read.status();
@@ -148,8 +149,8 @@ vr::Result<ChangedBlocks> changed_since(
 
 }  // namespace
 
-vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
-                         const FusionConfig& config) {
+vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
+                          const FusionConfig& config) {
   // Refused, not clamped, and refused here rather than trusted from the caller.
   // At one slot recon reuses a single arena in place and `release_through`
   // changes no behaviour -- so every DeviceMesh this class publishes would be
@@ -164,7 +165,7 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   // is still refused, whatever it calls itself. The refusal also cannot be
   // talked around by setting mesh_slots to 1.
   if (publishes_mesh(config) && config.mesh_slots < kMinMeshSlots) {
-    return vr::Status::invalid_argument(
+    return vkc::Status::invalid_argument(
         "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
         ", which switches recon's slot-release contract off; Published::mesh "
         "borrows the extractor's buffers, so it needs at least " +
@@ -188,7 +189,7 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   // a division is the ordinary way in. Both guards now refuse the same way: no
   // state touched, nothing to unwind.
   if (!set_occlusion_threshold(config.occlusion_threshold)) {
-    return vr::Status::invalid_argument(
+    return vkc::Status::invalid_argument(
         "FusionConfig::occlusion_threshold must be finite and >= 0");
   }
   config_ = config;
@@ -334,7 +335,7 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
       sizeof(float) + sizeof(float) + sizeof(std::uint32_t) ==
           static_cast<std::size_t>(kAttributeBytesPerVoxel),
       "kAttributeBytesPerVoxel and this AttributeSpec table disagree");
-  vr::Result<vr::volume::VoxelBlockGrid> made =
+  vkc::Result<vr::volume::VoxelBlockGrid> made =
       vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 3);
   if (!made) {
     return made.status();
@@ -345,14 +346,14 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   // nothing here.
   survey_epoch_ = grid_->map().topology_epoch();
 
-  vr::Result<vr::tsdf::TsdfIntegrator> integrator =
+  vkc::Result<vr::tsdf::TsdfIntegrator> integrator =
       vr::tsdf::TsdfIntegrator::create(device, allocator);
   if (!integrator) {
     return integrator.status();
   }
   integrator_.emplace(std::move(integrator).value());
 
-  vr::Result<vr::mesh::MarchingCubes> mc =
+  vkc::Result<vr::mesh::MarchingCubes> mc =
       vr::mesh::MarchingCubes::create(device, allocator, [&] {
         vr::mesh::MarchingCubesConfig mc_config;
         // The renderer binds these buffers as geometry rather than being handed
@@ -423,14 +424,14 @@ vr::Status Fusion::start(vr::Device& device, vr::Allocator& allocator,
   }
   marching_cubes_.emplace(std::move(mc).value());
 
-  vr::Result<vr::texture::ProjectiveTexturer> texturer =
+  vkc::Result<vr::texture::ProjectiveTexturer> texturer =
       vr::texture::ProjectiveTexturer::create(device, allocator);
   if (!texturer) {
     return texturer.status();
   }
   texturer_.emplace(std::move(texturer).value());
 
-  return vr::Status();
+  return vkc::Status();
 }
 
 void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
@@ -464,8 +465,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // nothing *and takes its untimed submit path* on a null. Passing the address
   // unconditionally would leave a per-dispatch query-pool round trip armed at
   // capture rate with no way to turn it off short of a rebuild.
-  vr::StageMetrics stages;
-  vr::StageMetrics* metrics = config_.measure_stages ? &stages : nullptr;
+  vkc::StageMetrics stages;
+  vkc::StageMetrics* metrics = config_.measure_stages ? &stages : nullptr;
   if (metrics != nullptr) {
     // Seeded so the table keeps its shape frame to frame. A row that appears
     // only when its stage ran makes every row below it jump, which is what
@@ -533,7 +534,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // the map itself, and does not depend on meshing having succeeded.
   float occupancy = 0.0f;
   bool occupancy_known = true;
-  if (vr::Result<float> lf = grid_->map().load_factor()) {
+  if (vkc::Result<float> lf = grid_->map().load_factor()) {
     occupancy = lf.value();
   } else {
     // A moved-from map is the only failure, and this class owns it -- so this
@@ -650,7 +651,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       break;
     case GrowthAction::Resize: {
       const std::int32_t grown_to = plan.grow_to;
-      const vr::Status grown = [&] {
+      const vkc::Status grown = [&] {
         // Its own row, because nothing else covers it. recon's `allocate` row
         // spans `allocate_from_depth`'s own dispatches and voxel_hash_map.hpp
         // says so where it documents that row, directing a caller to give a
@@ -659,7 +660,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         // toward the 32768-bucket ceiling commits ~1.5 GiB with ~2.3 GiB
         // transient, hundreds of milliseconds that would otherwise appear in no
         // row the read-out prints.
-        vr::StageScope span(metrics, kResizeStage);
+        vkc::StageScope span(metrics, kResizeStage);
         return grid_->resize(grown_to);
       }();
       if (grown) {
@@ -679,7 +680,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         // then skipped the allocate outright and announced a stopped scan on a
         // table that had just been given room. Another 4-byte read of the heap
         // counter.
-        if (vr::Result<float> after = grid_->map().load_factor()) {
+        if (vkc::Result<float> after = grid_->map().load_factor()) {
           occupancy = after.value();
         }
       } else {
@@ -710,9 +711,9 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
   vr::volume::AllocFailures failures;
-  vr::Result<std::uint32_t> overflow =
+  vkc::Result<std::uint32_t> overflow =
       table_exhausted
-          ? vr::Result<std::uint32_t>(0u)
+          ? vkc::Result<std::uint32_t>(0u)
           : grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
                                              &failures, metrics);
   // Whether this frame took no new geometry in, by either route. The guard
@@ -801,8 +802,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // Accumulates into the same `resize` row as the preemptive doubling above,
     // which is the honest total: both are the same operation at the same cost,
     // and a frame that reaches this loop has usually skipped that one.
-    const vr::Status grown = [&] {
-      vr::StageScope span(metrics, kResizeStage);
+    const vkc::Status grown = [&] {
+      vkc::StageScope span(metrics, kResizeStage);
       return grid_->resize(grown_to);
     }();
     if (!grown) {
@@ -835,7 +836,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // capacity from after them. Refreshed rather than left alone for the same
     // reason the preemptive path refreshes it: a ratio whose halves come from
     // opposite sides of a resize is wrong by exactly the factor it doubled.
-    if (vr::Result<float> lf = grid_->map().load_factor()) {
+    if (vkc::Result<float> lf = grid_->map().load_factor()) {
       occupancy = lf.value();
       occupancy_known = true;
     }
@@ -890,7 +891,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
   color.pixels = frame.color;
   color.cam = frame.color_camera;
   color.encoding = frame.color_encoding;
-  const vr::Status fused = integrator_->integrate(
+  const vkc::Status fused = integrator_->integrate(
       *grid_, frame.depth, frame.depth_camera, /*max_weight=*/5.0f,
       vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr,
       metrics);
@@ -1015,8 +1016,8 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // could see it. Reordering here rather than at either read-out keeps one
     // source: the bridge publishes the pipeline end to end, in order, and the
     // consumers keep drawing what they are handed.
-    const vr::StageRow* texture_row = nullptr;
-    for (const vr::StageRow& row : stages.rows()) {
+    const vkc::StageRow* texture_row = nullptr;
+    for (const vkc::StageRow& row : stages.rows()) {
       if (stats_.stage_count >= FusionStats::kMaxStages) {
         // Recorded rather than dropped in silence: a full array reads exactly
         // like a frame that happened to have this many rows, so a consumer
@@ -1066,7 +1067,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         return;
       }
       stats_.stages[stats_.stage_count++] =
-          vr::StageRow{name, cpu_ms, 0.0, false};
+          vkc::StageRow{name, cpu_ms, 0.0, false};
     };
     push_stage("extract", stats_.extract_ms);
     push_stage("  ..meshing", stats_.extract.dispatch_ms);
@@ -1168,7 +1169,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     // timestamps sums to the same 0.0 as a frame that dispatched nothing, and
     // only this flag separates them. Same rule the read-out follows when it
     // prints `gpu -` instead of `0.00`.
-    for (const vr::StageRow& row : stages.rows()) {
+    for (const vkc::StageRow& row : stages.rows()) {
       if (row.has_gpu) {
         sample.device_timing_valid = true;
         break;
@@ -1259,11 +1260,11 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       survey_error =
           "dirty survey: blocks were removed in this window, so the stamps do "
           "not cover every block a remove leaves to re-mesh";
-    } else if (vr::Result<std::vector<vr::volume::BlockIndex>> all =
+    } else if (vkc::Result<std::vector<vr::volume::BlockIndex>> all =
                    grid_->map().compact_active_blocks();
                !all) {
       survey_error = "dirty survey (compact): " + all.status().message();
-    } else if (vr::Result<ChangedBlocks> sample =
+    } else if (vkc::Result<ChangedBlocks> sample =
                    changed_since(*grid_, all.value(), survey_tick_);
                !sample) {
       survey_error = "dirty survey (stamps): " + sample.status().message();
@@ -1314,7 +1315,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
 }
 
 void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
-                    vr::StageMetrics* metrics) {
+                    vkc::StageMetrics* metrics) {
   // --- Hand the consumer's release to recon, on this thread -----------------
   //
   // `MarchingCubes::release_through` is not atomic, and its header makes
@@ -1385,7 +1386,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
   // incremental pass would be wrong -- the first one against this grid, a
   // topology change, a grown arena -- so this needs no first-frame special
   // case.
-  vr::Result<vr::mesh::DeviceMesh> device_mesh =
+  vkc::Result<vr::mesh::DeviceMesh> device_mesh =
       config_.incremental_benchmark
           ? marching_cubes_->extract_device_incremental(*grid_, 0.0f,
                                                         &extract_timings)
@@ -1463,7 +1464,7 @@ void Fusion::remesh(const vr::sensor::CapturedFrame& frame,
     // on, so the table keeps its shape across the frames between remeshes --
     // and across a remesh that returns early above, which is the ordinary
     // steady state rather than a fault.
-    const vr::Status textured =
+    const vkc::Status textured =
         texturer_->texture(device_mesh.value(), frame.depth, frame.depth_camera,
                            threshold, metrics);
     textured_ok = textured.ok();

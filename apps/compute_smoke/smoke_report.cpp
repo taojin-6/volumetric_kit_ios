@@ -7,9 +7,9 @@
 // real driver on real hardware, in four stages that fail independently so a
 // late failure still leaves the earlier evidence on screen.
 //
-// Everything here is plain C++ against recon's public headers; nothing is
-// iOS-specific except that it happens to be running there. main.mm supplies the
-// app shell that displays the report.
+// Everything here is plain C++ against recon's and the core's public headers;
+// nothing is iOS-specific except that it happens to be running there. main.mm
+// supplies the app shell that displays the report.
 
 #include "smoke_report.hpp"
 
@@ -19,19 +19,22 @@
 #include <vector>
 
 #include "fill_comp.spv.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/buffer.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/compute_pipeline.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/shader.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
-#include "volumetric_kit/recon/core/compute_pipeline.hpp"
-#include "volumetric_kit/recon/core/descriptor.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
-#include "volumetric_kit/recon/core/shader.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+
+namespace vkc = volumetric_kit::core;
 
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
@@ -93,13 +96,14 @@ std::string api_version_string(std::uint32_t v) {
 // device later); is scalarBlockLayout there (recon's whole buffer ABI rests on
 // it); and are timeline semaphores there (the interop-seam handoff).
 //
-// IMPORTANT: this stage must NOT reuse recon's VkInstance. recon negotiates
-// VkApplicationInfo::apiVersion = 1.2 (it needs no more), and MoltenVK caps the
-// apiVersion a physical device *advertises* to what its instance asked for --
-// so querying through recon's instance can never report above 1.2 and would
-// make gfx's 1.3 floor look unsupported on hardware that in fact supports it.
-// The question here is "what can this GPU do", not "what did recon ask for", so
-// we probe through our own instance created at the implementation's maximum.
+// The version is read through a probe instance of its own, not the core's
+// instance the stages below run on. The core asks for Vulkan 1.3 (or the
+// loader's version when lower), and MoltenVK caps the apiVersion a physical
+// device *advertises* to what its instance asked for -- so through the core's
+// instance a 1.4 GPU reads 1.3. That still answers both floors checked here,
+// but the question is "what can this GPU do", not "what did the instance ask
+// for", so we probe through an instance created at the implementation's
+// maximum.
 struct ProbeInstance {
   VkInstance handle = VK_NULL_HANDLE;
   ~ProbeInstance() {
@@ -142,8 +146,10 @@ bool create_probe_instance(ProbeInstance& out, std::uint32_t api_version) {
   return vkCreateInstance(&ci, nullptr, &out.handle) == VK_SUCCESS;
 }
 
-void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
+void stage_device_caps(Report& report, const vkc::Instance& instance,
+                       VkPhysicalDevice instance_physical) {
   report.section("Stage 0: device capabilities");
+  const std::string asked = api_version_string(instance.api_version());
 
   // The instance-level ceiling: the most any instance on this implementation
   // may request.
@@ -154,7 +160,7 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   report.field("instance API ceiling", api_version_string(instance_version));
 
   ProbeInstance probe;
-  VkPhysicalDevice physical = recon_physical;
+  VkPhysicalDevice physical = instance_physical;
   bool probed = false;
   if (create_probe_instance(probe, instance_version)) {
     std::uint32_t count = 0;
@@ -170,8 +176,10 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   }
   report.field("capability source",
                probed ? "dedicated max-version probe instance"
-                      : "recon's 1.2 instance (probe failed; API version and "
-                        "1.3 features below are CAPPED and not conclusive)");
+                      : "the core's " + asked +
+                            " instance (probe failed; the API version below is "
+                            "capped at " +
+                            asked + ")");
 
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(physical, &props);
@@ -179,12 +187,13 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
   report.field("Vulkan API", api_version_string(props.apiVersion));
   report.field("driver version", std::to_string(props.driverVersion));
 
-  // For contrast: what recon's own 1.2 instance sees. Expected to read 1.2 even
-  // on a 1.3+ device -- that is the cap described above, not a limitation.
-  VkPhysicalDeviceProperties recon_props{};
-  vkGetPhysicalDeviceProperties(recon_physical, &recon_props);
-  report.field("as advertised to recon's 1.2 instance",
-               api_version_string(recon_props.apiVersion));
+  // For contrast: what the core's instance sees, which the stages below run
+  // on. Expected to read 1.3 even on a 1.4 device -- that is the cap described
+  // above, not a limitation.
+  VkPhysicalDeviceProperties instance_props{};
+  vkGetPhysicalDeviceProperties(instance_physical, &instance_props);
+  report.field("as advertised to the core's " + asked + " instance",
+               api_version_string(instance_props.apiVersion));
 
   VkPhysicalDeviceVulkan12Features features12{};
   features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -245,23 +254,26 @@ void stage_device_caps(Report& report, VkPhysicalDevice recon_physical) {
 }
 
 // --- Stage 1: the compute chain end to end ----------------------------------
-void stage_compute_dispatch(Report& report, vr::Device& device,
-                            vr::Allocator& allocator) {
+void stage_compute_dispatch(Report& report, vkc::Device& device,
+                            vkc::Allocator& allocator) {
   report.section("Stage 1: compute dispatch");
 
   constexpr std::uint32_t kCount = 1024;
-  vr::BufferDesc buffer_desc;
+  vkc::BufferDesc buffer_desc;
   buffer_desc.size = kCount * sizeof(std::uint32_t);
   buffer_desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  buffer_desc.memory = vr::MemoryUsage::HostVisible;
-  buffer_desc.mapped = true;
-  vr::Result<vr::Buffer> buffer = allocator.create_buffer(buffer_desc);
+  // The kernel writes it and the host reads it back in place: device-mapped
+  // memory the host reads cached, which unified memory -- every iOS GPU --
+  // has. (A discrete GPU would refuse it and read back by a copy instead.)
+  buffer_desc.memory = vkc::MemoryUsage::DeviceMapped;
+  buffer_desc.host_access = vkc::HostAccess::Random;
+  vkc::Result<vkc::Buffer> buffer = allocator.create_buffer(buffer_desc);
   if (!buffer) {
     report.abort_stage("buffer create: " + buffer.status().message());
     return;
   }
 
-  vr::Result<vr::ShaderModule> shader = vr::ShaderModule::create(
+  vkc::Result<vkc::ShaderModule> shader = vkc::ShaderModule::create(
       device.handle(), reinterpret_cast<const std::uint32_t*>(vi_fill_comp_spv),
       vi_fill_comp_spv_size);
   if (!shader) {
@@ -274,8 +286,8 @@ void stage_compute_dispatch(Report& report, vr::Device& device,
   binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   binding.descriptorCount = 1;
   binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  vr::Result<vr::DescriptorSetLayout> layout =
-      vr::DescriptorSetLayout::create(device.handle(), &binding, 1);
+  vkc::Result<vkc::DescriptorSetLayout> layout =
+      vkc::DescriptorSetLayout::create(device.handle(), &binding, 1);
   if (!layout) {
     report.abort_stage("descriptor layout: " + layout.status().message());
     return;
@@ -284,13 +296,13 @@ void stage_compute_dispatch(Report& report, vr::Device& device,
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   pool_size.descriptorCount = 1;
-  vr::Result<vr::DescriptorPool> pool =
-      vr::DescriptorPool::create(device.handle(), &pool_size, 1, 1);
+  vkc::Result<vkc::DescriptorPool> pool =
+      vkc::DescriptorPool::create(device.handle(), &pool_size, 1, 1);
   if (!pool) {
     report.abort_stage("descriptor pool: " + pool.status().message());
     return;
   }
-  vr::Result<vr::DescriptorSet> set = pool.value().allocate(layout->handle());
+  vkc::Result<vkc::DescriptorSet> set = pool.value().allocate(layout->handle());
   if (!set) {
     report.abort_stage("descriptor set: " + set.status().message());
     return;
@@ -302,14 +314,14 @@ void stage_compute_dispatch(Report& report, vr::Device& device,
   push.offset = 0;
   push.size = sizeof(std::uint32_t);
   VkDescriptorSetLayout set_layout = layout->handle();
-  vr::ComputePipelineDesc pipeline_desc;
+  vkc::ComputePipelineDesc pipeline_desc;
   pipeline_desc.shader = &shader.value();
   pipeline_desc.set_layouts = &set_layout;
   pipeline_desc.set_layout_count = 1;
   pipeline_desc.push_ranges = &push;
   pipeline_desc.push_range_count = 1;
-  vr::Result<vr::ComputePipeline> pipeline =
-      vr::ComputePipeline::create(device.handle(), pipeline_desc);
+  vkc::Result<vkc::ComputePipeline> pipeline =
+      vkc::ComputePipeline::create(device.handle(), pipeline_desc);
   if (!pipeline) {
     report.abort_stage("compute pipeline: " + pipeline.status().message());
     return;
@@ -318,7 +330,7 @@ void stage_compute_dispatch(Report& report, vr::Device& device,
 
   const VkDescriptorSet descriptor_set = set->handle();
   const std::uint32_t count = kCount;
-  const vr::Status submitted =
+  const vkc::Status submitted =
       device.submit_single_time([&](VkCommandBuffer cmd) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                           pipeline->handle());
@@ -381,13 +393,13 @@ vol::VoxelGridParams smoke_grid_params() {
 // GL_EXT_scalar_block_layout; std430 would 16-byte-align the vec3 and shift
 // every field. If MoltenVK's iOS SPIR-V -> MSL translation got that wrong, the
 // coordinates written here would come back garbled.
-void stage_scalar_abi(Report& report, vr::Device& device,
-                      vr::Allocator& allocator) {
+void stage_scalar_abi(Report& report, vkc::Device& device,
+                      vkc::Allocator& allocator) {
   report.section("Stage 2: scalar block layout (host/GLSL ABI)");
 
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
-  vr::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
       device, allocator, smoke_grid_params(), attrs, 2);
   if (!grid_result) {
     report.abort_stage("VoxelBlockGrid::create: " +
@@ -405,7 +417,7 @@ void stage_scalar_abi(Report& report, vr::Device& device,
     b.coord = vr::Vec3i(i - 3, 2 * i + 1, -5 * i);
     blocks.push_back(b);
   }
-  vr::Result<std::uint32_t> overflow = vbg.map().allocate(
+  vkc::Result<std::uint32_t> overflow = vbg.map().allocate(
       blocks.data(), static_cast<std::uint32_t>(blocks.size()));
   if (!overflow) {
     report.abort_stage("allocate: " + overflow.status().message());
@@ -415,7 +427,7 @@ void stage_scalar_abi(Report& report, vr::Device& device,
                                           std::to_string(blocks.size()) +
                                           " blocks with no overflow");
 
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
   if (!active) {
     report.abort_stage("compact_active_blocks: " + active.status().message());
@@ -446,13 +458,13 @@ void stage_scalar_abi(Report& report, vr::Device& device,
 // A synthetic posed depth frame through the real spine:
 // allocate_from_depth -> TSDF integrate -> marching cubes. This is the shape
 // an ARKit frame will drive, with the frame's own depth in place of the plane.
-void stage_vertical_slice(Report& report, vr::Device& device,
-                          vr::Allocator& allocator) {
+void stage_vertical_slice(Report& report, vkc::Device& device,
+                          vkc::Allocator& allocator) {
   report.section("Stage 3: vertical slice (allocate -> fuse -> mesh)");
 
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
-  vr::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
       device, allocator, smoke_grid_params(), attrs, 2);
   if (!grid_result) {
     report.abort_stage("VoxelBlockGrid::create: " +
@@ -479,13 +491,13 @@ void stage_vertical_slice(Report& report, vr::Device& device,
   const std::vector<float> depth(
       static_cast<std::size_t>(cam.width) * cam.height, plane_z);
 
-  vr::Result<std::uint32_t> overflow =
+  vkc::Result<std::uint32_t> overflow =
       vbg.map().allocate_from_depth(depth.data(), cam);
   if (!overflow) {
     report.abort_stage("allocate_from_depth: " + overflow.status().message());
     return;
   }
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
   if (!active) {
     report.abort_stage("compact_active_blocks: " + active.status().message());
@@ -496,7 +508,7 @@ void stage_vertical_slice(Report& report, vr::Device& device,
                    " blocks from a " + std::to_string(cam.width) + "x" +
                    std::to_string(cam.height) + " depth frame");
 
-  vr::Result<tsdf::TsdfIntegrator> integ_result =
+  vkc::Result<tsdf::TsdfIntegrator> integ_result =
       tsdf::TsdfIntegrator::create(device, allocator);
   if (!integ_result) {
     report.abort_stage("TsdfIntegrator::create: " +
@@ -505,7 +517,7 @@ void stage_vertical_slice(Report& report, vr::Device& device,
   }
   tsdf::TsdfIntegrator integ = std::move(integ_result).value();
 
-  const vr::Status fused = integ.integrate(vbg, depth.data(), cam);
+  const vkc::Status fused = integ.integrate(vbg, depth.data(), cam);
   if (!fused) {
     report.abort_stage("integrate: " + fused.message());
     return;
@@ -514,7 +526,7 @@ void stage_vertical_slice(Report& report, vr::Device& device,
 
   // The plane sits at z = 0.5 m, so a zero crossing must exist and the
   // extracted surface must be non-empty.
-  vr::Result<mesh::MarchingCubes> mc_result =
+  vkc::Result<mesh::MarchingCubes> mc_result =
       mesh::MarchingCubes::create(device, allocator);
   if (!mc_result) {
     report.abort_stage("MarchingCubes::create: " +
@@ -523,7 +535,7 @@ void stage_vertical_slice(Report& report, vr::Device& device,
   }
   mesh::MarchingCubes mc = std::move(mc_result).value();
 
-  vr::Result<mesh::Mesh> extracted = mc.extract_host(vbg);
+  vkc::Result<mesh::Mesh> extracted = mc.extract_host(vbg);
   if (!extracted) {
     report.abort_stage("extract_host: " + extracted.status().message());
     return;
@@ -542,27 +554,33 @@ std::string run_smoke_report() {
   Report report;
   report.line("volumetric_kit_recon -- iOS / MoltenVK smoke");
 
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     report.abort_stage("Instance::create: " + instance.status().message());
     return report.text();
   }
-  vr::Result<VkPhysicalDevice> gpu = instance->select_physical_device();
+  // Any GPU, not one already filtered by recon's requirements: on hardware
+  // short of them, Stage 0's report of what it does have is the evidence this
+  // gate exists for, and Device::create below names the requirement it fails.
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu = instance->select_physical_device();
   if (!gpu) {
     report.abort_stage("select_physical_device: " + gpu.status().message());
     return report.text();
   }
 
-  stage_device_caps(report, gpu.value());
+  stage_device_caps(report, instance.value(), gpu->handle());
 
-  vr::Result<vr::Device> device =
-      vr::Device::create(instance->handle(), gpu.value(), {});
+  // What recon's kernels need: a compute queue, timeline semaphores and
+  // scalar block layout, the ABI every recon shader declares.
+  const vkc::DeviceRequirements reqs = vr::device_requirements();
+  vkc::Result<vkc::Device> device =
+      vkc::Device::create(instance.value(), gpu.value(), reqs);
   if (!device) {
     report.abort_stage("Device::create: " + device.status().message());
     return report.text();
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance->handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance->handle(), device.value());
   if (!allocator) {
     report.abort_stage("Allocator::create: " + allocator.status().message());
     return report.text();

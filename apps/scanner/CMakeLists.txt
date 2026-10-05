@@ -32,8 +32,7 @@ add_library(
   Bridge/Fusion.mm
   Bridge/MemoryQuery.cpp
   Bridge/Readout.mm
-  Bridge/RendererErrors.mm
-  Bridge/SharedDevice.mm)
+  Bridge/RendererErrors.mm)
 
 # ARC, selected by language rather than by a second copy of the source list.
 #
@@ -73,18 +72,19 @@ target_compile_options(scanner_bridge
 #
 # -Werror=switch is the load-bearing one. Bridge/AllocationStopDisplay.hpp and
 # Bridge/RendererErrors.hpp both promise that a value added upstream stops the
-# compile, and both siblings track main rather than a pin. As a bare warning
-# that promise is false: a new gfx or recon Status::Code links cleanly and
-# reports itself to Swift as VolumetricRendererErrorUnknown, and a new
+# compile -- the pin bump that brings it in, rather than a build that drifts. As
+# a bare warning that promise is false: a new core Status::Code links cleanly
+# and reports itself to Swift as VolumetricRendererErrorUnknown, and a new
 # AllocationStop cause reports a scan that has stopped taking geometry as a
 # healthy one on every rendering at once. Core/AllocationStop.cpp carries the
 # other half of the same guarantee and sets the same flags.
 target_compile_options(scanner_bridge PRIVATE -Wall -Wextra -Werror=switch)
 
 # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
-# VkMetalSurfaceCreateInfoEXT is declared. gfx's core/vulkan.hpp umbrella
-# deliberately includes no platform defines -- naming the platform is the
-# consumer's job, which is exactly this target.
+# VkMetalSurfaceCreateInfoEXT is declared. The core's
+# volumetric_kit/core/vulkan/vulkan.hpp umbrella deliberately includes no
+# platform defines -- naming the platform is the consumer's job, which is
+# exactly this target.
 target_compile_definitions(scanner_bridge PRIVATE VK_USE_PLATFORM_METAL_EXT)
 
 # glm targets OpenGL's [-1, 1] clip depth; Vulkan's is [0, 1]. This switches
@@ -156,10 +156,14 @@ if(VI_INCREMENTAL_BENCHMARK)
 endif()
 
 # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
-# holds an OrbitCamera by value and hands MemoryBudget across the seam.
+# holds an OrbitCamera by value and hands MemoryBudget across the seam. The
+# core's vulkan tier is named too, not left to recon's and gfx's links: the
+# bridge builds the SharedDevice, adopts recon's Device and makes its Allocator
+# itself.
 target_link_libraries(
   scanner_bridge
   PUBLIC vi_core
+         volumetric_kit::core_vulkan
          volumetric_kit::gfx_app
          volumetric_kit::gfx_core
          volumetric_kit::recon_sensor

@@ -58,6 +58,9 @@ typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
     /// A Vulkan call failed; the `VkResult` is in
     /// @ref VolumetricRendererVulkanResultKey.
     VolumetricRendererErrorVulkan = 6,
+    /// A numerical method failed: a singular system, no convergence, or a
+    /// degenerate or ill-conditioned configuration.
+    VolumetricRendererErrorNumerical = 7,
 };
 
 /// The failing `VkResult` as an `NSNumber`, present only on a
@@ -847,8 +850,10 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Frames successfully presented since bring-up.
 @property(nonatomic, readonly) uint64_t framesPresented;
 
-/// How the one shared `VkDevice` was built and its queues carved up, e.g.
-/// "Apple M5 GPU, family 0, 2 queues (gfx + recon)".
+/// How the one shared `VkDevice` was built and its queues carved up, as the
+/// core's `SharedDevice::summary` words it, e.g. "Apple M5 GPU: TwoFamilies,
+/// graphics family 0, compute family 1, a queue each". Empty when no shared
+/// device was built.
 @property(nonatomic, readonly, copy) NSString* sharedDeviceSummary;
 
 /// Whether recon and gfx both hold the bootstrap's one `VkDevice` *and* neither

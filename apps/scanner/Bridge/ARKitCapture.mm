@@ -16,12 +16,14 @@
 #include <utility>
 #include <vector>
 
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
 #include "volumetric_kit/recon/sensor/color_conventions.hpp"
+
+namespace vkc = volumetric_kit::core;
 
 namespace vr = volumetric_kit::recon;
 namespace sensor = volumetric_kit::recon::sensor;
@@ -556,7 +558,7 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   // if that day comes, is to fold the primaries 3x3 into the vImage matrix
   // rather than walking pixels on the CPU -- only the transfer decode genuinely
   // needs the curve, and ARKit's is already canonical.
-  const vr::Status brought = sensor::to_canonical(
+  const vkc::Status brought = sensor::to_canonical(
       out.color.data(), out.color.size(), out.color_encoding, out.color.data());
   if (!brought) {
     // PQ lands here, reported by `to_canonical` rather than judged above, and a
@@ -600,13 +602,13 @@ class ARKitCapture final : public sensor::ICameraCapture {
  public:
   // Nothing to start: Swift owns the ARSession and pushes frames in. Present so
   // a consumer can drive any ICameraCapture uniformly.
-  vr::Status start() override { return vr::Status(); }
+  vkc::Status start() override { return vkc::Status(); }
   void stop() noexcept override {
     std::lock_guard<std::mutex> lock(mutex_);
     staged_ = false;
   }
 
-  vr::Result<std::optional<sensor::CapturedFrame>> poll() override {
+  vkc::Result<std::optional<sensor::CapturedFrame>> poll() override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!staged_) {
       return no_frame();
@@ -779,7 +781,7 @@ class ARKitCapture final : public sensor::ICameraCapture {
   }
   color.cam_to_world = sensor::cv_from_gl_camera(arkit_pose);
 
-  vr::Result<vr::DepthCameraParams> derived =
+  vkc::Result<vr::DepthCameraParams> derived =
       sensor::depth_from_registered_color(
           color,
           static_cast<std::uint32_t>(
@@ -815,7 +817,7 @@ class ARKitCapture final : public sensor::ICameraCapture {
 }
 
 - (BOOL)pollLatest {
-  vr::Result<std::optional<sensor::CapturedFrame>> got = _capture->poll();
+  vkc::Result<std::optional<sensor::CapturedFrame>> got = _capture->poll();
   return got && got.value() ? YES : NO;
 }
 

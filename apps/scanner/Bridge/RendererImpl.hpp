@@ -28,30 +28,33 @@
 #include "FrameTrace.hpp"
 #include "Fusion.hpp"
 #include "OrbitCamera.hpp"
-#include "SharedDevice.hpp"
 #include "ViewOrientation.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/image.hpp"
+#include "volumetric_kit/core/vulkan/shared_device.hpp"
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
-#include "volumetric_kit/gfx/core/descriptor.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
 #include "volumetric_kit/gfx/core/sampler.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
-#include "volumetric_kit/gfx/core/texture.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/device_mesh.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
 
 namespace volumetric_kit::ios_app {
+
+namespace vkc = volumetric_kit::core;
 
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
@@ -84,7 +87,7 @@ namespace vr = volumetric_kit::recon;
 struct RendererImpl {
   // Declared first, destroyed last: everything below borrows the VkDevice this
   // owns and destroys nothing, so it has to outlive all of them.
-  volumetric_kit::ios_app::SharedDevice shared;
+  std::unique_ptr<vkc::SharedDevice> shared;
   // recon's view of the same VkDevice -- what the volume, the integrator and
   // marching cubes below all allocate and dispatch on. Adopted at bring-up
   // rather than lazily, so a mismatch between what the bootstrap enabled and
@@ -92,8 +95,8 @@ struct RendererImpl {
   // optional, not a plain member: recon's Device is create-or-adopt only and
   // has no public default constructor -- which is the invariant working, not an
   // inconvenience. There is no such thing as an empty one to default-construct.
-  std::optional<volumetric_kit::recon::Device> recon_device;
-  std::optional<volumetric_kit::recon::Allocator> recon_allocator;
+  std::optional<volumetric_kit::core::Device> recon_device;
+  std::optional<volumetric_kit::core::Allocator> recon_allocator;
 
   // --- Reconstruction ------------------------------------------------------
   Fusion fusion;
@@ -178,13 +181,13 @@ struct RendererImpl {
   // Never *selected* by the shader on those frames, because Fusion leaves every
   // uv0 at the sentinel when it does not texture -- but the set must be
   // non-null regardless or the frame records no draw at all.
-  vg::Texture atlas_texture;
+  vkc::Image atlas_texture;
   // optional for the same reason recon's Device is: Sampler keeps its default
   // constructor private, so it is create-only and there is no empty one to
   // default-construct. The other three do expose an empty state.
   std::optional<vg::Sampler> atlas_sampler;
-  vg::DescriptorPool atlas_pool;
-  vg::DescriptorSet atlas_set;
+  vkc::DescriptorPool atlas_pool;
+  vkc::DescriptorSet atlas_set;
 
   // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
   // use-after-free, and at per-frame meshing that would be every frame. One
@@ -284,7 +287,9 @@ struct RendererImpl {
     if (app.valid()) {
       (void)app.wait_idle();
     }
-    shared.wait_idle();
+    if (shared) {
+      shared->wait_idle();
+    }
   }
 
   void stop_fusing() {

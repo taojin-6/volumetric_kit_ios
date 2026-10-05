@@ -6,24 +6,29 @@
 #include <cstddef>
 #include <utility>
 
-#include "volumetric_kit/gfx/core/allocator.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/gfx/core/image_barrier.hpp"
-#include "volumetric_kit/gfx/core/result.hpp"
 
 namespace volumetric_kit::ios_app {
 
-void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
-                         std::uint32_t width, std::uint32_t height,
-                         bool first_write) {
+namespace vg = volumetric_kit::gfx;
+
+void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
+                         vkc::Image& image) {
+  // Never written since it was created: no read to order against, and no
+  // contents to preserve.
+  const bool first_write = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED;
+
   // gfx's helper rather than a hand-rolled VkImageMemoryBarrier: it owns the
   // sType, the two VK_QUEUE_FAMILY_IGNORED defaults (a mistyped real family
   // index here is a silent ownership transfer on a build with no validation
   // layers) and the whole-image subresource range, and it is unit-tested
   // upstream where this was not tested at all. It also carries the one
-  // diagnostic this path had none of: `cmd_image_barrier` VG_CHECKs that
+  // diagnostic this path had none of: `cmd_image_barrier` checks that
   // new_layout is not UNDEFINED, with file and line, in every build.
   vg::ImageBarrierDesc to_dst;
-  to_dst.image = image;
+  to_dst.image = image.handle();
   // The source scope is the FRAGMENT shader, not TOP_OF_PIPE: the previous
   // frame that bound this slot sampled it there, and this copy must not begin
   // until that read has finished. The slot ring makes that frame an old one in
@@ -36,8 +41,7 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   to_dst.dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
   to_dst.src_access = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
   to_dst.dst_access = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_dst.old_layout = first_write ? VK_IMAGE_LAYOUT_UNDEFINED
-                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  to_dst.old_layout = image.layout();
   to_dst.new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   vg::cmd_image_barrier(cmd, to_dst);
 
@@ -52,12 +56,12 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   region.bufferImageHeight = 0;
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.imageOffset = {0, 0, 0};
-  region.imageExtent = {width, height, 1};
-  vkCmdCopyBufferToImage(cmd, staging, image,
+  region.imageExtent = {image.width(), image.height(), 1};
+  vkCmdCopyBufferToImage(cmd, staging, image.handle(),
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
   vg::ImageBarrierDesc to_read;
-  to_read.image = image;
+  to_read.image = image.handle();
   to_read.src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
   to_read.dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
   to_read.src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -65,41 +69,44 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   to_read.old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   to_read.new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   vg::cmd_image_barrier(cmd, to_read);
+  // Recorded, so the next upload's barrier starts from here -- and so does
+  // anything else handed this image, which reads the same record.
+  image.set_layout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
-vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
-                            VkSampler sampler, std::uint32_t width,
-                            std::uint32_t height) {
+vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
+                             VkSampler sampler, std::uint32_t width,
+                             std::uint32_t height) {
   // The preconditions, refused rather than asserted. Two of the three would
   // otherwise fire inside the commit loop below -- after every allocation has
   // succeeded -- which is the one place this function has no way to unwind
   // from. See the header for what each one costs when it is not checked.
   if (ring.ready) {
-    return vg::Status::invalid_argument(
+    return vkc::Status::invalid_argument(
         "atlas ring: already built; rebuilding frees images frames in flight "
         "are still binding");
   }
   if (sampler == VK_NULL_HANDLE) {
-    return vg::Status::invalid_argument("atlas ring: null sampler");
+    return vkc::Status::invalid_argument("atlas ring: null sampler");
   }
   for (std::size_t i = 0; i < kRingSlots; ++i) {
     if (!ring.slots[i].set.valid()) {
-      return vg::Status::invalid_argument(
+      return vkc::Status::invalid_argument(
           "atlas ring: descriptor sets were not allocated at bring-up");
     }
   }
   if (width == 0 || height == 0) {
-    return vg::Status::invalid_argument("atlas ring: zero colour extent");
+    return vkc::Status::invalid_argument("atlas ring: zero colour extent");
   }
   const VkDeviceSize bytes = atlas_staging_bytes(width, height);
 
   // Staged here, committed below. Destroying these on an early return is the
   // whole point -- see the note above.
-  vg::Texture textures[kRingSlots];
-  vg::Buffer stagings[kRingSlots];
+  vkc::Image textures[kRingSlots];
+  vkc::Buffer stagings[kRingSlots];
 
   for (std::size_t i = 0; i < kRingSlots; ++i) {
-    vg::TextureDesc tex_desc;
+    vkc::ImageDesc tex_desc;
     tex_desc.extent = {width, height};
     // _SRGB, matching `fuse_render`'s atlas and for its two reasons.
     //
@@ -122,21 +129,22 @@ vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
     tex_desc.format = VK_FORMAT_R8G8B8A8_SRGB;
     tex_desc.usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    vg::Result<vg::Texture> tex = allocator.create_image(tex_desc);
+    vkc::Result<vkc::Image> tex = allocator.create_image(tex_desc);
     if (!tex) {
       return tex.status();
     }
 
-    vg::BufferDesc buf_desc;
+    vkc::BufferDesc buf_desc;
     buf_desc.size = bytes;
     buf_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    buf_desc.memory = vg::MemoryUsage::HostVisible;
-    buf_desc.mapped = true;
+    // Host memory with copy usage only, mapped for its lifetime: the core's
+    // placement for the source of an upload.
+    buf_desc.memory = vkc::MemoryUsage::Staging;
     // Sequential: this is written by one memcpy front to back and never read
     // back, which on a write-combined mapping is the difference between a
     // streaming store and a read-modify-write per cache line.
-    buf_desc.host_access = vg::HostAccess::SequentialWrite;
-    vg::Result<vg::Buffer> staging = allocator.create_buffer(buf_desc);
+    buf_desc.host_access = vkc::HostAccess::SequentialWrite;
+    vkc::Result<vkc::Buffer> staging = allocator.create_buffer(buf_desc);
     if (!staging) {
       return staging.status();
     }
@@ -160,10 +168,8 @@ vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
     ring.slots[i].set.write_combined_image_sampler(
         0, ring.slots[i].texture.view(), sampler,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Fresh images, so every slot is back in VK_IMAGE_LAYOUT_UNDEFINED and its
-    // first upload must transition from there rather than from
-    // SHADER_READ_ONLY_OPTIMAL.
-    ring.slot_in_undefined_layout[i] = true;
+    // Fresh images record VK_IMAGE_LAYOUT_UNDEFINED, so each slot's first
+    // upload transitions from there rather than from SHADER_READ_ONLY_OPTIMAL.
     // Not bindable either, which is a separate question with the same answer
     // right now: nothing has been written into these images yet, so binding one
     // would sample undefined contents. See where frame_info.atlas is chosen.
@@ -173,7 +179,7 @@ vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
   ring.width = width;
   ring.height = height;
   ring.ready = true;
-  return vg::Status();
+  return vkc::Status();
 }
 
 }  // namespace volumetric_kit::ios_app

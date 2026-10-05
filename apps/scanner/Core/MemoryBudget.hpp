@@ -46,14 +46,16 @@ namespace volumetric_kit::ios_app {
 ///       - The **GPU working set** (`MTLDevice.recommendedMaxWorkingSetSize`,
 ///         two thirds of physical RAM on this hardware) is *lower* than the
 ///         jetsam ceiling, and the voxel grid and mesh arenas are Metal buffers
-///         charged against it. `VolumetricRenderer` reads that one separately
-///         and prints it directly beneath this reading; see
+///         charged against it. The core's allocators refuse new memory past
+///         it (MoltenVK reports it as the heap budget), so reaching it
+///         surfaces as a `vkc::Status` too. `VolumetricRenderer` reads that
+///         one separately and prints it directly beneath this reading; see
 ///         `scanner.entitlements`.
 ///       - **Virtual address space**, lifted by
 ///         `com.apple.developer.kernel.extended-virtual-addressing`, which this
 ///         app deliberately does not carry (a personal development team cannot
 ///         provision it). Exhausting *that* one fails an allocation rather than
-///         the process, so it surfaces as a `vr::Status` out of recon -- which
+///         the process, so it surfaces as a `vkc::Status` out of recon -- which
 ///         is what distinguishes the two after the fact: one reports, one does
 ///         not.
 struct MemoryBudget {

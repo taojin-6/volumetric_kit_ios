@@ -27,7 +27,6 @@
 #import "Readout.hpp"
 #import "RendererErrors.hpp"
 #import "RendererImpl.hpp"
-#import "SharedDevice.hpp"
 #import "StatTone.hpp"
 #import "ViewOrientation.hpp"
 
@@ -64,27 +63,33 @@
 #include "triangle_vert.spv.hpp"
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
 
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/image.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/gfx/assets/mesh.hpp"
-#include "volumetric_kit/gfx/core/descriptor.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
 #include "volumetric_kit/gfx/core/render_target.hpp"
-#include "volumetric_kit/gfx/core/result.hpp"
 #include "volumetric_kit/gfx/core/sampler.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
-#include "volumetric_kit/gfx/core/texture.hpp"
 #include "volumetric_kit/gfx/core/texture_upload.hpp"
-#include "volumetric_kit/gfx/core/vulkan.hpp"
 #include "volumetric_kit/gfx/pipelines/gpu_mesh.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-// vr::StageRow, named directly by -initWithRow: and by the read-out's row loop.
-// Reached transitively through Fusion.hpp today, which is the pattern the
+// vkc::StageRow, named directly by -initWithRow: and by the read-out's row
+// loop. Reached transitively through Fusion.hpp today, which is the pattern the
 // <cstdio> note above records going wrong: pruning that header's includes, or
 // recon relocating the type, breaks this file with an unknown-type error in a
 // translation unit nobody edited.
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/shared_device.hpp"
+#include "volumetric_kit/core/vulkan/vk_result.hpp"
+#include "volumetric_kit/gfx/core/device_requirements.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
+
+namespace vkc = volumetric_kit::core;
 
 namespace vg = volumetric_kit::gfx;
 namespace vr = volumetric_kit::recon;
@@ -144,10 +149,17 @@ namespace {
 //
 // Deliberately not in Bridge/MemoryQuery: that file reads the jetsam ledger
 // through Mach and stays plain C++, and these are separate subsystems that
-// scanner.entitlements is explicit about keeping apart. Read from Metal rather
-// than from VMA's HeapStats::budget_bytes, which is a heuristic until
-// VK_EXT_memory_budget is enabled -- an open TODO in both sibling libraries,
-// and exactly the kind of estimate this read-out exists to stop relying on.
+// scanner.entitlements is explicit about keeping apart.
+//
+// It is also now where allocation stops, not only a figure to watch. The
+// core's Device enables VK_EXT_memory_budget wherever it is offered, and its
+// Allocator refuses new device memory past a heap's budget. MoltenVK 1.4.2
+// reports this value as the unified heap's budget on iOS 16+, against
+// `currentAllocatedSize` as its usage (read off the linked libMoltenVK.a), so
+// recon's and gfx's allocations fail as over-budget when Metal's total would
+// cross it -- a `vkc::Status` on the stage that asked, not a jetsam. Read from
+// Metal rather than from the allocators' HeapStats all the same: the same
+// number, without needing a device to exist.
 //
 // Cached: iOS has one GPU and this value does not move, so the device is
 // created once rather than at the polling rate. `recommendedMaxWorkingSetSize`
@@ -256,12 +268,47 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // Not an optimisation: a VkBuffer is valid only on the VkDevice that created
   // it, so the zero-copy mesh handoff needs *one* device. Two devices on this
   // same GPU would still cost a round trip through host memory.
-  const vr::Status built = _impl->shared.build((__bridge const void*)layer,
-                                               "volumetric_kit_ios scanner");
-  if (!built) {
-    app::set_error(error, built, "SharedDevice");
+  vkc::SharedDeviceConfig shared_config;
+  shared_config.instance.app_name = "volumetric_kit_ios scanner";
+  // VK_EXT_metal_surface is the platform surface on Apple. The core asks for
+  // portability enumeration only where a loader offers it, which a directly
+  // linked MoltenVK does not.
+  shared_config.instance.extensions = {VK_KHR_SURFACE_EXTENSION_NAME,
+                                       VK_EXT_METAL_SURFACE_EXTENSION_NAME};
+  // Object names and command labels in Debug only. recon labels its kernel
+  // dispatches, and MoltenVK turns each label into a Metal debug group and
+  // each name into a Metal label, captured or not. An Xcode GPU capture is
+  // what reads them -- worth it while developing, not in a Release build,
+  // which the app's own bootstrap never enabled them in.
+#ifdef NDEBUG
+  shared_config.instance.request_debug_utils = false;
+#endif
+  // Neither library is consulted about the other: each states its needs, and
+  // the shared device satisfies the union. gfx presents; recon computes.
+  shared_config.compute = vr::device_requirements();
+  shared_config.graphics = vg::device_requirements();
+  shared_config.graphics.needs_present = true;
+  shared_config.make_surface =
+      [layer](VkInstance instance) -> vkc::Result<VkSurfaceKHR> {
+    auto create_metal_surface = reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(
+        vkGetInstanceProcAddr(instance, "vkCreateMetalSurfaceEXT"));
+    if (create_metal_surface == nullptr) {
+      return vkc::Status::unsupported("vkCreateMetalSurfaceEXT unavailable");
+    }
+    VkMetalSurfaceCreateInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+    info.pLayer = layer;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VKC_VK_TRY(create_metal_surface(instance, &info, nullptr, &surface));
+    return surface;
+  };
+  vkc::Result<std::unique_ptr<vkc::SharedDevice>> shared =
+      vkc::SharedDevice::create(shared_config);
+  if (!shared) {
+    app::set_error(error, shared.status(), "SharedDevice");
     return nil;
   }
+  _impl->shared = std::move(shared).value();
 
   vg::app::WindowedAppConfig config;
   config.app_name = "volumetric_kit_ios scanner";
@@ -284,19 +331,19 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // silently turn the mesh ring into a use-after-free.
   config.frames_in_flight = app::RendererImpl::kFramesInFlight;
 
-  vg::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
-      _impl->shared.gfx_payload(), config,
-      [self](VkInstance instance) -> vg::Result<VkSurfaceKHR> {
+  vkc::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
+      _impl->shared->graphics_payload(), config,
+      [self](VkInstance instance) -> vkc::Result<VkSurfaceKHR> {
         // The surface already exists -- picking a present-capable device
         // required one -- so hand over the bootstrap's rather than making a
         // second. Ownership transfers with it, which is why the bootstrap
         // releases it: destroying it twice is a use-after-free at teardown.
-        if (instance != self->_impl->shared.instance()) {
-          return vg::Status::invalid_argument(
+        if (instance != self->_impl->shared->instance().handle()) {
+          return vkc::Status::invalid_argument(
               "surface factory: adopted a different VkInstance than the "
               "bootstrap created the surface on");
         }
-        return self->_impl->shared.release_surface();
+        return self->_impl->shared->release_surface();
       });
   if (!app) {
     app::set_error(error, app.status(), "WindowedApp::adopt");
@@ -308,8 +355,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // adopting now is the point of this slice -- and a mismatch between what the
   // bootstrap enabled and what recon requires must fail at bring-up, where the
   // message is actionable, rather than at the first dispatch.
-  vr::Result<vr::Device> recon_device =
-      vr::Device::adopt(_impl->shared.recon_payload(), {});
+  vkc::Result<vkc::Device> recon_device = vkc::Device::adopt(
+      _impl->shared->compute_payload(), vr::device_requirements());
   if (!recon_device) {
     app::set_error(error, recon_device.status(), "recon Device::adopt");
     return nil;
@@ -319,19 +366,19 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // recon allocates its volume, mesh arena and staging buffers from its own
   // VMA allocator on the shared device -- separate accounting from gfx's, one
   // device underneath.
-  vr::Result<vr::Allocator> recon_allocator =
-      vr::Allocator::create(_impl->shared.instance(), *_impl->recon_device);
+  vkc::Result<vkc::Allocator> recon_allocator = vkc::Allocator::create(
+      _impl->shared->instance().handle(), *_impl->recon_device);
   if (!recon_allocator) {
-    // The vr::Status overload, not a flatten through vg::Status::unsupported:
-    // an allocator failure on a user's phone is out-of-memory or a VkResult,
-    // and reporting it as "unsupported" reads as a capability the driver lacks.
+    // Its own Status, unflattened: an allocator failure on a user's phone is
+    // out-of-memory or a VkResult, and reporting it as "unsupported" would read
+    // as a capability the driver lacks.
     app::set_error(error, recon_allocator.status(), "recon Allocator::create");
     return nil;
   }
   _impl->recon_allocator.emplace(std::move(recon_allocator).value());
 
   VkDevice device = _impl->app.device().handle();
-  vg::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
+  vkc::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_vert_spv),
       vi_triangle_vert_spv_size);
   if (!vert) {
@@ -340,7 +387,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->vertex_shader = std::move(vert).value();
 
-  vg::Result<vg::ShaderModule> frag = vg::ShaderModule::create(
+  vkc::Result<vg::ShaderModule> frag = vg::ShaderModule::create(
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_frag_spv),
       vi_triangle_frag_spv_size);
   if (!frag) {
@@ -358,7 +405,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   desc.vertex_bindings = nullptr;
   desc.vertex_binding_count = 0;
 
-  vg::Result<vg::GraphicsPipeline> pipeline =
+  vkc::Result<vg::GraphicsPipeline> pipeline =
       vg::GraphicsPipeline::create(device, desc);
   if (!pipeline) {
     app::set_error(error, pipeline.status(), "GraphicsPipeline::create");
@@ -369,7 +416,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // The renderer's hybrid path: it samples the projective-texturing atlas where
   // a triangle carries a real uv0, and falls back to the per-vertex colour the
   // TSDF fused elsewhere. That is exactly what recon's mesh emits.
-  vg::Result<vg::pipelines::HybridMeshPipeline> mesh_pipeline =
+  vkc::Result<vg::pipelines::HybridMeshPipeline> mesh_pipeline =
       vg::pipelines::HybridMeshPipeline::create(
           device, _impl->app.swapchain().layout());
   if (!mesh_pipeline) {
@@ -401,7 +448,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   atlas_desc.format = VK_FORMAT_R8G8B8A8_UNORM;
   atlas_desc.pixels = kWhite;
   atlas_desc.size = sizeof(kWhite);
-  vg::Result<vg::Texture> atlas_texture = vg::upload_texture(
+  vkc::Result<vkc::Image> atlas_texture = vg::upload_texture(
       _impl->app.device(), _impl->app.allocator(), atlas_desc);
   if (!atlas_texture) {
     app::set_error(error, atlas_texture.status(), "atlas upload_texture");
@@ -409,7 +456,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->atlas_texture = std::move(atlas_texture).value();
 
-  vg::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
+  vkc::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
   if (!atlas_sampler) {
     app::set_error(error, atlas_sampler.status(), "atlas Sampler::create");
     return nil;
@@ -424,15 +471,15 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   const std::uint32_t kAtlasSets = app::RendererImpl::kMeshSlots + 1;
   const VkDescriptorPoolSize atlas_pool_size{
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kAtlasSets};
-  vg::Result<vg::DescriptorPool> atlas_pool =
-      vg::DescriptorPool::create(device, &atlas_pool_size, 1, kAtlasSets);
+  vkc::Result<vkc::DescriptorPool> atlas_pool =
+      vkc::DescriptorPool::create(device, &atlas_pool_size, 1, kAtlasSets);
   if (!atlas_pool) {
     app::set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
     return nil;
   }
   _impl->atlas_pool = std::move(atlas_pool).value();
 
-  vg::Result<vg::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
+  vkc::Result<vkc::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
       _impl->mesh_pipeline->descriptor_set_layout(0));
   if (!atlas_set) {
     app::set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
@@ -462,7 +509,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // available is a configuration fault rather than the transient the per-frame
   // path has to tolerate.
   for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
-    vg::Result<vg::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
+    vkc::Result<vkc::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
         _impl->mesh_pipeline->descriptor_set_layout(0));
     if (!slot_set) {
       app::set_error(error, slot_set.status(),
@@ -512,11 +559,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   fusion_config.incremental_benchmark = false;
 #endif
 
-  fusion_config.queue_families[0] = _impl->shared.compute_family();
-  fusion_config.queue_families[1] = _impl->shared.graphics_family();
+  fusion_config.queue_families[0] = _impl->shared->compute_family();
+  fusion_config.queue_families[1] = _impl->shared->graphics_family();
   fusion_config.queue_family_count = 2;
 
-  const vr::Status fusion_started = _impl->fusion.start(
+  const vkc::Status fusion_started = _impl->fusion.start(
       *_impl->recon_device, *_impl->recon_allocator, fusion_config);
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
@@ -532,7 +579,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   const VkExtent2D extent{static_cast<std::uint32_t>(size.width),
                           static_cast<std::uint32_t>(size.height)};
 
-  vg::Result<std::optional<vg::windowing::Frame>> frame =
+  vkc::Result<std::optional<vg::windowing::Frame>> frame =
       _impl->app.begin_frame(extent);
   if (!frame) {
     // The fault happened in an *earlier* frame; this is only where it is
@@ -603,7 +650,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // collapses the pair to EXCLUSIVE wherever they are the same family, and
     // that is correct rather than a failure.
     const bool cross_family =
-        _impl->shared.graphics_family() != _impl->shared.compute_family();
+        _impl->shared->graphics_family() != _impl->shared->compute_family();
     const bool sharing_ok =
         !cross_family || m.sharing_mode == VK_SHARING_MODE_CONCURRENT;
     const bool bindable =
@@ -652,7 +699,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
           // returns nil -- but it is passed rather than reached for, so the
           // ring never dereferences an optional it cannot see being filled,
           // and its null check is a real guard rather than a decorative one.
-          const vg::Status built = app::build_atlas_ring(
+          const vkc::Status built = app::build_atlas_ring(
               _impl->atlas, _impl->app.allocator(),
               _impl->atlas_sampler ? _impl->atlas_sampler->handle()
                                    : VK_NULL_HANDLE,
@@ -697,15 +744,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
           // be recorded inside a render pass instance, and this build ships
           // without the validation layer that would say so. See the
           // precondition on record_atlas_upload.
-          app::record_atlas_upload(
-              f.cmd, slot.staging.handle(), slot.texture.image(),
-              _impl->atlas.width, _impl->atlas.height,
-              _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot]);
-          // Two flags, deliberately: the image has now been written, so it is
-          // no longer in UNDEFINED and never will be again until the ring is
-          // rebuilt -- while `slot_written`, which is about bindability, gets
-          // cleared below for reasons that leave the layout exactly as it is.
-          _impl->atlas.slot_in_undefined_layout[_impl->mesh_slot] = false;
+          app::record_atlas_upload(f.cmd, slot.staging.handle(), slot.texture);
+          // Two records, deliberately: the image's own layout, which the upload
+          // just moved out of UNDEFINED for good until the ring is rebuilt --
+          // and `slot_written`, which is about bindability and gets cleared
+          // below for reasons that leave the layout exactly as it is.
           _impl->atlas.slot_written[_impl->mesh_slot] = true;
         } else if (_impl->atlas.ready) {
           // A textured mesh whose keyframe could not be staged. Skipping the
@@ -1041,7 +1084,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 
   f.target->end(f.cmd);
 
-  const vg::Status end = _impl->app.end_frame(f);
+  const vkc::Status end = _impl->app.end_frame(f);
   if (!end.ok()) {
     // A stale swapchain is the normal signal that the drawable changed size;
     // the next begin_frame rebuilds. Only a genuine error propagates.
@@ -1099,7 +1142,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
       // contract still holds: one bad frame is recorded and skipped, it does
       // not end a scan the user is in the middle of.
       try {
-        vr::Result<std::optional<vr::sensor::CapturedFrame>> got =
+        vkc::Result<std::optional<vr::sensor::CapturedFrame>> got =
             impl->capture->poll();
         if (!got || !got.value()) {
           // Nothing new: sleep briefly rather than spin. ARKit delivers at
@@ -1354,7 +1397,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // gfx idles only the queues it was assigned, and recon's Device exposes no
   // wait at all -- so on a two-family plan recon's queue is one nobody else
   // would ever drain. The bootstrap owns them both and waits on both.
-  _impl->shared.wait_idle();
+  if (_impl->shared) {
+    _impl->shared->wait_idle();
+  }
 }
 
 - (NSString*)deviceName {
@@ -1370,14 +1415,17 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (NSString*)sharedDeviceSummary {
-  return app::to_ns_string(_impl->shared.summary());
+  if (!_impl->shared) {
+    return @"";
+  }
+  return app::to_ns_string(_impl->shared->summary());
 }
 
 - (BOOL)sharesOneDevice {
-  if (!_impl->app.valid() || !_impl->recon_device) {
+  if (!_impl->shared || !_impl->app.valid() || !_impl->recon_device) {
     return NO;
   }
-  const VkDevice bootstrap = _impl->shared.device();
+  const VkDevice bootstrap = _impl->shared->device();
   if (bootstrap == VK_NULL_HANDLE) {
     return NO;
   }

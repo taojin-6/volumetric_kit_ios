@@ -56,14 +56,14 @@ repos:
         files: \.swift$
 
       # Enforce the Vulkan-include umbrella, matching the rule both libraries
-      # hold: reach Vulkan through gfx's core/vulkan.hpp, never <vulkan/...>
-      # directly, so the loader/dispatch choice stays a detail of that one
-      # header. It applies here too -- the .mm bridge is first-party code
-      # against the same libraries. (VK_USE_PLATFORM_METAL_EXT is a compile
-      # definition, not an include, so the Metal surface path needs no
-      # exemption.)
+      # hold: reach Vulkan through the core's
+      # volumetric_kit/core/vulkan/vulkan.hpp, never <vulkan/...> directly, so
+      # the loader/dispatch choice stays a detail of that one header. It
+      # applies here too -- the .mm bridge is first-party code against the same
+      # libraries. (VK_USE_PLATFORM_METAL_EXT is a compile definition, not an
+      # include, so the Metal surface path needs no exemption.)
       - id: vulkan-include-umbrella
-        name: enforce gfx core/vulkan.hpp Vulkan-include umbrella
+        name: enforce the core's vulkan.hpp Vulkan-include umbrella
         entry: '^\s*#\s*include\s*[<"]vulkan/'
         language: pygrep
         files: \.(h|hpp|hxx|inl|ipp|c|cc|cpp|cxx|m|mm)$
