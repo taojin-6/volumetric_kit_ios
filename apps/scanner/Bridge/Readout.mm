@@ -28,7 +28,7 @@
 // copy: a header that happens to pull this in today is not a dependency.
 #include <vector>
 
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 
 namespace app = volumetric_kit::ios_app;
 
@@ -317,7 +317,7 @@ VolumetricStatTone panel_tone(double fraction, app::ToneThresholds t) {
 @end
 
 @implementation VolumetricStageRow
-- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row {
+- (instancetype)initWithRow:(const volumetric_kit::core::StageRow&)row {
   if ((self = [super init])) {
     // Copied, unlike the C++ row which borrows: an NSString outliving the
     // literal costs nothing here, and it frees the Swift side from the

@@ -58,6 +58,9 @@ typedef NS_ERROR_ENUM(VolumetricRendererErrorDomain, VolumetricRendererError){
     /// A Vulkan call failed; the `VkResult` is in
     /// @ref VolumetricRendererVulkanResultKey.
     VolumetricRendererErrorVulkan = 6,
+    /// A numerical method failed: a singular system, no convergence, or a
+    /// degenerate or ill-conditioned configuration.
+    VolumetricRendererErrorNumerical = 7,
 };
 
 /// The failing `VkResult` as an `NSNumber`, present only on a

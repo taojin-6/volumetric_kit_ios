@@ -26,16 +26,16 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "volumetric_kit/gfx/core/allocator.hpp"
-#include "volumetric_kit/gfx/core/buffer.hpp"
-#include "volumetric_kit/gfx/core/descriptor.hpp"
-#include "volumetric_kit/gfx/core/result.hpp"
-#include "volumetric_kit/gfx/core/texture.hpp"
-#include "volumetric_kit/gfx/core/vulkan.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/image.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 
 namespace volumetric_kit::ios_app {
 
-namespace vg = volumetric_kit::gfx;
+namespace vkc = volumetric_kit::core;
 
 /// @brief How many keyframe images the ring holds -- one per mesh slot.
 ///
@@ -62,7 +62,7 @@ inline constexpr std::size_t kRingSlots = 3;
 /// memcpy into a mapped staging buffer, then a copy recorded into the frame's
 /// own command buffer. Nothing is allocated, submitted or waited on per frame.
 struct AtlasSlot {
-  vg::Texture texture;
+  vkc::Image texture;
   /// Host-visible and persistently mapped: the render thread writes here and
   /// the GPU copies out inside the frame already being recorded, so there is no
   /// second submit and no fence.
@@ -78,8 +78,8 @@ struct AtlasSlot {
   /// decouple the depth from `kFramesInFlight`, and this wants re-deriving on
   /// its own terms -- the mesh ring's version of the argument is about a
   /// GpuMesh being replaced and does not reach the staging buffers.
-  vg::Buffer staging;
-  vg::DescriptorSet set;
+  vkc::Buffer staging;
+  vkc::DescriptorSet set;
 };
 
 /// @brief The renderer's keyframe images, and the state saying which may be
@@ -221,7 +221,7 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
 /// symbol now, reachable from every bridge translation unit:
 ///
 /// - `!ring.ready`. Rebuilding a live ring frees images that frames in flight
-///   are binding -- `vg::Texture`'s move-assignment destroys eagerly, so the
+///   are binding -- `vkc::Image`'s move-assignment destroys eagerly, so the
 ///   commit loop would `vkDestroyImage` up to @ref kRingSlots images and their
 ///   mapped staging buffers while submitted command buffers still sample them,
 ///   then rewrite the descriptor sets those buffers bound. No queue drain, no
@@ -230,7 +230,7 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
 ///   `imageResolution` change, which is exactly the path the renderer's
 ///   extent-mismatch branch refuses today for this reason.
 /// - Every `ring.slots[i].set` already allocated. Writing a descriptor opens
-///   with a `VG_CHECK` that aborts in every build, and it would do so
+///   with a `VKC_CHECK` that aborts in every build, and it would do so
 ///   *after* the six allocations -- leaving images and staging buffers moved
 ///   into @p ring with `width`/`height` still 0, the exact non-atomic state the
 ///   all-or-nothing shape above exists to prevent.
@@ -241,8 +241,8 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
 /// Writing the descriptors here is safe only because `ring.ready` is false for
 /// the whole time this runs, including across a retry: no frame binds a slot
 /// set until the flag goes up, so nothing is reading what this writes.
-vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
-                            VkSampler sampler, std::uint32_t width,
-                            std::uint32_t height);
+vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
+                             VkSampler sampler, std::uint32_t width,
+                             std::uint32_t height);
 
 }  // namespace volumetric_kit::ios_app

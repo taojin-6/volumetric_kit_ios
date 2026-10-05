@@ -31,7 +31,7 @@
 // rather than left to Fusion.hpp's copy: a transitive include is not a
 // dependency, and reordering the imports above would turn this into a hard
 // error in a header whose whole job is to be included from two places.
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 
 // Every function below hands Swift an object, and without this region Swift
 // imports each as an implicitly-unwrapped optional rather than trapping at the
@@ -144,7 +144,7 @@ VolumetricDashboardSnapshot* dashboard_snapshot(
 // `frameHistory` builds samples there because it needs the Fusion object rather
 // than its stats snapshot.
 @interface VolumetricStageRow ()
-- (instancetype)initWithRow:(const volumetric_kit::recon::StageRow&)row;
+- (instancetype)initWithRow:(const volumetric_kit::core::StageRow&)row;
 @end
 
 @interface VolumetricFrameSample ()

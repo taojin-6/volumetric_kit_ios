@@ -18,10 +18,15 @@ The libraries remain independent siblings with their own guidance.
   and the decisions made from their results in `Core/`.
 - The bridge presents plain values and `NSError` to Swift. Keep the bridge's
   static-library target separate from the Swift app target under Xcode.
-- Share one `VkDevice` between recon and gfx through their create/adopt seam.
-  Preserve the documented requirements merge, queue selection, and lifetimes.
-- Include Vulkan through gfx's `core/vulkan.hpp` umbrella, never directly
-  through `<vulkan/...>`.
+- Share one `VkDevice` between recon and gfx through the core's
+  `SharedDevice` and each library's adopt. Preserve the documented
+  requirements merge, queue selection, and lifetimes.
+- recon and gfx share volumetric_kit_core's types: write them as the core does,
+  `vkc::Status`, `vkc::Device`, `VKC_TRY` (`vkc` aliases
+  `volumetric_kit::core`), from the core's headers -- recon's and gfx's own
+  names (`vr::`, `vg::`) only for what each library defines.
+- Include Vulkan through the core's `volumetric_kit/core/vulkan/vulkan.hpp`
+  umbrella, never directly through `<vulkan/...>`.
 
 ## Read what the task needs
 
@@ -30,7 +35,7 @@ The libraries remain independent siblings with their own guidance.
 | Build, dependencies, signing, device deployment | [README build guide](README.md#build), relevant CMake/toolchain files |
 | Pure app logic and host tests | [Host-test boundary](README.md#the-host-tests), `apps/scanner/Core/CMakeLists.txt`, affected tests |
 | Swift/Objective-C++ seam | [Language split](README.md#language-split), affected bridge headers and Swift callers |
-| Shared Vulkan device | [Bootstrap contract](README.md#the-duplicated-bootstrap), `Bridge/SharedDevice.{hpp,mm}` |
+| Shared Vulkan device | [Shared device](README.md#the-shared-device), the core's `volumetric_kit/core/vulkan/shared_device.hpp`, `Bridge/VolumetricRenderer.mm` |
 | Benchmarking incremental extraction | [Measurement build](README.md#the-measurement-build), scanner CMake and fusion configuration |
 | Hardware capability or simulator assumptions | [Platform notes](README.md#platform-notes), relevant runtime guards |
 | Formatting and CI | [Development](README.md#development), `.pre-commit-config.yaml`, `.github/workflows/` |
@@ -99,8 +104,9 @@ cmake --build "$ios_root/build-ios" --config Debug -- \
 
 - recon and gfx are pinned by commit in `CMakeLists.txt`. Adopt upstream
   changes by bumping a pin in its own PR, and say which commits the build used.
-  When recon and gfx depend on `volumetric_kit_core`, declare the core first so
-  both build against one pinned copy (the core's README).
+  Both depend on `volumetric_kit_core`, which is declared first so both build
+  against one pinned copy (the core's README); bump it with, or at or after,
+  recon's and gfx's core pins.
 - Local sibling source overrides use CMake's
   `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON` / `_VOLUMETRIC_KIT_GFX` options;
   keep machine-specific paths out of committed build configuration.

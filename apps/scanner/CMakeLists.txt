@@ -32,8 +32,7 @@ add_library(
   Bridge/Fusion.mm
   Bridge/MemoryQuery.cpp
   Bridge/Readout.mm
-  Bridge/RendererErrors.mm
-  Bridge/SharedDevice.mm)
+  Bridge/RendererErrors.mm)
 
 # ARC, selected by language rather than by a second copy of the source list.
 #

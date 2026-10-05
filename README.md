@@ -216,35 +216,26 @@ compute path; this proves the render path.
 Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the native
 2420×1668, triangle on screen.
 
-#### The duplicated bootstrap
+#### The shared device
 
-`Bridge/SharedDevice.{hpp,mm}` builds one `VkDevice` from
-`vr::Device::requirements()` ∪ `vg::Device::requirements()` and hands the same
-handles to `recon::Device::adopt` and `gfx::app::WindowedApp::adopt`. recon's
-`examples/viewer/shared_device.hpp` does the same job for GLFW on desktop, so
-this is a second copy of one algorithm.
+One `VkDevice` serves both libraries, built by volumetric_kit_core's
+`SharedDevice` (`volumetric_kit/core/vulkan/shared_device.hpp`) from
+`vr::device_requirements()` ∪ `vg::device_requirements()` (with
+`needs_present`), and adopted by each: recon through `vkc::Device::adopt` with
+the shared device's `compute_payload()`, gfx through `WindowedApp::adopt` with
+its `graphics_payload()`. A `VkBuffer` is valid only on the device that made
+it, so the zero-copy mesh handoff needs the one device.
 
-It is copied rather than shared because there is nowhere yet for it to live:
-neither library can own it (it is the one piece that is *neither* library's, and
-both libraries' RAII owners start after it), and a third package for ~400 lines
-with two consumers buys less than it costs. What genuinely differs is small —
-surface creation (`VK_EXT_metal_surface` against a `CAMetalLayer` rather than
-GLFW) and returning a `Status` instead of printing to stderr.
-
-The rest is deliberately kept in step, and the parts that are load-bearing are
-the ones a copy loses quietly: the **queue-plan order** (one family with two
-queues, then two families, then a shared queue — MoltenVK reports several
-graphics + compute + present families of one queue each, so a phone lands on the
-second and taking the third hands back the concurrency the fuse thread exists
-for), the **pre-create support checks** (so a shortfall names the missing
-extension or feature instead of collapsing into `vkCreateDevice failed`), the
-**`feature_chain` splice** (gfx documents enabling its opaque chain as the
-embedder's job; it is null today), and the **field-wise feature merge**.
-
-Promote it to a shared package when a third consumer appears, or the first time
-the two copies disagree about any of the above — the family's rule is that
-duplication is answered at the second consumer, and the second consumer here is
-what makes the drift possible rather than what makes it wrong.
+The app used to keep its own copy of this bootstrap, beside recon's desktop
+viewer's; both now use the core's, which owns the parts a copy loses quietly --
+the queue-plan order (one family with two queues, then two families, then a
+shared queue, so a phone lands on two families and the fuse thread keeps its
+own queue), the pre-create support checks, and the mutex that serializes a
+shared queue. What stays here is what is the platform's:
+`VolumetricRenderer.mm` asks for `VK_KHR_surface` and `VK_EXT_metal_surface`
+and makes the surface from the view's `CAMetalLayer` in the `make_surface`
+callback. The core requests portability enumeration only where a loader offers
+it, which the directly linked MoltenVK does not.
 
 ### `compute_smoke`
 
@@ -300,9 +291,9 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
    documents.
 4. **Live fusion** — fuse and render live in `scanner`: ARKit frames feed recon
    on a background thread while the render thread draws the growing mesh, the
-   `fuse_viewer` model. Then one shared `VkDevice` built from
-   `vr::Device::requirements()` ∪ `vg::Device::requirements()` and handed to both
-   via `Device::adopt`. Starts on interop seam A (host mesh, as `fuse_viewer`
+   `fuse_viewer` model. Then one shared `VkDevice`, the core's `SharedDevice`,
+   built from `vr::device_requirements()` ∪ `vg::device_requirements()` and
+   handed to both via `adopt`. Starts on interop seam A (host mesh, as `fuse_viewer`
    does) and moves to seam B (indirect draw over a mesh ring with a timeline
    handoff) once it works.
 

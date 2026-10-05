@@ -44,9 +44,9 @@
 #include "Freshness.hpp"
 #include "GrowthPolicy.hpp"
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/sensor/camera_capture.hpp"
@@ -55,6 +55,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::ios_app {
+
+namespace vkc = volumetric_kit::core;
 
 namespace vr = volumetric_kit::recon;
 
@@ -386,7 +388,7 @@ struct FusionConfig {
 /// has to name which one, and the advice differs per state.
 ///
 /// @warning None of these says how *much* of the mesh was textured. recon's
-///          `ProjectiveTexturer::texture` returns a @ref vr::Status and no
+///          `ProjectiveTexturer::texture` returns a @ref vkc::Status and no
 ///          count, and the only way to derive one at this tier would be to read
 ///          the vertex arena back and tally sentinels -- the ~45 MB round trip
 ///          the device overload exists to avoid. So @ref Ran means the dispatch
@@ -636,7 +638,7 @@ struct FusionStats {
   ///          from a recon tier reporting with a string literal, or from a
   ///          literal this file passes to `StageScope`, so the pointers outlive
   ///          any read -- but a row added from a non-literal would dangle.
-  vr::StageRow stages[kMaxStages]{};
+  vkc::StageRow stages[kMaxStages]{};
   /// How many of @ref stages are real.
   std::uint32_t stage_count = 0;
   /// Whether recon reported more rows than @ref kMaxStages held.
@@ -1036,8 +1038,8 @@ class Fusion {
   /// @param device     recon's adopted view of the shared `VkDevice`.
   /// @param allocator  recon's allocator on that device.
   /// @param config     Per-scan tuning.
-  vr::Status start(vr::Device& device, vr::Allocator& allocator,
-                   const FusionConfig& config);
+  vkc::Status start(vkc::Device& device, vkc::Allocator& allocator,
+                    const FusionConfig& config);
 
   /// @brief Fuse one captured frame, and remesh if the cadence says so.
   ///
@@ -1103,7 +1105,7 @@ class Fusion {
     /// on a real device rather than only at session start, and @ref
     /// Fusion::remesh skips texturing entirely on one. A pass that *was*
     /// attempted and failed publishes nothing either: it is gated on the
-    /// returned @ref vr::Status, not on the decision to try, because a refusal
+    /// returned @ref vkc::Status, not on the decision to try, because a refusal
     /// leaves `uv0` untouched and staging 11 MB against it would assert a
     /// pairing that does not hold. Either way no coordinate points at an atlas
     /// that was never uploaded, and @ref FusionStats::texture_state says which
@@ -1236,7 +1238,7 @@ class Fusion {
   ///                 -- it reports through `mesh::ExtractTimings`; see @ref
   ///                 FusionStats::stages.
   void remesh(const vr::sensor::CapturedFrame& frame,
-              vr::StageMetrics* metrics);
+              vkc::StageMetrics* metrics);
 
   FusionConfig config_{};
   // recon's per-scan state is create-only (no default constructor), which is

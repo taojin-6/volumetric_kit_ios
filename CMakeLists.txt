@@ -144,14 +144,31 @@ endif()
 
 # recon and gfx are pinned by commit, and adopted deliberately: a PR bumps a
 # pin, and CI builds exactly that pair. Tracking `main` let an upstream change
-# break this build with no commit here -- and the family's shared core is about
-# to change both siblings' Status (volumetric_kit_core's DECISIONS.md,
+# break this build with no commit here (volumetric_kit_core's DECISIONS.md,
 # "Consumers pin"). A commit hash rules out GIT_SHALLOW, which takes only a
 # branch or tag.
+#
+# Both build on volumetric_kit_core, the family's shared foundation, so it is
+# declared first: FetchContent keeps the first declaration of a name, which
+# makes this pin the one recon and gfx both build against (the core's README).
+# Its vulkan tier is on, as gfx requires -- gfx refuses to configure against a
+# core without it, or older than its own pin -- and recon's Device, Allocator
+# and SharedDevice live there. Bump it with, or at or after, recon's and gfx's
+# core pins.
+set(VKC_WITH_VULKAN
+    ON
+    CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  volumetric_kit_core
+  GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
+  GIT_TAG a60398b7aeb2cad722a3f79cb71696bda10fc054) # core #13, recon's and
+                                                    # gfx's pin
+
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG a6a5e43781182df69d9b7fbd77f09dc7ccb57ebe) # main, 2026-10-03
+  GIT_TAG 624b2dce05e3925b95c14e9f44ffc4832524d2b7) # recon #168, after its core
+                                                    # migration (#164-#167)
 
 # recon's VR_BUILD_EXAMPLES / VR_BUILD_TESTS default to PROJECT_IS_TOP_LEVEL, so
 # a fetched copy builds the library tiers only -- no gtest, no example
@@ -168,7 +185,8 @@ FetchContent_MakeAvailable(volumetric_kit_recon)
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG e15aed44b382597185d6c36b0293e1c93468ec29) # main, 2026-10-03
+  GIT_TAG 53e8f6389fe9cd9462e7000c49cc758d29c8149a) # gfx #106, after its core
+                                                    # migration (#100-#106)
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)

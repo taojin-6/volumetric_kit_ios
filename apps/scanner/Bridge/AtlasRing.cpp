@@ -6,11 +6,13 @@
 #include <cstddef>
 #include <utility>
 
-#include "volumetric_kit/gfx/core/allocator.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/gfx/core/image_barrier.hpp"
-#include "volumetric_kit/gfx/core/result.hpp"
 
 namespace volumetric_kit::ios_app {
+
+namespace vg = volumetric_kit::gfx;
 
 void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
                          std::uint32_t width, std::uint32_t height,
@@ -67,39 +69,39 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging, VkImage image,
   vg::cmd_image_barrier(cmd, to_read);
 }
 
-vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
-                            VkSampler sampler, std::uint32_t width,
-                            std::uint32_t height) {
+vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
+                             VkSampler sampler, std::uint32_t width,
+                             std::uint32_t height) {
   // The preconditions, refused rather than asserted. Two of the three would
   // otherwise fire inside the commit loop below -- after every allocation has
   // succeeded -- which is the one place this function has no way to unwind
   // from. See the header for what each one costs when it is not checked.
   if (ring.ready) {
-    return vg::Status::invalid_argument(
+    return vkc::Status::invalid_argument(
         "atlas ring: already built; rebuilding frees images frames in flight "
         "are still binding");
   }
   if (sampler == VK_NULL_HANDLE) {
-    return vg::Status::invalid_argument("atlas ring: null sampler");
+    return vkc::Status::invalid_argument("atlas ring: null sampler");
   }
   for (std::size_t i = 0; i < kRingSlots; ++i) {
     if (!ring.slots[i].set.valid()) {
-      return vg::Status::invalid_argument(
+      return vkc::Status::invalid_argument(
           "atlas ring: descriptor sets were not allocated at bring-up");
     }
   }
   if (width == 0 || height == 0) {
-    return vg::Status::invalid_argument("atlas ring: zero colour extent");
+    return vkc::Status::invalid_argument("atlas ring: zero colour extent");
   }
   const VkDeviceSize bytes = atlas_staging_bytes(width, height);
 
   // Staged here, committed below. Destroying these on an early return is the
   // whole point -- see the note above.
-  vg::Texture textures[kRingSlots];
-  vg::Buffer stagings[kRingSlots];
+  vkc::Image textures[kRingSlots];
+  vkc::Buffer stagings[kRingSlots];
 
   for (std::size_t i = 0; i < kRingSlots; ++i) {
-    vg::TextureDesc tex_desc;
+    vkc::ImageDesc tex_desc;
     tex_desc.extent = {width, height};
     // _SRGB, matching `fuse_render`'s atlas and for its two reasons.
     //
@@ -122,21 +124,22 @@ vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
     tex_desc.format = VK_FORMAT_R8G8B8A8_SRGB;
     tex_desc.usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    vg::Result<vg::Texture> tex = allocator.create_image(tex_desc);
+    vkc::Result<vkc::Image> tex = allocator.create_image(tex_desc);
     if (!tex) {
       return tex.status();
     }
 
-    vg::BufferDesc buf_desc;
+    vkc::BufferDesc buf_desc;
     buf_desc.size = bytes;
     buf_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    buf_desc.memory = vg::MemoryUsage::HostVisible;
-    buf_desc.mapped = true;
+    // Host memory with copy usage only, mapped for its lifetime: the core's
+    // placement for the source of an upload.
+    buf_desc.memory = vkc::MemoryUsage::Staging;
     // Sequential: this is written by one memcpy front to back and never read
     // back, which on a write-combined mapping is the difference between a
     // streaming store and a read-modify-write per cache line.
-    buf_desc.host_access = vg::HostAccess::SequentialWrite;
-    vg::Result<vg::Buffer> staging = allocator.create_buffer(buf_desc);
+    buf_desc.host_access = vkc::HostAccess::SequentialWrite;
+    vkc::Result<vkc::Buffer> staging = allocator.create_buffer(buf_desc);
     if (!staging) {
       return staging.status();
     }
@@ -173,7 +176,7 @@ vg::Status build_atlas_ring(AtlasRing& ring, vg::Allocator& allocator,
   ring.width = width;
   ring.height = height;
   ring.ready = true;
-  return vg::Status();
+  return vkc::Status();
 }
 
 }  // namespace volumetric_kit::ios_app

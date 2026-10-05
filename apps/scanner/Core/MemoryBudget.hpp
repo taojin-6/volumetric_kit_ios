@@ -53,7 +53,7 @@ namespace volumetric_kit::ios_app {
 ///         `com.apple.developer.kernel.extended-virtual-addressing`, which this
 ///         app deliberately does not carry (a personal development team cannot
 ///         provision it). Exhausting *that* one fails an allocation rather than
-///         the process, so it surfaces as a `vr::Status` out of recon -- which
+///         the process, so it surfaces as a `vkc::Status` out of recon -- which
 ///         is what distinguishes the two after the fact: one reports, one does
 ///         not.
 struct MemoryBudget {
