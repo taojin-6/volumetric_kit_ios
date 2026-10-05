@@ -3,18 +3,15 @@
 
 import UIKit
 
+/// The process's delegate. The window is the scene's (`SceneDelegate`): an app
+/// built against the iOS 27 SDK must adopt the scene lifecycle, and UIKit
+/// traps at launch one that still sets its window up here.
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
-  var window: UIWindow?
-
   func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    let window = UIWindow(frame: UIScreen.main.bounds)
-    window.rootViewController = ScannerViewController()
-    window.makeKeyAndVisible()
-    self.window = window
     return true
   }
 }
