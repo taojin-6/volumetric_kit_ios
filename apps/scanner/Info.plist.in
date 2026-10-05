@@ -23,6 +23,27 @@
   <!-- Required on iOS 14+; without it the app is letterboxed in a
        compatibility scale rather than filling the screen. An empty dict means
        "a plain launch screen matching the system background". -->
+  <!-- The scene lifecycle, which an app built against the iOS 27 SDK must
+       adopt: without this manifest UIKit traps at launch
+       (UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption). One
+       scene; its delegate makes the window. -->
+  <key>UIApplicationSceneManifest</key>
+  <dict>
+    <key>UIApplicationSupportsMultipleScenes</key>
+    <false/>
+    <key>UISceneConfigurations</key>
+    <dict>
+      <key>UIWindowSceneSessionRoleApplication</key>
+      <array>
+        <dict>
+          <key>UISceneConfigurationName</key>
+          <string>Default Configuration</string>
+          <key>UISceneDelegateClassName</key>
+          <string>SceneDelegate</string>
+        </dict>
+      </array>
+    </dict>
+  </dict>
   <key>UILaunchScreen</key>
   <dict/>
   <!-- Required before AVFoundation will hand ARKit the camera. Without it the

@@ -89,17 +89,36 @@
 
 @end
 
-@interface AppDelegate : UIResponder <UIApplicationDelegate>
+// The window is the scene's: an app built against the iOS 27 SDK must adopt the
+// scene lifecycle, and UIKit traps at launch one that still sets its window up
+// in the app delegate. Info.plist.in's UIApplicationSceneManifest names this
+// class.
+@interface SceneDelegate : UIResponder <UIWindowSceneDelegate>
 @property(nonatomic, strong) UIWindow* window;
+@end
+
+@implementation SceneDelegate
+
+- (void)scene:(UIScene*)scene
+    willConnectToSession:(UISceneSession*)session
+                 options:(UISceneConnectionOptions*)connectionOptions {
+  if (![scene isKindOfClass:[UIWindowScene class]]) {
+    return;
+  }
+  self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene*)scene];
+  self.window.rootViewController = [[SmokeViewController alloc] init];
+  [self.window makeKeyAndVisible];
+}
+
+@end
+
+@interface AppDelegate : UIResponder <UIApplicationDelegate>
 @end
 
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication*)application
     didFinishLaunchingWithOptions:(NSDictionary*)options {
-  self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-  self.window.rootViewController = [[SmokeViewController alloc] init];
-  [self.window makeKeyAndVisible];
   return YES;
 }
 
