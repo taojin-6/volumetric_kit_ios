@@ -115,6 +115,17 @@ inline constexpr int kMaxGrowAttempts = 2;
 /// request reactive growth sooner, but it must take a fresh reading too.
 inline constexpr std::uint64_t kMemoryDeclineRetryFrames = 60;
 
+/// @brief Whether a headroom refusal is still current during its backoff.
+///
+/// Shared by the growth gate and the published warning. A reactive refusal can
+/// happen below the occupancy threshold and outlive the chain pressure that
+/// caused it, so its warning must expire even when no new growth is due.
+constexpr bool memory_decline_active(
+    bool memory_declined, std::uint64_t frames_since_memory_decline) noexcept {
+  return memory_declined &&
+         frames_since_memory_decline < kMemoryDeclineRetryFrames;
+}
+
 /// @brief The occupancy past which no new blocks are allocated at all.
 ///
 /// **Deliberately not recon's `kGrowThreshold`.** That one says "start
@@ -315,8 +326,7 @@ constexpr bool growth_due(const GrowthInputs& in) noexcept {
   // A headroom decline backs off on a cadence rather than being pinned to a
   // size; see kMemoryDeclineRetryFrames for why it cannot be pinned.
   const bool waiting_out_a_decline =
-      in.memory_declined &&
-      in.frames_since_memory_decline < kMemoryDeclineRetryFrames;
+      memory_decline_active(in.memory_declined, in.frames_since_memory_decline);
   return in.occupancy_known && in.occupancy > in.grow_threshold &&
          in.num_buckets < in.max_buckets && in.num_buckets != in.declined_at &&
          !waiting_out_a_decline;

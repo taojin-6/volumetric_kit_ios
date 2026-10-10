@@ -629,6 +629,14 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     declined_grow_to_ = 0;
     declined_grow_bytes_ = 0;
   };
+  // Expire the warning independently of growth_due: a reactive refusal below
+  // the occupancy threshold may be followed only by successful allocations.
+  // Clear before handling this frame's plan so a fresh refusal renews it.
+  if (memory_declined_ &&
+      !memory_decline_active(growth.memory_declined,
+                             growth.frames_since_memory_decline)) {
+    clear_memory_decline();
+  }
 
   // A switch rather than the two-way `if`/`else` this was, for the reason
   // Core/CMakeLists.txt gives for building with `-Werror=switch`: the action is

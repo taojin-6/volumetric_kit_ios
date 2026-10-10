@@ -317,6 +317,52 @@ TEST(GrowthPolicy, AHeadroomDeclineExpiresRatherThanCappingTheScan) {
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
 }
 
+TEST(GrowthPolicy, AReactiveWarningExpiresWithoutPreemptiveGrowth) {
+  app::GrowthInputs in = due_to_grow();
+  in.occupancy = 0.2f;
+  in.budget.available_bytes = 0;
+  ASSERT_FALSE(app::growth_due(in));
+  ASSERT_EQ(app::plan_resize(in.num_buckets, in.max_buckets, in.budget).action,
+            app::GrowthAction::DeclinedForMemory);
+
+  in.memory_declined = true;
+  // The camera returns to existing geometry: capacity failures stop and the
+  // budget recovers, but occupancy never asks the preemptive path to grow.
+  in.budget = due_to_grow().budget;
+  for (std::uint64_t frame = 0; frame <= 120; ++frame) {
+    SCOPED_TRACE(frame);
+    in.frames_since_memory_decline = frame;
+    EXPECT_FALSE(app::growth_due(in));
+    EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
+    EXPECT_EQ(app::memory_decline_active(in.memory_declined,
+                                         in.frames_since_memory_decline),
+              frame < app::kMemoryDeclineRetryFrames);
+  }
+}
+
+TEST(GrowthPolicy, ANewRefusalRenewsTheWarningAndBackoff) {
+  app::GrowthInputs in = due_to_grow();
+  EXPECT_FALSE(app::memory_decline_active(false, 0));
+  in.memory_declined = true;
+  in.frames_since_memory_decline = app::kMemoryDeclineRetryFrames;
+  EXPECT_FALSE(app::memory_decline_active(in.memory_declined,
+                                          in.frames_since_memory_decline));
+  EXPECT_TRUE(app::growth_due(in));
+
+  // Pressure persists at the retry boundary. The new refusal starts a fresh
+  // warning interval; expiring the old one must not hide it or skip backoff.
+  in.budget.available_bytes = 0;
+  ASSERT_EQ(app::plan_growth(in).action, app::GrowthAction::DeclinedForMemory);
+  in.frames_since_memory_decline = 0;
+  EXPECT_TRUE(app::memory_decline_active(in.memory_declined,
+                                         in.frames_since_memory_decline));
+  EXPECT_FALSE(app::growth_due(in));
+  in.frames_since_memory_decline = app::kMemoryDeclineRetryFrames - 1;
+  EXPECT_TRUE(app::memory_decline_active(in.memory_declined,
+                                         in.frames_since_memory_decline));
+  EXPECT_FALSE(app::growth_due(in));
+}
+
 /// The two refusals are separate inputs because they expire differently, and a
 /// lapsed headroom decline must not lift a pin the allocator put there.
 TEST(GrowthPolicy, ALapsedDeclineDoesNotClearARefusedSize) {
