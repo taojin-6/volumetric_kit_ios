@@ -5,25 +5,28 @@
 
 namespace volumetric_kit::ios_app {
 
-GrowthPlan plan_growth(const GrowthInputs& in) noexcept {
+GrowthPlan plan_resize(std::int32_t num_buckets, std::int32_t max_buckets,
+                       const MemoryBudget& budget) noexcept {
   GrowthPlan plan;
-
-  if (!growth_due(in)) {
-    return plan;
-  }
-
-  plan.grow_to = grow_target(in.num_buckets, in.max_buckets);
+  if (num_buckets >= max_buckets) return plan;
+  plan.grow_to = grow_target(num_buckets, max_buckets);
   plan.needed_bytes = grid_bytes_for(plan.grow_to);
-
-  // Only a reading that is both valid and carries a real ceiling can decline a
-  // grow. See plan_growth's contract: an unreadable budget is not evidence of
-  // a full one.
-  const bool budget_can_refuse = in.budget.valid && in.budget.limit_known;
+  // An exhausted reading cannot derive the total ceiling, but it still says
+  // there is no headroom. Missing or failed readings carry neither flag.
+  const bool cannot_afford =
+      budget.valid &&
+      (budget.at_limit ||
+       (budget.limit_known && budget.available_bytes < plan.needed_bytes));
   plan.action =
-      budget_can_refuse && in.budget.available_bytes < plan.needed_bytes
-          ? GrowthAction::DeclinedForMemory
-          : GrowthAction::Resize;
+      cannot_afford ? GrowthAction::DeclinedForMemory : GrowthAction::Resize;
   return plan;
+}
+
+GrowthPlan plan_growth(const GrowthInputs& in) noexcept {
+  if (!growth_due(in)) {
+    return {};
+  }
+  return plan_resize(in.num_buckets, in.max_buckets, in.budget);
 }
 
 }  // namespace volumetric_kit::ios_app

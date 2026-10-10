@@ -335,6 +335,64 @@ TEST(GrowthPolicy, HeadroomExactlyCoveringTheGrowIsEnough) {
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
 }
 
+TEST(GrowthPolicy, ZeroHeadroomRefusesGrowthEvenWithoutADerivedCeiling) {
+  app::GrowthInputs in = due_to_grow();
+  in.num_buckets = 16384;
+  app::TaskMemoryReading reading;
+  reading.ok = true;
+  reading.has_remaining = true;
+  reading.phys_footprint = 4ULL * 1024 * 1024 * 1024;
+  // Both are exhausted for this resize. Reaching zero must not change a
+  // refusal into permission merely because the total ceiling is unknown.
+  for (const std::uint64_t remaining : {1ULL, 0ULL}) {
+    reading.limit_bytes_remaining = remaining;
+    in.budget = app::interpret_memory_budget(reading);
+    const app::GrowthPlan plan = app::plan_growth(in);
+    EXPECT_EQ(plan.action, app::GrowthAction::DeclinedForMemory);
+    EXPECT_EQ(plan.grow_to, 32768);
+    EXPECT_EQ(plan.needed_bytes, app::grid_bytes_for(32768));
+  }
+}
+
+TEST(GrowthPolicy, CapacityFailureCannotBypassAHeadroomRefusal) {
+  app::GrowthInputs in = due_to_grow();
+  in.num_buckets = 16384;
+  in.budget.available_bytes = 512ULL * 1024 * 1024;
+  ASSERT_EQ(app::plan_growth(in).action, app::GrowthAction::DeclinedForMemory);
+  EXPECT_EQ(app::plan_resize(in.num_buckets, in.max_buckets, in.budget).action,
+            app::GrowthAction::DeclinedForMemory);
+
+  // Local chain exhaustion can also request a resize before global occupancy
+  // reaches the preemptive threshold. It still needs the same headroom.
+  in.occupancy = 0.2f;
+  ASSERT_FALSE(app::growth_due(in));
+  EXPECT_EQ(app::plan_resize(in.num_buckets, in.max_buckets, in.budget).action,
+            app::GrowthAction::DeclinedForMemory);
+}
+
+TEST(GrowthPolicy, ConsecutiveResizeUsesTheNewSizeAndMemoryReading) {
+  app::GrowthInputs in = due_to_grow();
+  in.budget.available_bytes = app::grid_bytes_for(2048);
+  const app::GrowthPlan first =
+      app::plan_resize(in.num_buckets, in.max_buckets, in.budget);
+  ASSERT_EQ(first.action, app::GrowthAction::Resize);
+  ASSERT_EQ(first.grow_to, 2048);
+
+  // The first resize consumed the available memory. A retry cannot reuse its
+  // admission, even when the allocation still reports capacity failures.
+  in.budget.available_bytes = 1;
+  const app::GrowthPlan next =
+      app::plan_resize(first.grow_to, in.max_buckets, in.budget);
+  EXPECT_EQ(next.action, app::GrowthAction::DeclinedForMemory);
+  EXPECT_EQ(next.grow_to, 4096);
+  EXPECT_EQ(next.needed_bytes, app::grid_bytes_for(4096));
+
+  // A subsequent recovery remains possible; a refusal does not cap the scan.
+  in.budget.available_bytes = app::grid_bytes_for(4096);
+  EXPECT_EQ(app::plan_resize(first.grow_to, in.max_buckets, in.budget).action,
+            app::GrowthAction::Resize);
+}
+
 /// An unreadable budget is not evidence of a full one. Refusing on it would
 /// stop every scan on a device whose kernel answered short -- turning a missing
 /// diagnostic into a hard cap on scene size.
@@ -347,9 +405,8 @@ TEST(GrowthPolicy, AnUnreadableBudgetDoesNotDeclineTheGrow) {
   in.budget.limit_known = true;
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
 
-  // Same for a valid reading the kernel gave no ceiling for -- including the
-  // at-limit case, where `available_bytes` is a clamped 0 rather than a
-  // measurement. See MemoryBudget::limit_known.
+  // Same for a short reply that did not carry headroom. This is distinct from
+  // a complete reply reporting no headroom, which sets at_limit.
   in.budget.valid = true;
   in.budget.limit_known = false;
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
