@@ -58,24 +58,18 @@ TEST(StatTone, OverfullIsCritical) {
 /// arena paints solid red. The three-argument `tone_for` this replaced took
 /// both numbers or did not compile, and losing that guarantee while removing
 /// the duplication would have traded one silent wrong colour for another.
-TEST(StatTone, AThresholdPairCannotBeWrittenWithOneTier) {
-  static_assert(std::is_constructible_v<app::ToneThresholds, double, double>,
-                "the two-tier pair is the whole interface");
-  static_assert(!std::is_constructible_v<app::ToneThresholds, double>,
-                "a one-tier pair must not compile: its critical tier would be "
-                "a silent 0.0, and every fraction would read Critical");
-  static_assert(!std::is_default_constructible_v<app::ToneThresholds>,
-                "there is no meaningful default pair");
-  SUCCEED();
-}
+static_assert(std::is_constructible_v<app::ToneThresholds, double, double>,
+              "the two-tier pair is the whole interface");
+static_assert(!std::is_constructible_v<app::ToneThresholds, double>,
+              "a one-tier pair must not compile: its critical tier would be "
+              "a silent 0.0, and every fraction would read Critical");
+static_assert(!std::is_default_constructible_v<app::ToneThresholds>,
+              "there is no meaningful default pair");
 
 /// Usable in a constant expression, which is what lets a caller fold a
 /// threshold decision into a static table without a second implementation.
-TEST(StatTone, IsConstexpr) {
-  static_assert(tone_for(0.5, 0.75, 0.9) == StatTone::Neutral);
-  static_assert(tone_for(0.8, 0.75, 0.9) == StatTone::Warn);
-  static_assert(tone_for(0.99, 0.75, 0.9) == StatTone::Critical);
-  SUCCEED();
-}
+static_assert(tone_for(0.5, 0.75, 0.9) == StatTone::Neutral);
+static_assert(tone_for(0.8, 0.75, 0.9) == StatTone::Warn);
+static_assert(tone_for(0.99, 0.75, 0.9) == StatTone::Critical);
 
 }  // namespace

@@ -454,12 +454,10 @@ TEST(AllocationGuard, TheReportedTiersAreTheNumbersThatDecide) {
       app::guard_allocation(app::kRefuseAllocateAtOccupancy, true).allocate);
 }
 
-TEST(AllocationGuard, IsConstexpr) {
-  static_assert(app::guard_allocation(0.5f, true).allocate,
-                "the guard is used in constant expressions");
-  static_assert(app::guard_allocation(0.99f, true).stop ==
-                    app::AllocationStop::VolumeFull,
-                "the guard is used in constant expressions");
-}
+static_assert(app::guard_allocation(0.5f, true).allocate,
+              "the guard is used in constant expressions");
+static_assert(app::guard_allocation(0.99f, true).stop ==
+                  app::AllocationStop::VolumeFull,
+              "the guard is used in constant expressions");
 
 }  // namespace
