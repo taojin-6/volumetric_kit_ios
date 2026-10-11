@@ -3,7 +3,7 @@
 
 # scanner: the live reconstruction app.
 #
-# Two targets, deliberately. Swift and C++ in a *single* target under the Xcode
+# The app uses two targets. Swift and C++ in a *single* target under the Xcode
 # generator is the fragile configuration; splitting the Objective-C++/C++ engine
 # bridge into a static library and letting the Swift app link it through a
 # bridging header is both more robust and how Apple lays these projects out
@@ -21,109 +21,138 @@ set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
-add_library(
-  scanner_bridge STATIC
-  Bridge/VolumetricRenderer.mm
-  Bridge/AllocationStopDisplay.mm
-  Bridge/ARKitCapture.mm
-  Bridge/AtlasRing.cpp
-  Bridge/BridgeStrings.mm
-  Bridge/FrameTrace.cpp
-  Bridge/Fusion.mm
-  Bridge/MemoryQuery.cpp
-  Bridge/Readout.mm
-  Bridge/RendererErrors.mm)
+function(vi_add_scanner_bridge bridge_target)
+  add_library(
+    ${bridge_target} STATIC
+    ${ARGN}
+    Bridge/VolumetricRenderer.mm
+    Bridge/AllocationStopDisplay.mm
+    Bridge/ARKitCapture.mm
+    Bridge/AtlasRing.cpp
+    Bridge/BridgeStrings.mm
+    Bridge/FrameTrace.cpp
+    Bridge/Fusion.mm
+    Bridge/MemoryQuery.cpp
+    Bridge/Readout.mm
+    Bridge/RendererErrors.mm)
 
-# ARC, selected by language rather than by a second copy of the source list.
-#
-# The set_source_files_properties form this replaces named four of the six
-# sources explicitly, seven lines below the list it had to agree with and with
-# nothing deriving one from the other. Omitting a new Bridge/*.mm from it is
-# silent: a translation unit compiled without -fobjc-arc is not an error and not
-# a warning, it is manual retain/release, so every ARFrame, CVPixelBuffer and
-# CAMetalDrawable that file touches simply leaks -- in the app whose documented
-# worst failure is a jetsam SIGKILL with nothing in the log.
-#
-# Both lines, because the two generators take different routes and the failure
-# mode is the same silence the source list had.
-#
-# CMake's Xcode generator DROPS a COMPILE_LANGUAGE genex in
-# target_compile_options -- it has no per-language flag setting to put it in --
-# so the genex alone reached no file in this target at all. Nothing said so:
-# every .mm here had been compiling as manual retain/release, with no dealloc
-# anywhere in Bridge/ and the one that exists written for ARC's ordering. The
-# Xcode build setting is what actually arrives, and Xcode applies it only to the
-# ObjC dialects, so MemoryQuery.cpp and FrameTrace.cpp still stay out by
-# construction rather than by being remembered -- as does every source in
-# vi_core. (They are not excluded for reaching the OS through C headers -- an
-# ARC translation unit may include <mach/mach.h> and call into it perfectly
-# well. It is the file extension that decides.)
-#
-# The genex stays for the generators that honour it: this repo configures with
-# -G Xcode, but a Ninja or Makefile configure that silently lost ARC again is
-# exactly the failure being fixed, and it costs one line to not have it.
-set_target_properties(scanner_bridge
-                      PROPERTIES XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES)
-target_compile_options(scanner_bridge
-                       PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+  # ARC, selected by language rather than by a second copy of the source list.
+  #
+  # The set_source_files_properties form this replaces named four of the six
+  # sources explicitly, seven lines below the list it had to agree with and with
+  # nothing deriving one from the other. Omitting a new Bridge/*.mm from it is
+  # silent: a translation unit compiled without -fobjc-arc is not an error and
+  # not a warning, it is manual retain/release, so every ARFrame, CVPixelBuffer
+  # and CAMetalDrawable that file touches simply leaks -- in the app whose
+  # documented worst failure is a jetsam SIGKILL with nothing in the log.
+  #
+  # Both lines, because the two generators take different routes and the failure
+  # mode is the same silence the source list had.
+  #
+  # CMake's Xcode generator DROPS a COMPILE_LANGUAGE genex in
+  # target_compile_options -- it has no per-language flag setting to put it in
+  # -- so the genex alone reached no file in this target at all. Nothing said
+  # so: every .mm here had been compiling as manual retain/release, with no
+  # dealloc anywhere in Bridge/ and the one that exists written for ARC's
+  # ordering. The Xcode build setting is what actually arrives, and Xcode
+  # applies it only to the ObjC dialects, so MemoryQuery.cpp and FrameTrace.cpp
+  # still stay out by construction rather than by being remembered -- as does
+  # every source in vi_core. (They are not excluded for reaching the OS through
+  # C headers -- an ARC translation unit may include <mach/mach.h> and call into
+  # it perfectly well. It is the file extension that decides.)
+  #
+  # The genex stays for the generators that honour it: this repo configures with
+  # -G Xcode, but a Ninja or Makefile configure that silently lost ARC again is
+  # exactly the failure being fixed, and it costs one line to not have it.
+  set_target_properties(${bridge_target}
+                        PROPERTIES XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES)
+  target_compile_options(${bridge_target}
+                         PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 
-# The warning set the sibling libraries build under, which this target had none
-# of -- not -Wall, not -Wextra, not -Werror.
-#
-# -Werror=switch is the load-bearing one. Bridge/AllocationStopDisplay.hpp and
-# Bridge/RendererErrors.hpp both promise that a value added upstream stops the
-# compile -- the pin bump that brings it in, rather than a build that drifts. As
-# a bare warning that promise is false: a new core Status::Code links cleanly
-# and reports itself to Swift as VolumetricRendererErrorUnknown, and a new
-# AllocationStop cause reports a scan that has stopped taking geometry as a
-# healthy one on every rendering at once. Core/AllocationStop.cpp carries the
-# other half of the same guarantee and sets the same flags.
-target_compile_options(scanner_bridge PRIVATE -Wall -Wextra -Werror=switch)
+  # The warning set the sibling libraries build under, which this target had
+  # none of -- not -Wall, not -Wextra, not -Werror.
+  #
+  # -Werror=switch is the load-bearing one. Bridge/AllocationStopDisplay.hpp and
+  # Bridge/RendererErrors.hpp both promise that a value added upstream stops the
+  # compile -- the pin bump that brings it in, rather than a build that drifts.
+  # As a bare warning that promise is false: a new core Status::Code links
+  # cleanly and reports itself to Swift as VolumetricRendererErrorUnknown, and a
+  # new AllocationStop cause reports a scan that has stopped taking geometry as
+  # a healthy one on every rendering at once. Core/AllocationStop.cpp carries
+  # the other half of the same guarantee and sets the same flags.
+  target_compile_options(${bridge_target} PRIVATE -Wall -Wextra -Werror=switch)
 
-# VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
-# VkMetalSurfaceCreateInfoEXT is declared. The core's
-# volumetric_kit/core/vulkan/vulkan.hpp umbrella deliberately includes no
-# platform defines -- naming the platform is the consumer's job, which is
-# exactly this target.
-target_compile_definitions(scanner_bridge PRIVATE VK_USE_PLATFORM_METAL_EXT)
+  # VK_USE_PLATFORM_METAL_EXT makes <vulkan/vulkan.h> pull in vulkan_metal.h, so
+  # VkMetalSurfaceCreateInfoEXT is declared. The core's
+  # volumetric_kit/core/vulkan/vulkan.hpp umbrella deliberately includes no
+  # platform defines -- naming the platform is the consumer's job, which is
+  # exactly this target.
+  target_compile_definitions(${bridge_target} PRIVATE VK_USE_PLATFORM_METAL_EXT)
 
-# glm targets OpenGL's [-1, 1] clip depth; Vulkan's is [0, 1]. This switches
-# glm::perspective over, and it must be a *target* definition rather than a
-# #define in one file: glm is header-only, so the convention is fixed per
-# translation unit at instantiation, and a TU that missed it would silently
-# build a projection the depth buffer disagrees with.
-#
-# Now also inherited from vi_core, which sets it PUBLIC for the same reason, and
-# kept here regardless: this target is where `glm::perspective` is actually
-# called, so it is where the convention has to hold whatever it links. It is not
-# inherited from the libraries -- gfx sets it PUBLIC on
-# volumetric_kit::gfx_camera, which this target does not link (gfx_pipelines
-# pulls in gfx_core + gfx_assets, and gfx_app pulls in gfx_core +
-# gfx_windowing). Without it the near plane lands at 2fn/(f+n) instead of n: ~10
-# cm rather than the 5 cm kNearClip promises, and the turntable's closest zoom
-# sits inside the clip volume.
-target_compile_definitions(scanner_bridge PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
+  # glm targets OpenGL's [-1, 1] clip depth; Vulkan's is [0, 1]. This switches
+  # glm::perspective over, and it must be a *target* definition rather than a
+  # #define in one file: glm is header-only, so the convention is fixed per
+  # translation unit at instantiation, and a TU that missed it would silently
+  # build a projection the depth buffer disagrees with.
+  #
+  # Now also inherited from vi_core, which sets it PUBLIC for the same reason,
+  # and kept here regardless: this target is where `glm::perspective` is
+  # actually called, so it is where the convention has to hold whatever it
+  # links. It is not inherited from the libraries -- gfx sets it PUBLIC on
+  # volumetric_kit::gfx_camera, which this target does not link (gfx_pipelines
+  # pulls in gfx_core + gfx_assets, and gfx_app pulls in gfx_core +
+  # gfx_windowing). Without it the near plane lands at 2fn/(f+n) instead of n:
+  # ~10 cm rather than the 5 cm kNearClip promises, and the turntable's closest
+  # zoom sits inside the clip volume.
+  target_compile_definitions(${bridge_target}
+                             PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
-# The triangle's SPIR-V is embedded as a constexpr byte array, matching how the
-# library tiers ship their kernels: no runtime file, nothing to resolve in the
-# bundle. Reuses recon's embed module (gfx has an identical vg_embed_shaders).
-list(APPEND CMAKE_MODULE_PATH "${volumetric_kit_recon_SOURCE_DIR}/cmake")
-include(vr_embed)
-vr_embed_shaders(
-  scanner_bridge SYMBOL_PREFIX "vi_" SHADERS
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.vert"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.frag")
+  # The triangle's SPIR-V is embedded as a constexpr byte array, matching how
+  # the library tiers ship their kernels: no runtime file, nothing to resolve in
+  # the bundle. Reuses recon's embed module (gfx has an identical
+  # vg_embed_shaders).
+  list(APPEND CMAKE_MODULE_PATH "${volumetric_kit_recon_SOURCE_DIR}/cmake")
+  include(vr_embed)
+  vr_embed_shaders(
+    ${bridge_target} SYMBOL_PREFIX "vi_" SHADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.frag")
 
-target_include_directories(scanner_bridge
-                           PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
+  target_include_directories(${bridge_target}
+                             PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-# recon_sensor carries the capture contract and the camera-convention
-# conversions. Since the camera parameter blocks moved into core it links
-# recon_core and nothing else, so the ARKit driver pulls in no fusion tier just
-# to implement ICameraCapture; recon_tsdf and recon_texture below are what the
-# fusion spine consumes, and recon_mesh/recon_volume arrive transitively. Build
-# the scanner as a measurement binary: one mesh slot, spans tracked, and NO
-# geometry published, so recon's incremental extract can be timed at the
+  # recon_sensor carries the capture contract and camera conversions through
+  # recon_core alone. recon_tsdf and recon_texture supply fusion; recon_mesh and
+  # recon_volume arrive transitively.
+  #
+  # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
+  # holds an OrbitCamera by value and hands MemoryBudget across the seam. The
+  # core's vulkan tier is named too, not left to recon's and gfx's links: the
+  # bridge builds the SharedDevice, adopts recon's Device and makes its
+  # Allocator itself.
+  target_link_libraries(
+    ${bridge_target}
+    PUBLIC vi_core
+           volumetric_kit::core_vulkan
+           volumetric_kit::gfx_app
+           volumetric_kit::gfx_core
+           volumetric_kit::recon_sensor
+           volumetric_kit::recon_texture
+           volumetric_kit::recon_tsdf
+           volumetric_kit::gfx_pipelines)
+endfunction()
+
+vi_add_scanner_bridge(scanner_bridge)
+
+# Compile the same bridge with measurement mode enabled, sharing the existing
+# recon/gfx/core targets. Explicit-only coverage: the Swift app links only
+# scanner_bridge, and ordinary builds do not build this second archive.
+vi_add_scanner_bridge(scanner_bridge_benchmark EXCLUDE_FROM_ALL)
+target_compile_definitions(scanner_bridge_benchmark
+                           PRIVATE VI_INCREMENTAL_BENCHMARK)
+
+# Build the scanner as a measurement binary: one mesh slot, spans tracked, and
+# NO geometry published, so recon's incremental extract can be timed at the
 # device's own dirty fraction. Vertex sharing stays ON -- unsharing is what the
 # first version did and it cost 3x the vertex arena, which is a settled revert,
 # not a knob. Compile-time rather than runtime because iOS resumes a process
@@ -154,22 +183,6 @@ if(VI_INCREMENTAL_BENCHMARK)
   # On the bridge, which is where VolumetricRenderer.mm compiles.
   target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
 endif()
-
-# vi_core is PUBLIC because the bridge's own headers expose it: the renderer
-# holds an OrbitCamera by value and hands MemoryBudget across the seam. The
-# core's vulkan tier is named too, not left to recon's and gfx's links: the
-# bridge builds the SharedDevice, adopts recon's Device and makes its Allocator
-# itself.
-target_link_libraries(
-  scanner_bridge
-  PUBLIC vi_core
-         volumetric_kit::core_vulkan
-         volumetric_kit::gfx_app
-         volumetric_kit::gfx_core
-         volumetric_kit::recon_sensor
-         volumetric_kit::recon_texture
-         volumetric_kit::recon_tsdf
-         volumetric_kit::gfx_pipelines)
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(
