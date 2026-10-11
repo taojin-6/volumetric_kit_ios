@@ -75,6 +75,17 @@ it explicitly or use a fresh build directory:
 cmake -S . -B build-ios -DVI_INCREMENTAL_BENCHMARK=OFF
 ```
 
+CI also builds the explicit `scanner_bridge_benchmark` target in the same
+configured project. It compiles the bridge with measurement mode enabled while
+sharing the normal build's recon, gfx, and core libraries. It is excluded from
+the default build and is not linked into the scanner app, so this compile check
+does not change the app's mode or the cached option above:
+
+```sh
+cmake --build build-ios --config Debug --target scanner_bridge_benchmark -- \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+```
+
 ### The host tests
 
 `vi_core` — the scanner's pure logic — builds and runs on the machine you are
