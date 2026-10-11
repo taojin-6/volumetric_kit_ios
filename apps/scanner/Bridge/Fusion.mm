@@ -617,6 +617,26 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
     growth.budget = query_memory_budget();
     plan = plan_growth(growth);
   }
+  const auto note_memory_decline = [this](const GrowthPlan& refused) {
+    memory_declined_ = true;
+    memory_declined_at_frame_ = stats_.frames_fused;
+    declined_grow_to_ = refused.grow_to;
+    declined_grow_bytes_ = refused.needed_bytes;
+  };
+  const auto clear_memory_decline = [this] {
+    memory_declined_ = false;
+    memory_declined_at_frame_ = 0;
+    declined_grow_to_ = 0;
+    declined_grow_bytes_ = 0;
+  };
+  // Expire the warning independently of growth_due: a reactive refusal below
+  // the occupancy threshold may be followed only by successful allocations.
+  // Clear before handling this frame's plan so a fresh refusal renews it.
+  if (memory_declined_ &&
+      !memory_decline_active(growth.memory_declined,
+                             growth.frames_since_memory_decline)) {
+    clear_memory_decline();
+  }
 
   // A switch rather than the two-way `if`/`else` this was, for the reason
   // Core/CMakeLists.txt gives for building with `-Werror=switch`: the action is
@@ -644,10 +664,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       //
       // Nor `preemptive_grow_failed_at_`: nothing was asked of the allocator,
       // so there is no refused size to pin. See kMemoryDeclineRetryFrames.
-      memory_declined_ = true;
-      memory_declined_at_frame_ = stats_.frames_fused;
-      declined_grow_to_ = plan.grow_to;
-      declined_grow_bytes_ = plan.needed_bytes;
+      note_memory_decline(plan);
       break;
     case GrowthAction::Resize: {
       const std::int32_t grown_to = plan.grow_to;
@@ -668,10 +685,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
         preemptive_grow_failed_at_ = 0;
         // The table is bigger, so whatever the headroom would not cover is a
         // question about a different size now.
-        memory_declined_ = false;
-        memory_declined_at_frame_ = 0;
-        declined_grow_to_ = 0;
-        declined_grow_bytes_ = 0;
+        clear_memory_decline();
         // Re-read, because the guard below acts on this number and the doubling
         // just halved it. Sampling once above and testing there is what made
         // the frame that grew the map also the frame that refused to allocate
@@ -797,8 +811,19 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
                     " blocks dropped; far geometry will be missing";
       break;
     }
-    const std::int32_t grown_to =
-        grow_target(config_.num_buckets, config_.max_buckets);
+    // A local chain can exhaust below the preemptive occupancy threshold, or
+    // allocation can fail after that path declined a resize. Neither permits
+    // bypassing memory admission. Query inside the loop: the preceding resize
+    // and retry may have consumed the headroom that admitted the last attempt.
+    const GrowthPlan reactive_plan = plan_resize(
+        config_.num_buckets, config_.max_buckets, query_memory_budget());
+    if (reactive_plan.action != GrowthAction::Resize) {
+      if (reactive_plan.action == GrowthAction::DeclinedForMemory) {
+        note_memory_decline(reactive_plan);
+      }
+      break;
+    }
+    const std::int32_t grown_to = reactive_plan.grow_to;
     // Accumulates into the same `resize` row as the preemptive doubling above,
     // which is the honest total: both are the same operation at the same cost,
     // and a frame that reaches this loop has usually skipped that one.
@@ -813,6 +838,7 @@ void Fusion::fuse(const vr::sensor::CapturedFrame& frame) {
       return;
     }
     config_.num_buckets = grown_to;
+    clear_memory_decline();
     ++grow_attempts;
     // Checked, not discarded. This is the same call as above and its return is
     // the only thing that says whether the grown map actually absorbed the

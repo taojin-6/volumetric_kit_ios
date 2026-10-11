@@ -1330,7 +1330,7 @@ class Fusion {
   // any successful grow, since a resize that failed at N may well succeed at N
   // once the pressure that refused it has passed.
   std::int32_t preemptive_grow_failed_at_ = 0;
-  // Whether a preemptive doubling was turned away by the *headroom check*, and
+  // Whether a doubling was turned away by the *headroom check*, and
   // the `stats_.frames_fused` it was turned away at.
   //
   // A second pair rather than more work for the one above, because the two
@@ -1343,8 +1343,8 @@ class Fusion {
   // occupancy passes kRefuseAllocateAtOccupancy the allocate guard
   // short-circuits the overflow count the reactive backstop would have grown
   // on. One momentary shortfall then held the table at its current size for the
-  // rest of the scan. Backs off on kMemoryDeclineRetryFrames instead, and is
-  // cleared by any successful grow.
+  // rest of the scan. Expires after kMemoryDeclineRetryFrames even when no grow
+  // is due, and is cleared earlier by any successful grow.
   bool memory_declined_ = false;
   std::uint64_t memory_declined_at_frame_ = 0;
   // The figures that decline is about, held so the read-out can print them for

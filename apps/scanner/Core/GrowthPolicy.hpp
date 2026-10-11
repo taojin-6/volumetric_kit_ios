@@ -88,10 +88,11 @@ inline constexpr std::int32_t kAttributeBytesPerVoxel = 12;
 /// bucket-local `chain` exhaustion, which fires with the global load factor
 /// well under the grow threshold. Two keeps this a backstop for a frame that
 /// outruns one doubling, which is what it is documented to be, and leaves the
-/// rest of the range to the preemptive path that checks the memory budget.
+/// rest of the range to the preemptive path. Both paths check the memory budget
+/// before each resize.
 inline constexpr int kMaxGrowAttempts = 2;
 
-/// @brief Fused frames a memory-declined doubling waits before asking again.
+/// @brief Fused frames preemptive growth waits after a memory decline.
 ///
 /// A decline is a reading of the *device*, not of the table: the headroom that
 /// would not cover a doubling a second ago may cover it now, because whatever
@@ -109,10 +110,21 @@ inline constexpr int kMaxGrowAttempts = 2;
 /// never reached, forever, from one momentary shortfall at a doubling boundary.
 ///
 /// Long enough that the `task_info` trap @ref growth_due exists to keep off the
-/// per-frame path stays off it -- a standing decline costs one syscall per this
-/// many fused frames, not one per frame -- and short enough that a scan
-/// recovers within a second or two of the pressure lifting.
+/// ordinary per-frame path stays off it, and short enough that a scan recovers
+/// within a second or two of the pressure lifting. A capacity failure can
+/// request reactive growth sooner, but it must take a fresh reading too.
 inline constexpr std::uint64_t kMemoryDeclineRetryFrames = 60;
+
+/// @brief Whether a headroom refusal is still current during its backoff.
+///
+/// Shared by the growth gate and the published warning. A reactive refusal can
+/// happen below the occupancy threshold and outlive the chain pressure that
+/// caused it, so its warning must expire even when no new growth is due.
+constexpr bool memory_decline_active(
+    bool memory_declined, std::uint64_t frames_since_memory_decline) noexcept {
+  return memory_declined &&
+         frames_since_memory_decline < kMemoryDeclineRetryFrames;
+}
 
 /// @brief The occupancy past which no new blocks are allocated at all.
 ///
@@ -286,6 +298,20 @@ struct GrowthPlan {
   std::uint64_t needed_bytes = 0;
 };
 
+/// @brief Admit one requested doubling against a fresh memory reading.
+/// @param num_buckets Current table size.
+/// @param max_buckets Configured table ceiling.
+/// @param budget Memory reading taken immediately before this attempt.
+/// @return None at the table ceiling; otherwise Resize or DeclinedForMemory,
+///         with the target and its transient allocation cost.
+///
+/// Shared by preemptive and capacity-failure growth. It does not require high
+/// global occupancy: one bucket's chain can exhaust on an otherwise empty map.
+/// Call again with a new reading before each retry; a preceding allocation may
+/// have consumed the headroom that admitted the previous resize.
+GrowthPlan plan_resize(std::int32_t num_buckets, std::int32_t max_buckets,
+                       const MemoryBudget& budget) noexcept;
+
 /// @brief Whether a doubling is due, ignoring whether it can be afforded.
 ///
 /// The half of the decision that costs nothing, split out so a caller can ask
@@ -300,8 +326,7 @@ constexpr bool growth_due(const GrowthInputs& in) noexcept {
   // A headroom decline backs off on a cadence rather than being pinned to a
   // size; see kMemoryDeclineRetryFrames for why it cannot be pinned.
   const bool waiting_out_a_decline =
-      in.memory_declined &&
-      in.frames_since_memory_decline < kMemoryDeclineRetryFrames;
+      memory_decline_active(in.memory_declined, in.frames_since_memory_decline);
   return in.occupancy_known && in.occupancy > in.grow_threshold &&
          in.num_buckets < in.max_buckets && in.num_buckets != in.declined_at &&
          !waiting_out_a_decline;
@@ -339,9 +364,10 @@ constexpr bool growth_due(const GrowthInputs& in) noexcept {
 /// that gets a scan SIGKILLed rather than failed, and jetsam returns no
 /// `Status`.
 ///
-/// A reading that is invalid, or whose ceiling is unknown, does **not** decline
-/// the grow: an unreadable budget is not evidence of a full one, and refusing
-/// on it would stop every scan on a device whose kernel answered short.
+/// Invalid or missing headroom does not decline the grow: an unreadable budget
+/// is not evidence of a full one. A valid @ref MemoryBudget::at_limit reading
+/// does decline it, even though zero remaining bytes cannot derive the total
+/// ceiling. Admission is shared with reactive growth through @ref plan_resize.
 GrowthPlan plan_growth(const GrowthInputs& in) noexcept;
 
 /// @brief Whether to allocate this frame's blocks, and why not when not.
