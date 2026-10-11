@@ -86,10 +86,25 @@ cmake --build build-ios --config Debug --target scanner_bridge_benchmark -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 ```
 
+### Scanner configuration
+
+The app bundles [`apps/scanner/config/scanner.json`](apps/scanner/config/scanner.json).
+Edit this file to select voxel size, truncation, allocation limits, fusion and
+remeshing cadence, texturing, and stage timing, then rebuild the app. The bridge
+also accepts a configuration file path, so a caller can select another scenario.
+Core owns the versioned JSON format, defaults, and all static validation. A
+configuration error reaches the dashboard before GPU bring-up. Hardware support,
+resource creation, and runtime allocation checks remain in the scanner and engines.
+
+Scenario files share the format used by recon, gfx, and calib. Core rejects fields
+that the selected application cannot use; scanner configurations require the live
+ARKit source. Drawable size and queue/ring resources still come from the running
+app. The measurement build remains a build-time choice.
+
 ### The host tests
 
-`vi_core` — the scanner's pure logic — builds and runs on the machine you are
-sitting at:
+`vi_core` — the scanner's pure logic — and the bundled configuration test
+build and run on the host:
 
 ```sh
 cmake -S . -B build-host -DVI_HOST_TESTS=ON
@@ -98,7 +113,8 @@ ctest --test-dir build-host --output-on-failure
 ```
 
 No toolchain file, no MoltenVK, no recon, no gfx, no Xcode project — that mode
-short-circuits before any of them, so it is a couple of minutes rather than tens.
+short-circuits before any of them. It fetches only glm, the CPU-only core
+configuration tier, its private JSON dependency, and the test framework.
 
 It exists because **everything else here is build-only by nature**: MoltenVK
 ships no simulator slice and ARKit scene depth needs LiDAR, so nothing that

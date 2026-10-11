@@ -417,7 +417,14 @@ final class ScannerViewController: UIViewController {
     // thread through launch is a 0x8badf00d watchdog kill. The smoke app moves
     // the same class of work off-main for the same reason.
     DispatchQueue.global(qos: .userInitiated).async {
-      let outcome = Result { try VolumetricRenderer(layer: layer) }
+      let outcome = Result {
+        guard let url = Bundle.main.url(forResource: "scanner", withExtension: "json") else {
+          throw NSError(
+            domain: "ScannerConfiguration", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Missing bundled scanner.json"])
+        }
+        return try VolumetricRenderer(layer: layer, configurationPath: url.path)
+      }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.bringUpInFlight = false

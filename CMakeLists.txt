@@ -21,10 +21,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # The app targets are iOS-only. `vi_core` is not, and that is the whole point of
-# it: it is the scanner's pure logic, and it is the only thing in this repo a
-# host can build or a test can run. Nothing else here is runnable off-device --
-# MoltenVK ships no simulator slice and ARKit scene depth needs LiDAR -- so
-# without this mode CI can assert that the app compiles and nothing more.
+# it: it is the scanner's pure logic. Together with the shared configuration
+# parser it can be tested on the host. The renderer is device-only -- MoltenVK
+# ships no simulator slice and ARKit scene depth needs LiDAR -- so without this
+# mode CI can assert that the app compiles and nothing more.
 #
 # Opt-in rather than inferred from the absence of the toolchain file, because
 # the FATAL_ERROR below is load-bearing: configuring without the toolchain is
@@ -127,7 +127,20 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
   OVERRIDE_FIND_PACKAGE)
 
-# --- Host mode: vi_core and its tests, and nothing else ----------------------
+# The common scenario parser is CPU-only; host tests exercise the exact file
+# bundled into the scanner. Only iOS builds enable the Vulkan tier.
+set(VKC_WITH_CONFIG ON)
+set(VKC_WITH_VULKAN
+    ${VI_IOS}
+    CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  volumetric_kit_core
+  GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
+  GIT_TAG afaa844b41cf21b98d5b412b5e70e3708e1e71ef)
+FetchContent_MakeAvailable(volumetric_kit_core)
+vkc_require_core(0.3.0)
+
+# --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs recon, gfx and MoltenVK, none of which a
 # host build wants or can use. So the host configure stops here.
 #
@@ -155,20 +168,11 @@ endif()
 # core without it, or older than its own pin -- and recon's Device, Allocator
 # and SharedDevice live there. Bump it with, or at or after, recon's and gfx's
 # core pins.
-set(VKC_WITH_VULKAN
-    ON
-    CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  volumetric_kit_core
-  GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG a60398b7aeb2cad722a3f79cb71696bda10fc054) # core #13, recon's and
-                                                    # gfx's pin
 
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 624b2dce05e3925b95c14e9f44ffc4832524d2b7) # recon #168, after its core
-                                                    # migration (#164-#167)
+  GIT_TAG 624b2dce05e3925b95c14e9f44ffc4832524d2b7) # recon #168
 
 # recon's VR_BUILD_EXAMPLES / VR_BUILD_TESTS default to PROJECT_IS_TOP_LEVEL, so
 # a fetched copy builds the library tiers only -- no gtest, no example
@@ -185,8 +189,7 @@ FetchContent_MakeAvailable(volumetric_kit_recon)
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG 53e8f6389fe9cd9462e7000c49cc758d29c8149a) # gfx #106, after its core
-                                                    # migration (#100-#106)
+  GIT_TAG 53e8f6389fe9cd9462e7000c49cc758d29c8149a) # gfx #106
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)

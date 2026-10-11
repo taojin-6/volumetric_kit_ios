@@ -5,8 +5,8 @@
 #
 # Configured only in host mode (see the root CMakeLists.txt): these run on the
 # machine that builds them, and an iOS-arm64 test binary is not runnable there.
-# That is also why they cover vi_core and nothing else -- everything past it
-# needs a VkDevice, a live task port or an ARFrame, none of which exist off the
+# They cover vi_core and the bundled configuration -- everything past them needs
+# a VkDevice, a live task port or an ARFrame, none of which exist off the
 # device.
 #
 # googletest, matching the sibling libraries rather than inventing a harness for
@@ -45,3 +45,12 @@ target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main)
 # rather than the binary.
 include(GoogleTest)
 gtest_discover_tests(vi_core_tests)
+
+add_executable(vi_config_tests scanner_config_test.cpp)
+target_link_libraries(vi_config_tests PRIVATE volumetric_kit::core_config
+                                              GTest::gtest_main)
+target_compile_definitions(
+  vi_config_tests
+  PRIVATE
+    VI_SCANNER_CONFIG="${PROJECT_SOURCE_DIR}/apps/scanner/config/scanner.json")
+gtest_discover_tests(vi_config_tests)

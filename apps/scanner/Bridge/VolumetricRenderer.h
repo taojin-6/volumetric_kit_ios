@@ -523,9 +523,12 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @brief Bring up the renderer against @p layer.
 /// @param layer  The view's `CAMetalLayer`; becomes the `VkSurfaceKHR`. Its
 ///               `drawableSize` must already be set in **pixels**.
+/// @param configurationPath Path to a shared JSON scenario. Core validates it
+///                          before any GPU resources are created.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
+                     configurationPath:(NSString*)configurationPath
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
