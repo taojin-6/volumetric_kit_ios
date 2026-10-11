@@ -109,11 +109,9 @@ TEST(Freshness, TheStageMarginIsTheFuseStalenessSpan) {
   EXPECT_TRUE(app::stages_stale(fuse + app::kFuseStaleAfterMs + 1.0f, fuse));
 }
 
-TEST(Freshness, IsConstexpr) {
-  static_assert(!app::survey_stale(true, app::kSurveyStaleAfter),
-                "the freshness rules are used in constant expressions");
-  static_assert(app::extract_stale(true, 3, 1),
-                "the freshness rules are used in constant expressions");
-}
+static_assert(!app::survey_stale(true, app::kSurveyStaleAfter),
+              "the freshness rules are used in constant expressions");
+static_assert(app::extract_stale(true, 3, 1),
+              "the freshness rules are used in constant expressions");
 
 }  // namespace

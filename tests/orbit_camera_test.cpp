@@ -177,21 +177,31 @@ TEST(OrbitCamera, OrbitMovesTheCameraOppositeTheFinger) {
       << "a downward drag must lift the camera over the scene";
 }
 
-/// At exactly +-90 degrees the pivot-to-eye direction is parallel to world up,
-/// `glm::lookAt`'s cross product collapses, and the view comes out full of
-/// NaNs. `kMaxPitch` exists to make that unreachable however hard the drag.
-TEST(OrbitCamera, PitchClampKeepsTheViewFiniteUnderAnyDrag) {
+/// Overlarge drags stop at 89 degrees on either side and can be reversed.
+/// Finiteness alone misses an absent clamp: the view can remain finite after
+/// orbiting over a pole.
+TEST(OrbitCamera, PitchClampStopsAtBothLimitsAndAllowsReversal) {
   OrbitCamera cam;
   cam.set_device_pose(pose_looking({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}));
 
-  for (int i = 0; i < 50; ++i) {
-    cam.orbit(0.0f, 1.0f);
-    ASSERT_TRUE(all_finite(cam.view())) << "NaN after " << (i + 1) << " drags";
-  }
-  for (int i = 0; i < 100; ++i) {
-    cam.orbit(0.0f, -1.0f);
-    ASSERT_TRUE(all_finite(cam.view()))
-        << "NaN after " << (i + 1) << " reverse drags";
+  // Independent direction values at the documented 89-degree limit.
+  constexpr float kVertical = 0.9998477f;
+  constexpr float kHorizontal = 0.0174524f;
+  for (const float sign : {1.0f, -1.0f}) {
+    SCOPED_TRACE(sign);
+    // The second drag must stay at the same limit, without wrapping over it.
+    for (int drag = 0; drag < 2; ++drag) {
+      cam.orbit(0.0f, sign * 2.0f);
+      const glm::vec3 forward = view_forward(cam.view());
+      EXPECT_NEAR(forward.x, 0.0f, 1e-5f);
+      EXPECT_NEAR(forward.y, -sign * kVertical, 1e-5f);
+      EXPECT_NEAR(forward.z, -kHorizontal, 1e-5f);
+    }
+    cam.orbit(0.0f, -sign * 0.01f);
+    const glm::vec3 reversed = view_forward(cam.view());
+    EXPECT_GT(-sign * reversed.y, 0.0f);
+    EXPECT_LT(-sign * reversed.y, kVertical);
+    EXPECT_LT(reversed.z, -kHorizontal);
   }
 }
 

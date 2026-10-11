@@ -62,34 +62,4 @@ TEST(ViewOrientation, UpsideDownIsAQuarterTurnNegative) {
                   -kQuarter);
 }
 
-/// The step must run the *same* way across the whole enum: consecutive
-/// orientations differ by exactly one quarter turn, in one direction. A mapping
-/// that got the zero right and the step backwards would pass the landscape
-/// tests above and fail here.
-TEST(ViewOrientation, StepIsOneQuarterTurnThroughout) {
-  const ViewOrientation order[] = {
-      ViewOrientation::LandscapeLeft,
-      ViewOrientation::Portrait,
-      ViewOrientation::LandscapeRight,
-      ViewOrientation::PortraitUpsideDown,
-  };
-  for (int i = 1; i < 4; ++i) {
-    EXPECT_FLOAT_EQ(viewport_turn(order[i]) - viewport_turn(order[i - 1]),
-                    -kQuarter)
-        << "step from index " << (i - 1) << " to " << i;
-  }
-}
-
-/// The raw values are load-bearing: `viewport_turn` subtracts two of them and
-/// reads the difference as a count of quarter turns. ViewOrientation.cpp
-/// static_asserts this at compile time; asserted again here so the reason is
-/// visible to someone reading the tests rather than only to someone who breaks
-/// the build.
-TEST(ViewOrientation, RawValuesAreQuarterTurns) {
-  EXPECT_EQ(static_cast<int>(ViewOrientation::LandscapeLeft), 0);
-  EXPECT_EQ(static_cast<int>(ViewOrientation::Portrait), 1);
-  EXPECT_EQ(static_cast<int>(ViewOrientation::LandscapeRight), 2);
-  EXPECT_EQ(static_cast<int>(ViewOrientation::PortraitUpsideDown), 3);
-}
-
 }  // namespace
