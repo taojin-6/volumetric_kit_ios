@@ -136,7 +136,7 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 1ce825dcbfac4f142e694846488bdf4fa5aa13ae)
+  GIT_TAG 7857a6d4b9973b32461af09062d0bb894c86c751)
 FetchContent_MakeAvailable(volumetric_kit_core)
 vkc_require_core(0.3.0)
 
