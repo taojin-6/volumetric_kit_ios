@@ -64,6 +64,7 @@
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
 
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/config/config.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -257,11 +258,20 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
+                     configurationPath:(NSString*)configurationPath
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
     return nil;
   }
+  const auto loaded =
+      vkc::config::load(configurationPath.fileSystemRepresentation,
+                        vkc::config::Application::Scanner);
+  if (!loaded) {
+    app::set_error(error, loaded.status(), "Scanner configuration");
+    return nil;
+  }
+  const auto& settings = loaded.value();
   _impl = std::make_unique<app::RendererImpl>();
 
   // --- One VkDevice, adopted by both libraries ------------------------------
@@ -520,6 +530,16 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
 
   app::FusionConfig fusion_config;
+  fusion_config.voxel_size = settings.fusion.voxel_size_m;
+  fusion_config.trunc_dist = settings.fusion.truncation_m;
+  fusion_config.num_buckets = settings.fusion.buckets;
+  fusion_config.max_buckets = settings.fusion.max_buckets;
+  fusion_config.fuse_every = static_cast<uint32_t>(settings.fusion.fuse_every);
+  fusion_config.remesh_every =
+      static_cast<uint32_t>(settings.fusion.remesh_every);
+  fusion_config.occlusion_threshold = settings.fusion.occlusion_m;
+  fusion_config.texture = settings.render.texture;
+  fusion_config.measure_stages = settings.diagnostics.measure_stages;
   // One slot per frame in flight, plus one. The renderer draws the extractor's
   // buffers in place now, so an extract must never land on geometry a pending
   // frame is still reading -- and the ring is what makes that impossible rather

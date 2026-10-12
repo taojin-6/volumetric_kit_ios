@@ -104,6 +104,11 @@ jobs:
           fi
           echo "${found} app bundle(s) verified as iOS arm64."
 
+      - name: Verify the scanner scenario is bundled
+        run: |
+          cmp apps/scanner/config/scanner.json \
+            build-ios/apps/scanner/Debug-iphoneos/scanner.app/scanner.json
+
       # The alternate bridge compiles VI_INCREMENTAL_BENCHMARK's branch in the
       # same project, reusing the libraries built above. A separate build-bench
       # tree repeated compiler checks, populated its own _deps, and rebuilt

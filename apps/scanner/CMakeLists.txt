@@ -20,6 +20,14 @@
 set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
+# Both bridge variants use identical shaders. Embed once so the generated
+# symbols and build rules have one owner under Xcode as well as Make/Ninja.
+add_library(vi_scanner_shaders INTERFACE)
+vkc_embed_shaders(
+  vi_scanner_shaders SYMBOL_PREFIX "vi_" SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.vert"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.frag")
+
 # --- scanner_bridge: the Objective-C++ seam ----------------------------------
 function(vi_add_scanner_bridge bridge_target)
   add_library(
@@ -107,17 +115,6 @@ function(vi_add_scanner_bridge bridge_target)
   target_compile_definitions(${bridge_target}
                              PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
 
-  # The triangle's SPIR-V is embedded as a constexpr byte array, matching how
-  # the library tiers ship their kernels: no runtime file, nothing to resolve in
-  # the bundle. Reuses recon's embed module (gfx has an identical
-  # vg_embed_shaders).
-  list(APPEND CMAKE_MODULE_PATH "${volumetric_kit_recon_SOURCE_DIR}/cmake")
-  include(vr_embed)
-  vr_embed_shaders(
-    ${bridge_target} SYMBOL_PREFIX "vi_" SHADERS
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.vert"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/triangle.frag")
-
   target_include_directories(${bridge_target}
                              PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
@@ -139,7 +136,8 @@ function(vi_add_scanner_bridge bridge_target)
            volumetric_kit::recon_sensor
            volumetric_kit::recon_texture
            volumetric_kit::recon_tsdf
-           volumetric_kit::gfx_pipelines)
+           volumetric_kit::gfx_pipelines
+    PRIVATE volumetric_kit::core_config vi_scanner_shaders)
 endfunction()
 
 vi_add_scanner_bridge(scanner_bridge)
@@ -196,6 +194,10 @@ add_executable(
   Swift/SceneDelegate.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
+
+set_source_files_properties(config/scanner.json
+                            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 
 # MoltenVK is a static archive, so its platform dependencies resolve at the app
 # link, not the library's. Metal is the translation target; QuartzCore provides

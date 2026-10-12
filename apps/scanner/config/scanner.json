@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "operation": "fuse",
+  "source": { "kind": "live", "driver": "arkit" },
+  "fusion": {
+    "voxel_size_m": 0.01,
+    "truncation_m": 0.03,
+    "buckets": 1024,
+    "max_buckets": 32768,
+    "fuse_every": 1,
+    "remesh_every": 1,
+    "occlusion_m": 0.02
+  },
+  "render": { "texture": true },
+  "diagnostics": { "measure_stages": true }
+}
