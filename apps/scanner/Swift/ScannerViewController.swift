@@ -336,7 +336,7 @@ final class ScannerViewController: UIViewController {
   /// *interface* ended up, which is what the app's supported orientations
   /// actually constrain.
   private func currentViewOrientation() -> VolumetricViewOrientation {
-    switch view.window?.windowScene?.interfaceOrientation {
+    switch view.window?.windowScene?.effectiveGeometry.interfaceOrientation {
     case .portrait: return .portrait
     case .portraitUpsideDown: return .portraitUpsideDown
     case .landscapeLeft: return .landscapeLeft

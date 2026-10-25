@@ -317,7 +317,7 @@ struct DashboardView: View {
       }
     }
     .onAppear { onExpandedChange(expanded) }
-    .onChange(of: expanded) { onExpandedChange($0) }
+    .onChange(of: expanded) { _, now in onExpandedChange(now) }
     // Both non-interactive, deliberately. The panel sits over the
     // reconstruction and the orbit/pan/zoom recognizers live on the view
     // underneath; a full-bleed background that hit-tests claims every touch in
