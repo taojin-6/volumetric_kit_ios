@@ -573,9 +573,9 @@ final class ScannerViewController: UIViewController {
       suspend()
       return
     }
-    // No poll here. `ICameraCapture` is single-consumer ("Poll from one
-    // thread"), and its CapturedFrame is a non-owning view valid only until the
-    // next poll -- so the bring-up placeholder that polled once per rendered
+    // No poll here. The bridge's `FrameSource` is single-consumer ("poll from
+    // one thread"), and its CapturedFrame is a non-owning view valid only until
+    // the next poll -- so the bring-up placeholder that polled once per rendered
     // frame is now a second consumer racing the fuse thread for the same
     // buffers, and every frame it won was a frame fusion never saw.
     updateStatus(renderer)

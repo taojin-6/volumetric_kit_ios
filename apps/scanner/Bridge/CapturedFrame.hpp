@@ -45,6 +45,9 @@ struct CapturedFrame {
 
 /// @brief What the fuse thread polls: ARKitCapture, behind the opaque handle
 ///        `VolumetricCapture` hands the renderer.
+///
+/// Single-consumer: poll from one thread, since a poll ends the borrow of the
+/// frame the previous one returned.
 class FrameSource {
  public:
   virtual ~FrameSource() = default;

@@ -159,24 +159,14 @@ set_source_files_properties(config/scanner.json
                             PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 
-# MoltenVK is a static archive, so its platform dependencies resolve at the app
-# link, not the library's. Metal is the translation target; QuartzCore provides
-# CAMetalLayer; IOSurface and CoreVideo back the CVPixelBuffer path the ARKit
-# slice will need.
+# The core's vulkan tier links MoltenVK's system frameworks, UIKit and
+# QuartzCore among them, so the app names only those beyond them, all for
+# ARKitCapture: ARKit supplies the posed depth/colour frames, CoreVideo their
+# pixel buffers, and Accelerate's vImage does the YCbCr -> RGB conversion, which
+# at 1920x1440 would dominate the capture path as a scalar loop.
 target_link_libraries(
-  ${VI_APP_NAME}
-  PRIVATE "-framework Metal"
-          "-framework Foundation"
-          "-framework QuartzCore"
-          "-framework IOSurface"
-          "-framework CoreGraphics"
-          "-framework CoreVideo"
-          # ARKit supplies the posed depth/colour frames; Accelerate's vImage
-          # does the YCbCr -> RGB conversion, which at 1920x1440 would dominate
-          # the capture path as a scalar loop.
-          "-framework ARKit"
-          "-framework Accelerate"
-          "-framework UIKit")
+  ${VI_APP_NAME} PRIVATE "-framework ARKit" "-framework CoreVideo"
+                         "-framework Accelerate")
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
