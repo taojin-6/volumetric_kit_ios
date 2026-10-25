@@ -24,14 +24,16 @@ other downstream would.
 The one thing iOS genuinely needs is a **Vulkan implementation**: the platform
 ships no ICD loader and no `libvulkan`, so MoltenVK's static library *is* Vulkan
 here, linked directly (and therefore with no validation layers on device).
-`cmake/ios.toolchain.cmake` seeds `Vulkan_LIBRARY` / `Vulkan_INCLUDE_DIR` with
-MoltenVK's iOS xcframework, which is enough for CMake's `FindVulkan` to build a
-`Vulkan::Vulkan` target — so every `find_package(Vulkan)` in recon and gfx
-resolves without either repo knowing iOS exists.
+`cmake/ios.toolchain.cmake` names the platform and points `MoltenVK_ROOT` at
+the fetched release; volumetric_kit_core's iOS module (`cmake/vkc_ios.cmake`)
+then sets `Vulkan_LIBRARY` / `Vulkan_INCLUDE_DIR` from it, so every
+`find_package(Vulkan)` in recon and gfx makes `Vulkan::Vulkan` from MoltenVK's
+iOS xcframework.
 
 ## Build
 
 ```sh
+brew install shaderc glm         # once — glslc and glm's headers, host tools
 tools/fetch_moltenvk.sh          # once — pulls MoltenVK's iOS release
 
 cmake -S . -B build-ios -G Xcode \
@@ -56,36 +58,6 @@ names. A checkout that needs a newer core fails to configure or compile against
 this one; point the core at a matching checkout too, with
 `-DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_CORE=/path/to/volumetric_kit_core`.
 
-### The measurement build
-
-`-DVI_INCREMENTAL_BENCHMARK=ON` builds the scanner as an instrument for recon's
-incremental mesh extraction rather than as an app: it runs one mesh slot, keeps
-the per-block span table, and **publishes no geometry**, so the scan renders an
-empty scene by design. Read the result off the `Extract` panel section or the
-`--console` transcript — `incremental` says whether recon took the fast path
-(it falls back silently, and a run that measured the fallback is worthless) and
-`re-meshed` gives the fraction with the window it covers.
-
-It is a **cached** option, so it survives a plain re-configure of the same build
-tree — including the line above, which does not mention it. Every configure that
-carries it prints a warning naming it. To get an ordinary app build back, clear
-it explicitly or use a fresh build directory:
-
-```sh
-cmake -S . -B build-ios -DVI_INCREMENTAL_BENCHMARK=OFF
-```
-
-CI also builds the explicit `scanner_bridge_benchmark` target in the same
-configured project. It compiles the bridge with measurement mode enabled while
-sharing the normal build's recon, gfx, and core libraries. It is excluded from
-the default build and is not linked into the scanner app, so this compile check
-does not change the app's mode or the cached option above:
-
-```sh
-cmake --build build-ios --config Debug --target scanner_bridge_benchmark -- \
-  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-```
-
 ### Scanner configuration
 
 The app bundles [`apps/scanner/config/scanner.json`](apps/scanner/config/scanner.json).
@@ -99,7 +71,7 @@ resource creation, and runtime allocation checks remain in the scanner and engin
 Scenario files share the format used by recon, gfx, and calib. Core rejects fields
 that the selected application cannot use; scanner configurations require the live
 ARKit source. Drawable size and queue/ring resources still come from the running
-app. The measurement build remains a build-time choice.
+app.
 
 ### The host tests
 
@@ -321,10 +293,10 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 - **Shaders are compiled on the host** by `glslc` and embedded into the binary
   as constexpr byte arrays, so there is no runtime shader file and nothing to
   resolve in the app bundle.
-- **glm is vendored header-only.** Homebrew's glm 1.0.3 defines `glm::glm` as a
-  *macOS* dylib; recon links that canonical name deliberately (older packagings
-  lack `glm::glm-header-only`), so this repo supplies a header-only glm via
-  `OVERRIDE_FIND_PACKAGE` rather than pushing the problem upstream.
+- **glm is header-only.** Homebrew's glm 1.0.3 defines `glm::glm` as a *macOS*
+  dylib, which the iOS linker refuses; the core's iOS module answers every
+  `find_package(glm)` with the host's glm headers as a header-only target
+  instead. The host tests fetch glm 1.0.3 header-only.
 
 ## Roadmap
 

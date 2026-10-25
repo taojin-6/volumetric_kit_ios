@@ -25,13 +25,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
-#include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/image.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -79,7 +80,10 @@ struct AtlasSlot {
   /// its own terms -- the mesh ring's version of the argument is about a
   /// GpuMesh being replaced and does not reach the staging buffers.
   vkc::Buffer staging;
-  vkc::DescriptorSet set;
+  /// The hybrid pipeline's set 0 over @ref texture: gfx's texture set, made at
+  /// bring-up over the white fallback's view and pointed at @ref texture by
+  /// @ref build_atlas_ring.
+  std::unique_ptr<volumetric_kit::gfx::pipelines::HybridMeshTextureSet> set;
 };
 
 /// @brief The renderer's keyframe images, and the state saying which may be
@@ -188,25 +192,20 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
 /// precisely because the working set is the binding constraint, and it made the
 /// *next* allocation likelier to fail for the same reason.
 ///
-/// Allocates no descriptor sets. They are handed out once at bring-up, and that
-/// is what makes the retry this function's caller advertises actually possible:
-/// gfx's `DescriptorPool::create` passes no flags and its header states the kit
-/// does not free sets individually, so a set consumed by a slot built before a
-/// mid-way failure was gone for good. Against a pool sized at exactly
-/// `kRingSlots + 1`, the second attempt then failed at `allocate` with
-/// `VK_ERROR_OUT_OF_POOL_MEMORY` -- and so did every attempt after it, for the
-/// life of the process. The white fallback stayed bound, every textured
-/// triangle sampled one white texel, and the read-out called it transient.
+/// Makes no texture sets. They are made once at bring-up, where a failure fails
+/// bring-up, and this function only points each at its new image
+/// (`HybridMeshTextureSet::rebind`), which cannot fail -- so the commit below
+/// stays free of failure points, and the retry this function's caller
+/// advertises meets the same sets every time.
 ///
 /// @param ring       The ring to fill. Must not already be built.
 /// @param allocator  Produces the images and staging buffers, and must outlive
 ///                   @p ring -- see the teardown note on @ref RendererImpl.
-/// @param sampler    Written into every slot's descriptor alongside its view.
 /// @param width      ARKit's colour width, which sizes every slot.
 /// @param height     ARKit's colour height.
 ///
-/// All three preconditions are **checked and refused** with a `Status` rather
-/// than left to the single caller that satisfies them today. This is a header
+/// Both preconditions are **checked and refused** with a `Status` rather than
+/// left to the single caller that satisfies them today. This is a header
 /// symbol now, reachable from every bridge translation unit:
 ///
 /// - `!ring.ready`. Rebuilding a live ring frees images that frames in flight
@@ -218,20 +217,15 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
 ///   wait several submissions downstream. The obvious second caller is an
 ///   `imageResolution` change, which is exactly the path the renderer's
 ///   extent-mismatch branch refuses today for this reason.
-/// - Every `ring.slots[i].set` already allocated. Writing a descriptor opens
-///   with a `VKC_CHECK` that aborts in every build, and it would do so
-///   *after* the six allocations -- leaving images and staging buffers moved
-///   into @p ring with `width`/`height` still 0, the exact non-atomic state the
-///   all-or-nothing shape above exists to prevent.
-/// - `sampler != VK_NULL_HANDLE`, for the same reason: the renderer's sampler
-///   is an engaged-only `std::optional`, and dereferencing an empty one here
-///   would be undefined behaviour a hundred lines from where it is created.
+/// - Every `ring.slots[i].set` already made. Rebinding a null set would be
+///   undefined behaviour *after* the six allocations -- leaving images and
+///   staging buffers moved into @p ring with `width`/`height` still 0, the
+///   exact non-atomic state the all-or-nothing shape above exists to prevent.
 ///
-/// Writing the descriptors here is safe only because `ring.ready` is false for
-/// the whole time this runs, including across a retry: no frame binds a slot
-/// set until the flag goes up, so nothing is reading what this writes.
+/// Rebinding the sets here is safe only because `ring.ready` is false for the
+/// whole time this runs, including across a retry: no frame binds a slot set
+/// until the flag goes up, so no pending frame has bound what this rewrites.
 vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
-                             VkSampler sampler, std::uint32_t width,
-                             std::uint32_t height);
+                             std::uint32_t width, std::uint32_t height);
 
 }  // namespace volumetric_kit::ios_app

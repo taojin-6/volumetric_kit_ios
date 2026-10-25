@@ -9,12 +9,12 @@
 # directly (no loader indirection, and therefore no validation layers on
 # device).
 #
-# CMake's FindVulkan accepts a pre-seeded Vulkan_LIBRARY / Vulkan_INCLUDE_DIR
-# and builds Vulkan::Vulkan from them, so seeding those with MoltenVK's iOS
-# xcframework satisfies every find_package(Vulkan) in volumetric_kit_recon and
-# volumetric_kit_gfx **without either repo changing a line**. That keeps the
-# "independent siblings" rule intact: iOS support lives here, not in the
-# libraries.
+# volumetric_kit_core's iOS module (its cmake/vkc_ios.cmake, run as the core is
+# added) links it: from MoltenVK_ROOT it sets Vulkan_LIBRARY /
+# Vulkan_INCLUDE_DIR, so every find_package(Vulkan) in volumetric_kit_recon and
+# volumetric_kit_gfx makes Vulkan::Vulkan from MoltenVK's iOS xcframework, and
+# it links MoltenVK's system frameworks into the core's vulkan tier. This file
+# names the platform, the MoltenVK the module takes, and the host tools.
 #
 # Usage:
 #
@@ -59,7 +59,6 @@ list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES VI_MOLTENVK_DIR)
 
 set(_vi_mvk_lib
     "${VI_MOLTENVK_DIR}/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a")
-set(_vi_mvk_inc "${VI_MOLTENVK_DIR}/include")
 
 if(NOT EXISTS "${_vi_mvk_lib}")
   message(
@@ -69,14 +68,10 @@ if(NOT EXISTS "${_vi_mvk_lib}")
       "(the directory containing include/ and static/).")
 endif()
 
-# Seed FindVulkan. It validates these, parses the version out of vulkan_core.h,
-# and creates Vulkan::Vulkan -- so recon/gfx see an ordinary found Vulkan.
-set(Vulkan_LIBRARY
-    "${_vi_mvk_lib}"
-    CACHE FILEPATH "MoltenVK static library (the iOS Vulkan implementation)")
-set(Vulkan_INCLUDE_DIR
-    "${_vi_mvk_inc}"
-    CACHE PATH "Vulkan headers shipped with MoltenVK")
+# The MoltenVK the core's iOS module links, which also checks its version.
+set(MoltenVK_ROOT
+    "${VI_MOLTENVK_DIR}"
+    CACHE PATH "The MoltenVK/ directory of MoltenVK's iOS release")
 
 # --- Host tooling ------------------------------------------------------------
 # glslc compiles GLSL -> SPIR-V at build time and must be a *host* binary; under
@@ -94,15 +89,15 @@ if(NOT Vulkan_GLSLC_EXECUTABLE)
   endif()
 endif()
 
-# Host CMake package configs must stay visible: recon and gfx both
-# find_package(glm CONFIG), and glm is header-only, so the host copy is exactly
-# right for an iOS target. The iOS default (search the sysroot only) would hide
-# it. Programs likewise resolve on the host -- see glslc above.
+# Host CMake package configs stay visible, which the iOS default (search the
+# sysroot only) would hide; glm is the core's iOS module's answer, from the
+# host's headers, before any search. Programs likewise resolve on the host --
+# see glslc above.
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM BOTH)
 # Libraries and headers, by contrast, must come from the iOS sysroot only --
 # linking a Homebrew macOS .dylib into an iOS binary is exactly the mistake this
-# guards. MoltenVK is exempt because it is named by absolute path above.
+# guards. MoltenVK is exempt: the core's module names it by absolute path.
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 

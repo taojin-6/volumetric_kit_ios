@@ -38,19 +38,18 @@
 #include <string>
 #include <thread>
 
+#include "CapturedFrame.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
-#include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/image.hpp"
 #include "volumetric_kit/core/vulkan/shared_device.hpp"
 #include "volumetric_kit/gfx/app/windowed_app.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
-#include "volumetric_kit/gfx/core/sampler.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
+#include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/device_mesh.hpp"
-#include "volumetric_kit/recon/sensor/camera_capture.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -105,7 +104,7 @@ struct RendererImpl {
   // Borrowed, not owned -- but the owning VolumetricCapture is retained by the
   // renderer for exactly as long as this is non-null, and the thread that reads
   // it is joined before that retain is dropped. See -startFusionWithCapture:.
-  vr::sensor::ICameraCapture* capture = nullptr;
+  FrameSource* capture = nullptr;
 
   // --- Render state (plain values; destruction order does not matter) -------
   std::uint64_t frames_presented = 0;
@@ -166,28 +165,20 @@ struct RendererImpl {
   vg::ShaderModule fragment_shader;
   vg::GraphicsPipeline pipeline;
   std::optional<vg::pipelines::HybridMeshPipeline> mesh_pipeline;
-  // The atlas binding the hybrid pipeline requires of every frame. Its fragment
-  // shader samples set 0 unconditionally, so submit() records *nothing at all*
-  // without one -- see the bring-up comment where these are filled in.
+  // The 1x1 white atlas a frame binds when its mesh slot has no written
+  // keyframe: before the first textured mesh arrives, whenever a remesh
+  // published no keyframe (a colour the capture refused, a texture pass that
+  // failed), and whenever this frame's mesh slot holds an atlas image nothing
+  // has written yet. That last case is what `atlas.slot_written` decides -- see
+  // where frame_info.atlas is chosen, because binding an unwritten slot is
+  // undefined behaviour rather than merely a wrong colour.
   //
-  // 1x1 white, and still here: it is what a frame binds before the first
-  // textured mesh arrives, whenever a remesh published no keyframe (a colour
-  // the capture refused, a texture pass that failed), and whenever this frame's
-  // mesh slot holds an atlas image nothing has written yet. That last case is
-  // what `atlas.slot_written` decides -- see where frame_info.atlas is chosen,
-  // because binding an unwritten slot is undefined behaviour rather than merely
-  // a wrong colour.
-  //
-  // Never *selected* by the shader on those frames, because Fusion leaves every
-  // uv0 at the sentinel when it does not texture -- but the set must be
-  // non-null regardless or the frame records no draw at all.
+  // Never *selected* by the shader where Fusion left uv0 at the sentinel; a
+  // vertex with a real uv0 and no written keyframe samples white. The set over
+  // it is gfx's HybridMeshTextureSet, with its own pool and sampler, after the
+  // pipeline it was made for and the image it names.
   vkc::Image atlas_texture;
-  // optional for the same reason recon's Device is: Sampler keeps its default
-  // constructor private, so it is create-only and there is no empty one to
-  // default-construct. The other three do expose an empty state.
-  std::optional<vg::Sampler> atlas_sampler;
-  vkc::DescriptorPool atlas_pool;
-  vkc::DescriptorSet atlas_set;
+  std::unique_ptr<vg::pipelines::HybridMeshTextureSet> atlas_set;
 
   // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
   // use-after-free, and at per-frame meshing that would be every frame. One

@@ -20,8 +20,8 @@
 set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID "${VI_BUNDLE_PREFIX}.scanner")
 
-# Both bridge variants use identical shaders. Embed once so the generated
-# symbols and build rules have one owner under Xcode as well as Make/Ninja.
+# The bridge's shaders, in a target of their own so the generated symbols and
+# build rules have one owner under Xcode as well as Make/Ninja.
 add_library(vi_scanner_shaders INTERFACE)
 vkc_embed_shaders(
   vi_scanner_shaders SYMBOL_PREFIX "vi_" SHADERS
@@ -118,9 +118,9 @@ function(vi_add_scanner_bridge bridge_target)
   target_include_directories(${bridge_target}
                              PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-  # recon_sensor carries the capture contract and camera conversions through
-  # recon_core alone. recon_tsdf and recon_texture supply fusion; recon_mesh and
-  # recon_volume arrive transitively.
+  # recon_sensor carries the camera and colour conversions ARKitCapture applies.
+  # recon_tsdf and recon_texture supply fusion; recon_mesh and recon_volume
+  # arrive transitively.
   #
   # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
   # holds an OrbitCamera by value and hands MemoryBudget across the seam. The
@@ -141,46 +141,6 @@ function(vi_add_scanner_bridge bridge_target)
 endfunction()
 
 vi_add_scanner_bridge(scanner_bridge)
-
-# Compile the same bridge with measurement mode enabled, sharing the existing
-# recon/gfx/core targets. Explicit-only coverage: the Swift app links only
-# scanner_bridge, and ordinary builds do not build this second archive.
-vi_add_scanner_bridge(scanner_bridge_benchmark EXCLUDE_FROM_ALL)
-target_compile_definitions(scanner_bridge_benchmark
-                           PRIVATE VI_INCREMENTAL_BENCHMARK)
-
-# Build the scanner as a measurement binary: one mesh slot, spans tracked, and
-# NO geometry published, so recon's incremental extract can be timed at the
-# device's own dirty fraction. Vertex sharing stays ON -- unsharing is what the
-# first version did and it cost 3x the vertex arena, which is a settled revert,
-# not a knob. Compile-time rather than runtime because iOS resumes a process
-# instead of cold-starting it, so an environment variable survives exactly one
-# launch and then lies. See FusionConfig::incremental_benchmark.
-#
-# A define cannot drift across a *resume*, which is the failure the environment
-# variable had. It can still drift across a CONFIGURE: option() writes a CACHE
-# entry, so -DVI_INCREMENTAL_BENCHMARK=ON latches into the build tree and every
-# later cmake in that directory keeps it -- including the plain configure line
-# in README.md, which names no such flag and so cannot clear it. That is a worse
-# failure than the one it replaced if it goes unnoticed, because it turns an
-# ordinary app build into one that publishes no geometry: a scanner that renders
-# an empty room and looks broken.
-#
-# So it announces itself. Every configure of a tree carrying it prints this, and
-# the message names the way out, because the natural repair -- re-run the
-# configure line from the README -- is exactly the one that does not work.
-option(VI_INCREMENTAL_BENCHMARK
-       "Scanner measures incremental extraction and draws no mesh" OFF)
-if(VI_INCREMENTAL_BENCHMARK)
-  message(
-    WARNING
-      "VI_INCREMENTAL_BENCHMARK is ON: this scanner build MEASURES incremental "
-      "extraction and publishes NO geometry, so it renders an empty scene by "
-      "design. It is cached in this build tree and survives a plain re-configure"
-      " -- clear it with -DVI_INCREMENTAL_BENCHMARK=OFF.")
-  # On the bridge, which is where VolumetricRenderer.mm compiles.
-  target_compile_definitions(scanner_bridge PRIVATE VI_INCREMENTAL_BENCHMARK)
-endif()
 
 # --- scanner: the Swift app --------------------------------------------------
 add_executable(

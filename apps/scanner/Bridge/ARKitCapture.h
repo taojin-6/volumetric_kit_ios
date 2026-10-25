@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 /// @file ARKitCapture.h
-/// @brief The ARKit implementation of recon's `sensor::ICameraCapture`.
+/// @brief The ARKit capture: a `FrameSource` (CapturedFrame.hpp) the fuse
+///        thread polls.
 ///
 /// This is the driver the 2026-08-02 sensor-tier decision placed *here* rather
 /// than in recon: ARKit is iOS-only Objective-C and needs LiDAR hardware to
@@ -12,8 +13,8 @@
 /// them.
 ///
 /// Swift owns the `ARSession` (configuration, permissions, lifecycle) and hands
-/// each `ARFrame` across; the conversion to recon's `CapturedFrame` happens on
-/// this side, where an `ARFrame` and a C++ struct are both first-class.
+/// each `ARFrame` across; the conversion to a `CapturedFrame` happens on this
+/// side, where an `ARFrame` and a C++ struct are both first-class.
 
 #import <ARKit/ARKit.h>
 #import <Foundation/Foundation.h>
@@ -90,13 +91,11 @@ typedef struct {
   bool color_declaration_refused;
 } VolumetricCaptureStats;
 
-/// @brief Bridges `ARFrame`s into recon's capture contract.
+/// @brief Bridges `ARFrame`s into the frames the fuse thread polls.
 ///
 /// Push in, poll out: ARKit delivers frames on the session queue, and a
-/// consumer (the render loop, later the fuse thread) polls for the newest one.
-/// That is exactly the shape `sensor::ICameraCapture` documents, and the reason
-/// it is polled rather than callback-driven — the reverse would put fusion on
-/// ARKit's queue.
+/// consumer (the fuse thread) polls for the newest one. It is polled rather
+/// than callback-driven because the reverse would put fusion on ARKit's queue.
 ///
 /// Frames are **dropped, not queued**: a consumer slower than the sensor gets
 /// the newest frame, never a backlog.
@@ -120,7 +119,7 @@ typedef struct {
 
 /// @brief Take the newest staged frame, if a new one has arrived.
 ///
-/// Wraps the C++ `ICameraCapture::poll` so Swift can drive it. The returned
+/// Wraps the C++ `FrameSource::poll` so Swift can drive it. The returned
 /// pixels stay valid until the next call.
 ///
 /// @return `YES` if a frame was taken; `NO` when nothing new is staged.
@@ -132,8 +131,9 @@ typedef struct {
 /// Diagnostics from the most recent conversion.
 @property(nonatomic, readonly) VolumetricCaptureStats stats;
 
-/// @return The `sensor::ICameraCapture*` this wraps, as an opaque pointer.
-///         The fusion slice hands this to recon; nothing else should need it.
+/// @return The `volumetric_kit::ios_app::FrameSource*` this wraps, as an opaque
+///         pointer. The renderer's fuse thread polls it; nothing else should
+///         need it.
 - (void*)captureHandle NS_SWIFT_UNAVAILABLE("C++ interop only");
 
 @end

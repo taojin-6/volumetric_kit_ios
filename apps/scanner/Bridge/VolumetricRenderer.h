@@ -549,7 +549,7 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// that bounds how often it is paid.
 ///
 /// @p capture is **retained** for as long as fusion runs — the fuse thread
-/// dereferences the `ICameraCapture` it owns, and a bare "must outlive the
+/// dereferences the `FrameSource` it owns, and a bare "must outlive the
 /// renderer" is not something the caller can honour when the two are siblings
 /// with no specified destruction order.
 ///

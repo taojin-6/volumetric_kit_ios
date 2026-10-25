@@ -33,9 +33,11 @@ jobs:
 
       # glslc compiles the GLSL to SPIR-V at build time. It is a *host* tool
       # here -- the toolchain file resolves it with NO_CMAKE_FIND_ROOT_PATH so a
-      # cross build does not look for it in the iOS sysroot.
-      - name: Install shaderc (glslc)
-        run: brew install shaderc
+      # cross build does not look for it in the iOS sysroot. glm's headers are
+      # the host's too: the core's iOS module answers every find_package(glm)
+      # with them, header-only.
+      - name: Install shaderc (glslc) and glm
+        run: brew install shaderc glm
 
       # MoltenVK is a 34 MB upstream release artifact, fetched rather than
       # vendored. Cache it on the pinned version so a run costs one download.
@@ -50,8 +52,8 @@ jobs:
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
         run: tools/fetch_moltenvk.sh
 
-      # Every FetchContent dependency is pinned in CMakeLists.txt -- recon and
-      # gfx by commit, glm by tag -- so hashing that file keys the cache on
+      # Every FetchContent dependency is pinned in CMakeLists.txt -- the core,
+      # recon and gfx by commit -- so hashing that file keys the cache on
       # exactly the sources a run compiles: a pin bump changes the hash and
       # forces a clean miss. (Before the siblings were pinned, they tracked
       # `main`, and a step folded both resolved tips into this key.)
@@ -70,8 +72,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build-ios -G Xcode \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
-            -DVI_INCREMENTAL_BENCHMARK=OFF
+            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake
 
       # No VI_DEVELOPMENT_TEAM is passed, so CMake warns that the bundles cannot
       # be installed on hardware -- expected and correct for a build-only gate.
@@ -108,13 +109,3 @@ jobs:
         run: |
           cmp apps/scanner/config/scanner.json \
             build-ios/apps/scanner/Debug-iphoneos/scanner.app/scanner.json
-
-      # The alternate bridge compiles VI_INCREMENTAL_BENCHMARK's branch in the
-      # same project, reusing the libraries built above. A separate build-bench
-      # tree repeated compiler checks, populated its own _deps, and rebuilt
-      # recon/gfx/core. This target keeps the coverage without those repeats.
-      # Its define is private; the normal scanner still publishes geometry.
-      - name: Build the measurement bridge (compile coverage)
-        run: |
-          cmake --build build-ios --config Debug --target scanner_bridge_benchmark -- \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""

@@ -21,7 +21,9 @@
 #include "fill_comp.spv.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_pipeline.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
@@ -417,8 +419,27 @@ void stage_scalar_abi(Report& report, vkc::Device& device,
     b.coord = vr::Vec3i(i - 3, 2 * i + 1, -5 * i);
     blocks.push_back(b);
   }
+  // The map allocates from a device list, as a kernel would hand it one, so
+  // the coordinates are uploaded into a device-local storage buffer first.
+  const VkDeviceSize list_bytes = blocks.size() * sizeof(vol::BlockIndex);
+  vkc::Result<vkc::Buffer> list =
+      vkc::device_storage_buffer(allocator, list_bytes);
+  if (!list) {
+    report.abort_stage("block list buffer: " + list.status().message());
+    return;
+  }
+  vkc::CommandBatch batch(device, allocator);
+  vkc::Status uploaded =
+      batch.upload(list.value(), 0, blocks.data(), list_bytes);
+  if (uploaded) {
+    uploaded = batch.submit();
+  }
+  if (!uploaded) {
+    report.abort_stage("block list upload: " + uploaded.message());
+    return;
+  }
   vkc::Result<std::uint32_t> overflow = vbg.map().allocate(
-      blocks.data(), static_cast<std::uint32_t>(blocks.size()));
+      list.value(), static_cast<std::uint32_t>(blocks.size()));
   if (!overflow) {
     report.abort_stage("allocate: " + overflow.status().message());
     return;
