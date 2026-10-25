@@ -24,9 +24,9 @@ jobs:
     # Pinned rather than macos-latest. `-latest` rolls to a new OS image on
     # GitHub's schedule, which swaps the whole Xcode toolchain underneath the
     # build without a commit here; this repo cross-compiles against that SDK, so
-    # that rollover is a real variable. macos-26 is what macos-latest resolves to
-    # today, so pinning changes nothing now and stops the surprise later.
-    runs-on: macos-26
+    # that rollover is a real variable. xcode-27 is the image whose Xcode has the
+    # iOS SDK for the app's deployment target (cmake/ios.toolchain.cmake).
+    runs-on: xcode-27
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -164,7 +164,7 @@ namespace {
 //
 // Cached: iOS has one GPU and this value does not move, so the device is
 // created once rather than at the polling rate. `recommendedMaxWorkingSetSize`
-// is ios(16.0), which is this app's deployment target (see
+// is ios(16.0), below this app's deployment target (see
 // cmake/ios.toolchain.cmake).
 std::uint64_t gpu_working_set_bytes() {
   static const std::uint64_t cached = []() -> std::uint64_t {

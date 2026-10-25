@@ -24,7 +24,8 @@ jobs:
     # a PR that touched no Swift at all. Pinning removes the rollover; it cannot
     # remove Xcode updates within the image, which is why the version is still
     # printed below -- a drift shows up in the log rather than as a mystery.
-    runs-on: macos-26
+    # The build's image, so the hook formats with the Xcode that builds the app.
+    runs-on: xcode-27
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
