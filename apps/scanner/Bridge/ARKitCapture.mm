@@ -342,8 +342,8 @@ SourceColor source_color(CVPixelBufferRef image) {
       // has no HLG enumerator, so the old fall-through declared it sRGB --
       // canonical, no conversion, no error, an HDR curve decoded as a display
       // one. Named rather than lumped in with "unrecognized" because it is the
-      // reachable one: ARKit 6 captures HDR video on the iOS 16 floor this app
-      // already builds against.
+      // reachable one: ARKit captures HDR video on every iOS this app builds
+      // for.
       out.transfer_name = "BT.2100 HLG (unsupported)";
       out.understood = false;
     } else {

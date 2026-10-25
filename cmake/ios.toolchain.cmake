@@ -36,9 +36,10 @@ set(CMAKE_OSX_ARCHITECTURES
     arm64
     CACHE STRING "iOS architectures")
 
-# 16.0: the floor that carries ARKit sceneDepth on every LiDAR device we target.
+# 26.0: every target device runs it or newer, and CI's macos-26 image (Xcode 26)
+# builds for it.
 set(CMAKE_OSX_DEPLOYMENT_TARGET
-    16.0
+    26.0
     CACHE STRING "Minimum iOS version")
 
 # --- MoltenVK: the Vulkan implementation ------------------------------------

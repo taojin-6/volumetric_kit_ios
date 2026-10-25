@@ -314,6 +314,7 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 
 - **Device only, arm64.** MoltenVK's iOS release ships no simulator slice, and
   ARKit scene depth needs LiDAR hardware anyway.
+- **iOS 26.0 or newer** (`cmake/ios.toolchain.cmake`).
 - **LiDAR required** for the ARKit slice: iPhone 12 Pro and later Pro models,
   iPad Pro 2020 and later. Guard with
   `ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`.
