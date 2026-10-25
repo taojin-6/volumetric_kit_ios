@@ -36,7 +36,6 @@ The libraries remain independent siblings with their own guidance.
 | Pure app logic and host tests | [Host-test boundary](README.md#the-host-tests), `apps/scanner/Core/CMakeLists.txt`, affected tests |
 | Swift/Objective-C++ seam | [Language split](README.md#language-split), affected bridge headers and Swift callers |
 | Shared Vulkan device | [Shared device](README.md#the-shared-device), the core's `volumetric_kit/core/vulkan/shared_device.hpp`, `Bridge/VolumetricRenderer.mm` |
-| Benchmarking incremental extraction | [Measurement build](README.md#the-measurement-build), scanner CMake and fusion configuration |
 | Hardware capability or simulator assumptions | [Platform notes](README.md#platform-notes), relevant runtime guards |
 | Formatting and CI | [Development](README.md#development), `.pre-commit-config.yaml`, `.github/workflows/` |
 
@@ -72,13 +71,12 @@ git -C "$ios_root" diff --check
 
 The host mode needs no iOS toolchain, MoltenVK, recon, or gfx. Changes to the
 bridge, Swift, shaders, or app packaging need the iOS build on macOS with Xcode
-and host `glslc` installed:
+and host `glslc` and glm installed (`brew install shaderc glm`):
 
 ```sh
 "$ios_root/tools/fetch_moltenvk.sh"
 cmake -S "$ios_root" -B "$ios_root/build-ios" -G Xcode \
-  -DCMAKE_TOOLCHAIN_FILE="$ios_root/cmake/ios.toolchain.cmake" \
-  -DVI_INCREMENTAL_BENCHMARK=OFF
+  -DCMAKE_TOOLCHAIN_FILE="$ios_root/cmake/ios.toolchain.cmake"
 cmake --build "$ios_root/build-ios" --config Debug -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 ```
@@ -90,9 +88,6 @@ cmake --build "$ios_root/build-ios" --config Debug -- \
 - App targets are device-only iOS arm64. This MoltenVK package has no simulator
   slice; ARKit scene depth requires supported LiDAR hardware and a runtime
   capability check. An unsigned CI build is not a device runtime test.
-- `VI_INCREMENTAL_BENCHMARK=ON` deliberately publishes no geometry and is
-  cached. Use a separate benchmark tree or explicitly set it OFF for app runs.
-  Read the reported `incremental` flag to distinguish the fast path from fallback.
 - Use the pinned hooks. Keep both Cpp and ObjC sections in `.clang-format`;
   Swift formatting uses `xcrun swift-format` from the Xcode toolchain.
 - Documentation-only changes need formatting, link, and consistency checks;

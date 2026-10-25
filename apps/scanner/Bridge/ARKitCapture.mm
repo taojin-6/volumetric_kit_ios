@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Tao Jin
 
 #import "ARKitCapture.h"
+#import "CapturedFrame.hpp"
 
 #import <Accelerate/Accelerate.h>
 #import <CoreVideo/CoreVideo.h>
@@ -19,7 +20,6 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
-#include "volumetric_kit/recon/sensor/camera_capture.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
 #include "volumetric_kit/recon/sensor/color_conventions.hpp"
 
@@ -27,6 +27,7 @@ namespace vkc = volumetric_kit::core;
 
 namespace vr = volumetric_kit::recon;
 namespace sensor = volumetric_kit::recon::sensor;
+namespace app = volumetric_kit::ios_app;
 
 namespace {
 
@@ -592,32 +593,24 @@ VolumetricCaptureStats initial_stats() {
   return s;
 }
 
-/// The `ICameraCapture` recon consumes. Staging rotates three `FrameBuffers`:
-/// the session queue converts into the caller's scratch, @ref stage swaps that
-/// with `back_`, and a poll swaps `back_` to `front_`. The view handed out
-/// points into `front_`, which only a poll ever touches -- so it stays valid
-/// exactly as long as the contract promises (until the next poll) even while
-/// ARKit keeps delivering into the other two.
-class ARKitCapture final : public sensor::ICameraCapture {
+/// The `FrameSource` the fuse thread polls. Staging rotates three
+/// `FrameBuffers`: the session queue converts into the caller's scratch,
+/// @ref stage swaps that with `back_`, and a poll swaps `back_` to `front_`.
+/// The view handed out points into `front_`, which only a poll ever touches --
+/// so it stays valid exactly as long as the contract promises (until the next
+/// poll) even while ARKit keeps delivering into the other two.
+class ARKitCapture final : public app::FrameSource {
  public:
-  // Nothing to start: Swift owns the ARSession and pushes frames in. Present so
-  // a consumer can drive any ICameraCapture uniformly.
-  vkc::Status start() override { return vkc::Status(); }
-  void stop() noexcept override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    staged_ = false;
-  }
-
-  vkc::Result<std::optional<sensor::CapturedFrame>> poll() override {
+  vkc::Result<std::optional<app::CapturedFrame>> poll() override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!staged_) {
-      return no_frame();
+      return std::optional<app::CapturedFrame>{};
     }
     std::swap(front_, back_);
     staged_ = false;
     ++stats_.frames_polled;
 
-    sensor::CapturedFrame frame{};
+    app::CapturedFrame frame{};
     frame.depth = front_.depth.data();
     frame.color = front_.has_color ? front_.color.data() : nullptr;
     frame.depth_camera = front_.depth_camera;
@@ -628,7 +621,7 @@ class ARKitCapture final : public sensor::ICameraCapture {
     // be fused through the wrong curve rather than refused.
     frame.color_encoding = front_.color_encoding;
     frame.timestamp_ns = front_.timestamp_ns;
-    return some_frame(frame);
+    return std::optional<app::CapturedFrame>{frame};
   }
 
   /// Hand over a freshly converted frame, superseding any unpolled one, and
@@ -817,7 +810,7 @@ class ARKitCapture final : public sensor::ICameraCapture {
 }
 
 - (BOOL)pollLatest {
-  vkc::Result<std::optional<sensor::CapturedFrame>> got = _capture->poll();
+  vkc::Result<std::optional<app::CapturedFrame>> got = _capture->poll();
   return got && got.value() ? YES : NO;
 }
 
@@ -830,7 +823,7 @@ class ARKitCapture final : public sensor::ICameraCapture {
 }
 
 - (void*)captureHandle {
-  return static_cast<sensor::ICameraCapture*>(_capture.get());
+  return static_cast<app::FrameSource*>(_capture.get());
 }
 
 @end

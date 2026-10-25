@@ -87,8 +87,9 @@ set(VI_BUNDLE_PREFIX
 # --- The sibling libraries ---------------------------------------------------
 # Fetched, not vendored: recon and gfx are independent siblings that release on
 # their own, and this repo consumes them exactly as any other downstream would.
-# Neither needs an iOS-specific change -- the toolchain file's MoltenVK seeding
-# is the whole of the platform port -- so these are ordinary pinned checkouts.
+# Neither needs an iOS-specific change -- the core's iOS module, on the MoltenVK
+# the toolchain file names, is the whole of the platform port -- so these are
+# ordinary pinned checkouts.
 #
 # For local development against a working tree, point CMake at it instead of the
 # remote:
@@ -98,37 +99,11 @@ set(VI_BUNDLE_PREFIX
 # ~~~
 include(FetchContent)
 
-# --- glm, header-only ---------------------------------------------------------
-# recon links the canonical `glm::glm` target rather than `glm::glm-header-only`
-# -- deliberately, so older packagings that lack the header-only name (Ubuntu's
-# libglm-dev) still resolve. On macOS that is fine; but Homebrew's glm 1.0.3
-# defines `glm::glm` as a SHARED IMPORTED *macOS* dylib, which the iOS linker
-# rightly refuses ("building for 'iOS', but linking in dylib built for
-# 'macOS'").
-#
-# glm is header-only in this family's use, so the fix is to supply a glm whose
-# `glm::glm` is an INTERFACE target: vendor it with GLM_BUILD_LIBRARY=OFF and
-# let OVERRIDE_FIND_PACKAGE redirect recon's find_package(glm CONFIG REQUIRED)
-# here instead of to the Homebrew copy. This belongs in the iOS consumer, not in
-# recon -- recon's target choice is correct for its own portability.
-set(GLM_BUILD_LIBRARY
-    OFF
-    CACHE BOOL "" FORCE)
-set(GLM_BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(GLM_BUILD_INSTALL
-    OFF
-    CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  glm
-  GIT_REPOSITORY https://github.com/g-truc/glm.git
-  GIT_TAG 1.0.3 # matches the version recon and gfx build against on desktop
-  GIT_SHALLOW TRUE
-  OVERRIDE_FIND_PACKAGE)
-
 # The common scenario parser is CPU-only; host tests exercise the exact file
-# bundled into the scanner. Only iOS builds enable the Vulkan tier.
+# bundled into the scanner. Only iOS builds enable the Vulkan tier, and with it
+# the core's iOS module (its cmake/vkc_ios.cmake), which links MoltenVK's static
+# library from MoltenVK_ROOT and answers every find_package(glm) -- recon's,
+# gfx's and this file's -- with the host's glm headers as a header-only target.
 set(VKC_WITH_CONFIG ON)
 set(VKC_WITH_VULKAN
     ${VI_IOS}
@@ -136,24 +111,42 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 7857a6d4b9973b32461af09062d0bb894c86c751)
+  GIT_TAG 4e16bbca41920b9a9df4191b10142b9827ccb365) # core #52 (0.21.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.3.0)
+vkc_require_core(0.21.0)
 
 # --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs recon, gfx and MoltenVK, none of which a
 # host build wants or can use. So the host configure stops here.
 #
-# glm is made available explicitly because nothing in this mode asks for it:
-# OVERRIDE_FIND_PACKAGE populates on a `find_package(glm)`, and the call that
-# normally triggers it is recon's, further down.
+# vi_core is plain C++ over glm, so this mode fetches glm 1.0.3, header-only
+# (GLM_BUILD_LIBRARY=OFF), the version recon and gfx build against on desktop.
 if(NOT VI_IOS)
+  set(GLM_BUILD_LIBRARY
+      OFF
+      CACHE BOOL "" FORCE)
+  set(GLM_BUILD_TESTS
+      OFF
+      CACHE BOOL "" FORCE)
+  set(GLM_BUILD_INSTALL
+      OFF
+      CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 1.0.3
+    GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(glm)
   enable_testing()
   add_subdirectory(apps/scanner/Core)
   add_subdirectory(tests)
   return()
 endif()
+
+# The core's answer, found here so that the imported glm::glm is visible to
+# vi_core and to both siblings below: an imported target belongs to the
+# directory that found it and those beneath it.
+find_package(glm CONFIG REQUIRED)
 
 # recon and gfx are pinned by commit, and adopted deliberately: a PR bumps a
 # pin, and CI builds exactly that pair. Tracking `main` let an upstream change
@@ -167,12 +160,12 @@ endif()
 # Its vulkan tier is on, as gfx requires -- gfx refuses to configure against a
 # core without it, or older than its own pin -- and recon's Device, Allocator
 # and SharedDevice live there. Bump it with, or at or after, recon's and gfx's
-# core pins.
+# core pins: recon pins core #52 (0.21.0), this pin, and gfx core #50 (0.20.0).
 
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 624b2dce05e3925b95c14e9f44ffc4832524d2b7) # recon #168
+  GIT_TAG 9fde92e1d8a596addf6ab9ce0a8b295ba3f7722c) # recon #280
 
 # recon's VR_BUILD_EXAMPLES / VR_BUILD_TESTS default to PROJECT_IS_TOP_LEVEL, so
 # a fetched copy builds the library tiers only -- no gtest, no example
@@ -189,7 +182,7 @@ FetchContent_MakeAvailable(volumetric_kit_recon)
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG 53e8f6389fe9cd9462e7000c49cc758d29c8149a) # gfx #106
+  GIT_TAG 2d40d1e850539d4337c133ad1e3dfcf526481e67) # gfx #156
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)

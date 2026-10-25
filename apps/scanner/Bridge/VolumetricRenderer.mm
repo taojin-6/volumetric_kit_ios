@@ -66,18 +66,17 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/config/config.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
-#include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/image.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/gfx/assets/mesh.hpp"
 #include "volumetric_kit/gfx/core/graphics_pipeline.hpp"
 #include "volumetric_kit/gfx/core/render_target.hpp"
-#include "volumetric_kit/gfx/core/sampler.hpp"
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/core/texture_upload.hpp"
 #include "volumetric_kit/gfx/pipelines/gpu_mesh.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
+#include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
 // vkc::StageRow, named directly by -initWithRow: and by the read-out's row
 // loop. Reached transitively through Fusion.hpp today, which is the pattern the
 // <cstdio> note above records going wrong: pruning that header's includes, or
@@ -249,7 +248,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 @implementation VolumetricRenderer {
   std::unique_ptr<app::RendererImpl> _impl;
   // Retained, not borrowed. The fuse thread dereferences the raw
-  // ICameraCapture* this object owns, and the two are siblings on the view
+  // FrameSource* this object owns, and the two are siblings on the view
   // controller with no specified destruction order -- so "must outlive the
   // renderer" as a header sentence is not a mechanism. Held from
   // -startFusionWithCapture: until the join in -stopFusion, which is the exact
@@ -428,30 +427,21 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // TSDF fused elsewhere. That is exactly what recon's mesh emits.
   vkc::Result<vg::pipelines::HybridMeshPipeline> mesh_pipeline =
       vg::pipelines::HybridMeshPipeline::create(
-          device, _impl->app.swapchain().layout());
+          _impl->app.device(), _impl->app.allocator(),
+          _impl->app.swapchain().layout());
   if (!mesh_pipeline) {
     app::set_error(error, mesh_pipeline.status(), "HybridMeshPipeline::create");
     return nil;
   }
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
 
-  // --- The atlas set, without which nothing draws ---------------------------
-  // Not optional and not a detail: HybridMeshPipeline::submit returns early on
-  // a VK_NULL_HANDLE atlas, recording no bind, no push constant and no draw. A
-  // frame missing this one field clears the screen and presents it, which is
-  // indistinguishable from a working renderer looking at empty space -- and is
-  // exactly what the scanner did until now.
-  //
-  // 1x1 white, which is what gfx prescribes for the vertex-colour path: the
-  // fragment shader samples the atlas unconditionally, but only where a
-  // triangle carries a real uv0. Where projective texturing did not win a
-  // camera, uv0 is the (-1,-1) sentinel and the TSDF's per-vertex colour is
-  // used instead -- so these texels are never selected there.
-  //
-  // "Never selected" holds only while FusionConfig::texture is off, which is
-  // why it is off: the texturer overwrites uv0 with a real coordinate on every
-  // triangle it wins, and every one of those would then sample this one white
-  // texel instead of its fused colour. The pair moves together.
+  // --- The atlas sets --------------------------------------------------------
+  // 1x1 white for a frame whose mesh slot has no written keyframe: the
+  // fragment shader samples the atlas only where a triangle carries a real
+  // uv0. Where projective texturing did not win a camera, uv0 is the (-1,-1)
+  // sentinel and the TSDF's per-vertex colour is used instead -- so the white
+  // image is never selected there, and a textured vertex with no keyframe
+  // written behind it reads white rather than a plausible wrong image.
   static const std::uint8_t kWhite[4] = {255, 255, 255, 255};
   vg::ImageUploadDesc atlas_desc;
   atlas_desc.extent = {1, 1};
@@ -466,64 +456,41 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->atlas_texture = std::move(atlas_texture).value();
 
-  vkc::Result<vg::Sampler> atlas_sampler = vg::Sampler::create(device);
-  if (!atlas_sampler) {
-    app::set_error(error, atlas_sampler.status(), "atlas Sampler::create");
-    return nil;
-  }
-  _impl->atlas_sampler.emplace(std::move(atlas_sampler).value());
-
-  // Sized for the whole ring plus the white fallback, allocated once here. A
-  // pool grown or re-created later would have to be done mid-frame, on the
-  // thread that is recording -- and the sets it hands out are bound by frames
-  // still in flight, so freeing one is a use-after-free with no diagnostic on
-  // this configuration.
-  const std::uint32_t kAtlasSets = app::RendererImpl::kMeshSlots + 1;
-  const VkDescriptorPoolSize atlas_pool_size{
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kAtlasSets};
-  vkc::Result<vkc::DescriptorPool> atlas_pool =
-      vkc::DescriptorPool::create(device, &atlas_pool_size, 1, kAtlasSets);
-  if (!atlas_pool) {
-    app::set_error(error, atlas_pool.status(), "atlas DescriptorPool::create");
-    return nil;
-  }
-  _impl->atlas_pool = std::move(atlas_pool).value();
-
-  vkc::Result<vkc::DescriptorSet> atlas_set = _impl->atlas_pool.allocate(
-      _impl->mesh_pipeline->descriptor_set_layout(0));
+  // The renderer's texture sets are gfx's: each a HybridMeshTextureSet, with
+  // its own pool and sampler, over an image this renderer owns. The sampler is
+  // the one the renderer made before: linear, repeating, every mip level.
+  vg::pipelines::HybridMeshTextureSet::Options atlas_sampling;
+  atlas_sampling.filter = VK_FILTER_LINEAR;
+  atlas_sampling.address = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  atlas_sampling.max_lod = VK_LOD_CLAMP_NONE;
+  vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> atlas_set =
+      vg::pipelines::HybridMeshTextureSet::create(
+          _impl->app.device(), *_impl->mesh_pipeline,
+          _impl->atlas_texture.view(), atlas_sampling);
   if (!atlas_set) {
-    app::set_error(error, atlas_set.status(), "atlas DescriptorPool::allocate");
+    app::set_error(error, atlas_set.status(), "atlas HybridMeshTextureSet");
     return nil;
   }
   _impl->atlas_set = std::move(atlas_set).value();
-  _impl->atlas_set.write_combined_image_sampler(
-      0, _impl->atlas_texture.view(), _impl->atlas_sampler->handle(),
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-  // The ring's sets, here and only here -- the images they will point at do not
+  // The ring's sets, here and only here -- the images they will name do not
   // exist yet, and are built on the first textured mesh once ARKit has stated
-  // its colour size (see build_atlas_ring).
-  //
-  // Allocated up front because a set taken from this pool cannot be given back:
-  // gfx passes no flags to DescriptorPool::create and its header says the kit
-  // does not free sets individually. Allocating them lazily inside
-  // build_atlas_ring meant a build that failed halfway had permanently spent
-  // the sets its completed slots took, out of a pool holding exactly
-  // kMeshSlots + 1 -- so the retry that function's caller promises could never
-  // succeed, and a transient memory-pressure refusal became a flat-white
-  // reconstruction for the life of the process. Taken once here, the count is
-  // exact by construction and no later path can exhaust it.
+  // its colour size. Each starts over the white image and build_atlas_ring
+  // rebinds it to its slot's image once that exists, so the build's commit has
+  // nothing left that can fail. No frame binds a slot set before then.
   //
   // A failure here fails bring-up, which is the honest place for it: this is a
   // fixed, small allocation made before the first frame, so it not being
   // available is a configuration fault rather than the transient the per-frame
   // path has to tolerate.
   for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
-    vkc::Result<vkc::DescriptorSet> slot_set = _impl->atlas_pool.allocate(
-        _impl->mesh_pipeline->descriptor_set_layout(0));
+    vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> slot_set =
+        vg::pipelines::HybridMeshTextureSet::create(
+            _impl->app.device(), *_impl->mesh_pipeline,
+            _impl->atlas_texture.view(), atlas_sampling);
     if (!slot_set) {
       app::set_error(error, slot_set.status(),
-                     "atlas ring DescriptorPool::allocate");
+                     "atlas ring HybridMeshTextureSet");
       return nil;
     }
     _impl->atlas.slots[i].set = std::move(slot_set).value();
@@ -550,35 +517,6 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // EXCLUSIVE buffer read by a family that does not own it is undefined with no
   // error. recon collapses the pair to EXCLUSIVE wherever they are the same
   // family, so this needs no branch on the plan.
-  // Measurement mode, and a COMPILE-TIME one: cmake
-  // -DVI_INCREMENTAL_BENCHMARK=ON.
-  //
-  // It was an environment variable first, and that silently did not work. iOS
-  // resumes a running process rather than cold-starting it, so a relaunch --
-  // even `devicectl ... --terminate-existing` -- re-ran no `getenv`, and the
-  // app kept whatever mode the FIRST launch after install had picked up. Runs
-  // two through four read as benchmark mode and were measuring the full path;
-  // the only tell was `verts == 3 * tris`, i.e. that sharing was off. A toggle
-  // whose failure mode is "quietly measured the wrong thing" is worse than no
-  // toggle.
-  //
-  // A define cannot drift across a *resume*: the mode is in the binary, so
-  // installing it is what switches it, and there is no runtime state for a
-  // resume to carry. It also matches what this is -- a build you launch to read
-  // a number, not something a user should reach by tapping.
-  //
-  // It is not stateless, though, and the remaining state is one configure up
-  // rather than one launch: `option()` caches, so an ON latches into the build
-  // tree and outlives the configure that set it. The build file warns on every
-  // configure that carries it, because the repair someone reaches for -- re-run
-  // the README's configure line -- is the one that leaves it on.
-  // See FusionConfig::incremental_benchmark.
-#ifdef VI_INCREMENTAL_BENCHMARK
-  fusion_config.incremental_benchmark = true;
-#else
-  fusion_config.incremental_benchmark = false;
-#endif
-
   fusion_config.queue_families[0] = _impl->shared->compute_family();
   fusion_config.queue_families[1] = _impl->shared->graphics_family();
   fusion_config.queue_family_count = 2;
@@ -715,15 +653,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
         // frame has arrived, and guessing 1920x1440 would be a constant that
         // silently mis-sizes the ring on any device that reports otherwise.
         if (!_impl->atlas.ready) {
-          // The sampler is engaged from bring-up onwards -- a failure there
-          // returns nil -- but it is passed rather than reached for, so the
-          // ring never dereferences an optional it cannot see being filled,
-          // and its null check is a real guard rather than a decorative one.
-          const vkc::Status built = app::build_atlas_ring(
-              _impl->atlas, _impl->app.allocator(),
-              _impl->atlas_sampler ? _impl->atlas_sampler->handle()
-                                   : VK_NULL_HANDLE,
-              fresh->atlas_width, fresh->atlas_height);
+          // Creates the slots' images and rebinds each slot's texture set to
+          // its new image.
+          const vkc::Status built =
+              app::build_atlas_ring(_impl->atlas, _impl->app.allocator(),
+                                    fresh->atlas_width, fresh->atlas_height);
           if (!built.ok()) {
             // Not fatal to the frame, and deliberately not latched: the ring is
             // an allocation of ~kMeshSlots * 11 MB of images plus as much again
@@ -889,13 +823,6 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->camera.set_device_pose(device_pose);
 
-  // `have_mesh` is false for the whole session under VI_INCREMENTAL_BENCHMARK:
-  // it is armed only by a successful take below, and that mode publishes
-  // nothing for a take to find. So this is not "keeps drawing the last mesh" --
-  // there is no last mesh, and the scene stays empty from launch. The stats
-  // panel says so in as many words, because an empty view is otherwise read as
-  // ARKit having lost tracking, and this mode's number depends on whoever is
-  // holding the iPad believing the scan is working and walking the room.
   const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
 
   // --- Retire the generations no frame in flight is reading any more --------
@@ -964,9 +891,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // dump's format is fixed -- so a frame that never sampled the allocator
   // printed `alloc=ok arena=0 blocks=0 occ=0.0%`, byte-identical to one that
   // measured an idle allocator and an empty arena. Those are the regimes a
-  // device-lost dump is *read* in: before the first successful take, after a
-  // latched upload failure, or under VI_INCREMENTAL_BENCHMARK, which publishes
-  // no geometry for the whole session. `arena_bytes` carries a reading
+  // device-lost dump is *read* in: before the first successful take, or after a
+  // latched upload failure. `arena_bytes` carries a reading
   // instruction on FrameTrace::Entry -- compare it against the previous entry
   // -- and a phantom drop to 0 at every drew=1 -> drew=0 boundary breaks
   // exactly the comparison that would find the use-after-free described above.
@@ -1015,8 +941,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // which makes glm::perspective's first term 1/(0 * tanHalfFovy) = +inf and
     // NaNs every clip-space x. The mesh then vanishes into a clear-coloured
     // frame that still returns YES: indistinguishable on screen from "fusion
-    // produced nothing", which is the exact ambiguity the atlas comment above
-    // exists to design out. In Debug, glm asserts instead and CI aborts.
+    // produced nothing". In Debug, glm asserts instead and CI aborts.
     const float aspect = static_cast<float>(std::max(extent.width, 1u)) /
                          static_cast<float>(std::max(extent.height, 1u));
     // The same FOV the camera scales a pan by, and the same clip range its
@@ -1046,14 +971,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // Either the device pose or the turntable, depending on whether the user
     // has taken the camera over.
     frame_info.view_proj = proj * _impl->camera.view();
-    // Required. Leave it null and submit() records nothing whatsoever.
     // The keyframe belonging to the mesh this frame is about to draw, or the
     // 1x1 white fallback before the ring exists. Indexed by `mesh_slot` because
     // the two are one value -- see AtlasSlot.
-    //
-    // The set must be non-null either way -- HybridMeshPipeline::submit records
-    // no bind, no push constant and no draw at all on a null one, which is
-    // indistinguishable from a working renderer looking at empty space.
     //
     // Gated on the slot having been WRITTEN, not on the ring existing.
     // build_atlas_ring creates all kMeshSlots images at once and each starts in
@@ -1073,8 +993,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     const bool atlas_bindable =
         _impl->atlas.ready && _impl->atlas.slot_written[_impl->mesh_slot];
     frame_info.atlas = atlas_bindable
-                           ? _impl->atlas.slots[_impl->mesh_slot].set.handle()
-                           : _impl->atlas_set.handle();
+                           ? _impl->atlas.slots[_impl->mesh_slot].set->set()
+                           : _impl->atlas_set->set();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
     _impl->mesh_pipeline->submit(f.cmd, frame_info);
@@ -1140,8 +1060,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // Retained for the life of the thread below, which reads the pointer this
   // unwraps on every iteration.
   _capture = capture;
-  _impl->capture =
-      static_cast<vr::sensor::ICameraCapture*>([capture captureHandle]);
+  _impl->capture = static_cast<app::FrameSource*>([capture captureHandle]);
   _impl->fusing.store(true);
 
   // The impl pointer, deliberately, and not `self`: this TU is compiled
@@ -1162,7 +1081,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
       // contract still holds: one bad frame is recorded and skipped, it does
       // not end a scan the user is in the middle of.
       try {
-        vkc::Result<std::optional<vr::sensor::CapturedFrame>> got =
+        vkc::Result<std::optional<app::CapturedFrame>> got =
             impl->capture->poll();
         if (!got || !got.value()) {
           // Nothing new: sleep briefly rather than spin. ARKit delivers at

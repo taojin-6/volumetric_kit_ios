@@ -75,9 +75,8 @@ void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
 }
 
 vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
-                             VkSampler sampler, std::uint32_t width,
-                             std::uint32_t height) {
-  // The preconditions, refused rather than asserted. Two of the three would
+                             std::uint32_t width, std::uint32_t height) {
+  // The preconditions, refused rather than asserted. The second would
   // otherwise fire inside the commit loop below -- after every allocation has
   // succeeded -- which is the one place this function has no way to unwind
   // from. See the header for what each one costs when it is not checked.
@@ -86,13 +85,10 @@ vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
         "atlas ring: already built; rebuilding frees images frames in flight "
         "are still binding");
   }
-  if (sampler == VK_NULL_HANDLE) {
-    return vkc::Status::invalid_argument("atlas ring: null sampler");
-  }
   for (std::size_t i = 0; i < kRingSlots; ++i) {
-    if (!ring.slots[i].set.valid()) {
+    if (ring.slots[i].set == nullptr) {
       return vkc::Status::invalid_argument(
-          "atlas ring: descriptor sets were not allocated at bring-up");
+          "atlas ring: texture sets were not made at bring-up");
     }
   }
   if (width == 0 || height == 0) {
@@ -155,19 +151,17 @@ vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
 
   // --- Commit. Nothing below can fail ---------------------------------------
   //
-  // Which is a property of the checks at the top, not of these statements: the
-  // descriptor write and the sampler dereference both used to be able to abort
-  // here, and both preconditions are now refused above while unwinding is still
-  // possible.
+  // Which is a property of the checks at the top, not of these statements: a
+  // null set is refused above while unwinding is still possible, and the
+  // rebind below checks only for a null view, which a created image never has.
   for (std::size_t i = 0; i < kRingSlots; ++i) {
     ring.slots[i].texture = std::move(textures[i]);
     ring.slots[i].staging = std::move(stagings[i]);
-    // Written once, here: the image the set points at never changes, only its
-    // contents. That is what makes the per-frame path a copy rather than a
-    // descriptor update. The set itself was allocated at bring-up.
-    ring.slots[i].set.write_combined_image_sampler(
-        0, ring.slots[i].texture.view(), sampler,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Pointed here once, where the image is (re)created: the image the set
+    // names never changes after this, only its contents. That is what makes
+    // the per-frame path a copy rather than a descriptor update. The set
+    // itself was made at bring-up.
+    ring.slots[i].set->rebind(ring.slots[i].texture.view());
     // Fresh images record VK_IMAGE_LAYOUT_UNDEFINED, so each slot's first
     // upload transitions from there rather than from SHADER_READ_ONLY_OPTIMAL.
     // Not bindable either, which is a separate question with the same answer

@@ -31,20 +31,12 @@ target_include_directories(${VI_APP_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 # Every recon tier the smoke exercises. recon_core comes in transitively, but
 # the stages name volume/tsdf/mesh directly, so link them directly -- and the
 # core's vulkan tier, whose Instance, Device and Allocator the stages create.
+# That tier also links MoltenVK's system frameworks, which include the UIKit and
+# Foundation this shell uses, so the app names none of its own.
 target_link_libraries(
   ${VI_APP_NAME}
   PRIVATE volumetric_kit::core_vulkan volumetric_kit::recon_volume
           volumetric_kit::recon_tsdf volumetric_kit::recon_mesh)
-
-# MoltenVK is a static archive, so its own platform dependencies do not come
-# along automatically the way a dylib's would -- the app is where they resolve.
-# Metal is the translation target; IOSurface and QuartzCore back the
-# CAMetalLayer/CVPixelBuffer paths the ARKit slice will need; Foundation and
-# UIKit are the shell.
-target_link_libraries(
-  ${VI_APP_NAME}
-  PRIVATE "-framework Metal" "-framework Foundation" "-framework QuartzCore"
-          "-framework IOSurface" "-framework CoreGraphics" "-framework UIKit")
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)

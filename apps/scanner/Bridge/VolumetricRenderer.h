@@ -131,24 +131,16 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 - (instancetype)init NS_UNAVAILABLE;
 /// Stage label; a breakdown of the row above it is prefixed with spaces.
 ///
-/// @warning A breakdown's `cpuMs` is **contained in** the `cpuMs` of the row
-///          above it, while its `gpuMs` is not contained in that row's `gpuMs`
-///          -- the two halves nest differently, because a host scope spans a
-///          whole call and a device span covers one dispatch. So summing this
-///          column over every row double-counts the host half, and the
-///          host-minus-device gap of a row that *has* a breakdown is not idle
-///          time. See @ref cpuMs.
+/// @warning A breakdown's `cpuMs` and `gpuMs` are both **contained in** those
+///          of the row above it, so summing either column over every row
+///          double-counts the breakdowns.
 @property(nonatomic, readonly, copy) NSString* name;
 /// Wall clock around the stage. For a recon compute stage this covers host
 /// record, submit, the fence stall AND device execution -- an end-to-end cost,
 /// not a host-only one.
-///
-/// It follows that `cpuMs - gpuMs` is *not* a measure of host overhead wherever
-/// the row has a breakdown beneath it: that child's kernel ran inside this
-/// host span and reports its device time on its own row, so the difference
-/// counts it as stall. See @ref name.
 @property(nonatomic, readonly) double cpuMs;
-/// Device time from a timestamp span around the dispatch alone.
+/// Device time of every command recorded inside the stage, its breakdowns'
+/// included.
 @property(nonatomic, readonly) double gpuMs;
 /// Whether @ref gpuMs holds a real measurement -- see the note on this class,
 /// which is not the same claim as "this device can time the GPU".
@@ -216,7 +208,7 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 ///          double-counts; subtracting them reports a device stall as host
 ///          overhead. Overlay them, or plot this one alone.
 @property(nonatomic, readonly) double hostMs;
-/// Summed device milliseconds, breakdown rows included.
+/// Summed device milliseconds, breakdown rows excluded, as for @ref hostMs.
 ///
 /// Meaningful only where @ref deviceTimingValid is set -- a device that reports
 /// no timestamps and a frame that dispatched nothing are both `0.0` here.
@@ -549,7 +541,7 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// that bounds how often it is paid.
 ///
 /// @p capture is **retained** for as long as fusion runs — the fuse thread
-/// dereferences the `ICameraCapture` it owns, and a bare "must outlive the
+/// dereferences the `FrameSource` it owns, and a bare "must outlive the
 /// renderer" is not something the caller can honour when the two are siblings
 /// with no specified destruction order.
 ///

@@ -662,67 +662,23 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // reads as one.
   {
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
-    // First row on the first card, because it is the answer to the question
-    // the screen is provoking. This build publishes no geometry, so the view is
-    // empty from launch however well the scan is going -- and the operator
-    // walking the room is the one supplying the coverage being measured. Left
-    // unmarked, the natural reading is that tracking has failed and the natural
-    // response is to stop walking, which ends the measurement.
-    if (s.incremental_benchmark) {
-      add(r, @"mode", @"MEASURING -- no geometry drawn",
-          VolumetricStatToneWarn);
-    }
-    // Under an incremental extract these are recon's arena watermark, which
-    // still counts ranges the kernel retired in place, so they run above the
-    // live surface. Marked rather than silently compared against a normal
-    // build's. See FusionStats::spans_tracked.
-    add(r, @"mesh",
-        s.spans_tracked ? fmt("%u verts / %u tris  (incl. retired)", s.vertices,
-                              s.triangles)
-                        : fmt("%u verts / %u tris", s.vertices, s.triangles));
+    add(r, @"mesh", fmt("%u verts / %u tris", s.vertices, s.triangles));
     // The arena's fill against the plan for the slot this extract wrote. Its
     // own row rather than folded into the mesh line above: the numerator is the
     // same triangle count, but the question is whether the next remesh has room
     // rather than how much surface there is.
-    //
-    // OCCUPANCY, not live-surface fill, and the distinction is the whole of
-    // this row under an incremental extract. `s.triangles` is recon's arena
-    // watermark, which still counts triangles the kernel retired in place, so
-    // the ratio runs above the live surface by however much the arena has not
-    // compacted away -- recon's own occupancy ceiling is what eventually forces
-    // a full pass to compact it. Left driving the tone, because the resident
-    // bytes are genuinely held either way, but named so a warn colour is not
-    // read as "the live surface is about to overflow".
     const double fill = s.extract.triangle_capacity > 0
                             ? (double)s.triangles / s.extract.triangle_capacity
                             : 0.0;
     add(r, @"arena",
-        s.spans_tracked ? fmt("%.1f%% of %u tris  (incl. retired)",
-                              100.0 * fill, s.extract.triangle_capacity)
-                        : fmt("%.1f%% of %u tris", 100.0 * fill,
-                              s.extract.triangle_capacity),
+        fmt("%.1f%% of %u tris", 100.0 * fill, s.extract.triangle_capacity),
         panel_tone(fill, kArenaFillThresholds));
-    // recon folds the per-block span table into `arena_bytes` -- grid-sized,
-    // and doubling on every VoxelHashMap::resize -- so this figure is not
-    // comparable with a normal build's. The table is the measurement's own
-    // cost, which makes saying so part of reporting the measurement.
     add(r, @"resident",
-        s.spans_tracked ? fmt("%.0f MB across %u slot%s  (incl. span table)",
-                              s.extract.arena_bytes / mb, s.mesh_slots,
-                              s.mesh_slots == 1 ? "" : "s")
-                        : fmt("%.0f MB across %u slots",
-                              s.extract.arena_bytes / mb, s.mesh_slots));
-    // The publish counter, or the reason there is not one. Under the
-    // measurement mode nothing publishes, so the version stays 0 while the
-    // remesh count climbs; printed as "v0 after 4900 remeshes" that reads
-    // exactly like a wedged publish path, which is the one thing a diagnostic
-    // build must not be ambiguous about. Named instead, since "not published"
-    // is the mode working.
+        fmt("%.0f MB across %u slots", s.extract.arena_bytes / mb,
+            s.mesh_slots));
     add(r, @"version",
-        s.incremental_benchmark ? fmt("not published, after %llu remeshes",
-                                      (unsigned long long)s.remeshes)
-                                : fmt("v%u after %llu remeshes", s.mesh_version,
-                                      (unsigned long long)s.remeshes));
+        fmt("v%u after %llu remeshes", s.mesh_version,
+            (unsigned long long)s.remeshes));
     // `pass` rather than `dispatch`: the number is how many times the surface
     // was meshed, and `dispatch` is a duration on the latency bars. Read it as
     // cost, not as a verdict on the capacity planner -- the refit triggers
@@ -742,46 +698,6 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
         s.extract_stale || s.extract.dispatches > 1
             ? VolumetricStatToneWarn
             : VolumetricStatToneNeutral);
-    // The two rows the measurement mode exists to produce, and without which it
-    // cannot be told from the thing it is measured against. recon falls back to
-    // a full extract silently and by design -- the first extract against a
-    // grid, an iso change, a remove or clear, an arena that grows or has
-    // drifted too far past its surface, a preceding culled extract -- so "did
-    // this call re-mesh only the changed blocks" is reported rather than
-    // inferred. `dispatches` on the row above reads 1 on both paths and cannot
-    // answer it.
-    //
-    // Shown only when the mode is on, because on the normal path `incremental`
-    // is false by construction and a permanent "full" row is noise.
-    if (s.incremental_benchmark) {
-      add(r, @"incremental",
-          s.extract.incremental ? @"yes" : @"NO -- fell back to full",
-          s.extract.incremental ? VolumetricStatToneNeutral
-                                : VolumetricStatToneWarn);
-      // The fraction the whole feature trades against. Meaningless on a full
-      // pass, which reports 0 rather than restating active_blocks -- so the
-      // fallback prints the window alone instead of a fake 0%.
-      //
-      // The window travels with it because the fraction is a function of how
-      // much fusing happened since the last extract: the same scan re-meshes
-      // twice as much of itself over two frames as over one, and a number
-      // quoted without it can be compared with anything. See
-      // FusionStats::extract_window_frames.
-      if (s.extract.incremental && s.extract.active_blocks > 0) {
-        const double frac =
-            (double)s.extract.remeshed_blocks / (double)s.extract.active_blocks;
-        add(r, @"re-meshed",
-            fmt("%.1f%% of %u blocks  (%llu fused frame%s)", 100.0 * frac,
-                s.extract.active_blocks,
-                (unsigned long long)s.extract_window_frames,
-                s.extract_window_frames == 1 ? "" : "s"));
-      } else {
-        add(r, @"re-meshed",
-            fmt("- (%llu fused frame%s)",
-                (unsigned long long)s.extract_window_frames,
-                s.extract_window_frames == 1 ? "" : "s"));
-      }
-    }
     add(r, @"fused", fmt("%llu frames", (unsigned long long)s.frames_fused));
     // The texture pass, as a state rather than a duration -- the latency bars
     // already carry its timing, and this row exists to say which of the four
@@ -844,7 +760,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // makes them right rather than a second account of the same scan.
   //
   // With `FusionConfig::measure_stages` on -- the default -- recon publishes
-  // all of this as stage rows: `extract` and the seven `"  .."` phases it
+  // all of this as stage rows: `extract` and the six `"  .."` phases it
   // decomposes into, `..other` included. Publishing a section as well drew and
   // printed every one of those figures twice, and the residual worst of all:
   // Dashboard.swift and this file both record `max(0, extract_ms -
@@ -872,9 +788,9 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
 
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     if (s.extract.dispatches == 0) {
-      // Named, not drawn as seven zeros. `FusionStats::extract` is
+      // Named, not drawn as six zeros. `FusionStats::extract` is
       // value-initialised until the first successful remesh, so an ungated
-      // table renders `compact 0.00 / inputs 0.00 / ...` from launch -- and for
+      // table renders `compact 0.00 / sizing 0.00 / ...` from launch -- and for
       // the whole session on a device whose extract never succeeds -- in which
       // "the extract has not run" is indistinguishable from "it ran and every
       // phase was free". That is the confusion these cells carry two decimals
@@ -886,7 +802,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       // Everything below comes from the last successful remesh, so say when
       // that is no longer this frame -- the same marker the Scene card's
       // `extract` row carries, for the same reason and off the same flag. A
-      // breakdown frozen by a failing extract otherwise shows seven crisp
+      // breakdown frozen by a failing extract otherwise shows six crisp
       // durations in a neutral tone from a remesh fifteen seconds ago, three
       // cards from the row saying so.
       const VolumetricStatTone phase_tone =
@@ -906,18 +822,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       };
       const PhaseCell phases[] = {
           {"compact", s.extract.compact_ms},
-          {"inputs", s.extract.input_upload_ms},
-          // Named for what it holds rather than what it usually holds, exactly
-          // as the stage row publishing this same field is. recon charges the
-          // O(active blocks) span-stamping loop to `arena_alloc_ms` alongside
-          // the arena sizing, and that loop runs only when the span table is
-          // on -- so in that configuration this is not the measurement a normal
-          // build's is, and comparing the seven phases across the two silently
-          // compares different things. Under `incremental_benchmark`, the mode
-          // this breakdown exists to serve, an unmarked label reads a span
-          // table as a slower refit.
-          {s.spans_tracked ? "sizing+spans" : "sizing",
-           s.extract.arena_alloc_ms},
+          {"sizing", s.extract.arena_alloc_ms},
           {"desc", s.extract.descriptor_ms},
           {"meshing", s.extract.dispatch_ms},
           {"read", s.extract.readback_ms},
@@ -1039,16 +944,12 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
       // A row rather than a missing card -- a card that simply is not there
       // reflows the grid the moment one lands. But *which* row, because the
       // gate is a one-way latch and a single neutral "no sample yet" was the
-      // sole output for three states that want three different responses.
+      // sole output for two states that want different responses.
       //
-      // Under the measurement mode the survey never runs at all: the block in
-      // `Fusion::fuse` is gated on `!incremental_benchmark`, so nothing is
-      // failing and nothing is coming. After the first window has had time to
-      // land and has not, the surveys are failing, which used to read as the
-      // neutral first-window state forever.
-      if (s.incremental_benchmark) {
-        add(r, @"survey", @"not run under the measurement mode");
-      } else if (s.frames_fused < app::kSurveyStaleAfter) {
+      // After the first window has had time to land and has not, the surveys
+      // are failing, which used to read as the neutral first-window state
+      // forever.
+      if (s.frames_fused < app::kSurveyStaleAfter) {
         add(r, @"survey", @"no sample yet");
       } else {
         add(r, @"survey",

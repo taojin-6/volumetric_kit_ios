@@ -8,7 +8,7 @@
 ///
 /// Owns recon's per-scan state — the sparse block grid, the TSDF integrator,
 /// marching cubes, and the projective texturer — and turns polled
-/// `sensor::CapturedFrame`s into a host mesh the renderer draws. The desktop
+/// `CapturedFrame`s into a host mesh the renderer draws. The desktop
 /// `fuse_viewer` is the reference; this is that loop with ARKit in place of a
 /// Replica sequence.
 ///
@@ -36,6 +36,7 @@
 // the device, and this header cannot be reached from a host build: it pulls in
 // all of recon.
 #include "AllocationStop.hpp"
+#include "CapturedFrame.hpp"
 // @ref kSurveyEveryFrames and the staleness rules the read-out shares with the
 // fuse loop, and @ref plan_growth / @ref guard_allocation -- the two decisions
 // `fuse` makes about the block table. All pure, all on the far side of the same
@@ -49,7 +50,6 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/sensor/camera_capture.hpp"
 #include "volumetric_kit/recon/texture/projective_texturer.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -267,12 +267,8 @@ struct FusionConfig {
   /// @brief How many extracted meshes may be outstanding at once.
   ///
   /// Passed through to `MarchingCubesConfig::slot_count`, and **two is the
-  /// floor for any configuration that publishes geometry**: @ref Fusion::start
-  /// refuses anything lower rather than running with it. The floor is keyed on
-  /// the borrow, not on a mode name -- a configuration in which nothing takes a
-  /// @ref Published::mesh has nothing to corrupt, which is why
-  /// @ref incremental_benchmark can hold one slot and why relaxing it is stated
-  /// as "publishes no mesh" rather than as an exemption for that flag.
+  /// floor**: @ref Fusion::start refuses anything lower rather than running
+  /// with it.
   ///
   /// One is recon's own default and means a single arena reused in
   /// place, with `release_through` recording a number and changing no
@@ -288,85 +284,6 @@ struct FusionConfig {
   /// (`RendererImpl::kMeshSlots`). Each slot costs a full vertex arena, so
   /// higher is not free -- see recon's `slot_count`.
   std::uint32_t mesh_slots = 2;
-
-  /// @brief Measure incremental extraction, publishing no geometry.
-  ///
-  /// recon's @ref vr::mesh::MarchingCubes::extract_device_incremental re-meshes
-  /// only the blocks a fuse changed. **Sharing stays on** -- that kernel
-  /// reserves two per-block ranges and reuses them, and retires a dead triangle
-  /// through its own index run for 12 bytes rather than 192.
-  ///
-  /// Turning sharing off was what the first version did, and it cost 3x the
-  /// vertex arena: 4177 MB measured on an iPad Pro (M5) against 33 MB for the
-  /// same app normally. That made the number it produced unrepresentative of
-  /// anything shippable, which is the whole reason it is no longer done.
-  ///
-  /// This mode changes two settings beyond the extract it calls, and both cost
-  /// something:
-  ///
-  /// - `slot_count` drops to 1, because recon *refuses* a ring here: a
-  ///   re-meshed block writes into the arena the last extract filled, and a
-  ///   ring hands this one a different slot.
-  /// - `track_block_spans` turns on, which is the table the incremental pass
-  ///   re-meshes against. It is grid-sized (`num_blocks * 16` device plus
-  ///   `num_blocks * 8` host, doubling on every `VoxelHashMap::resize`) and
-  ///   recon charges it to `ExtractTimings::arena_bytes` -- so this mode's
-  ///   resident figure is **not comparable** with a normal build's. It also
-  ///   charges the per-extract span stamping loop to `arena_alloc_ms`, which
-  ///   this class publishes as the `..sizing` stage row.
-  ///
-  /// What it re-meshes against costs fusion nothing: the `changed` stamps
-  /// recon's integrator writes on every fuse, which the extractor reads against
-  /// the tick of its own last extract.
-  ///
-  /// It also stands the dirty survey down. Not for correctness -- the survey
-  /// keeps a tick of its own -- but because its two fence waits would land on
-  /// the fuse thread this mode times, and the frames dropped meanwhile would
-  /// inflate the next `remeshed_blocks`. See the survey's gate in
-  /// @ref Fusion::fuse.
-  ///
-  /// It **does not publish a mesh**, and that is what makes one slot safe
-  /// rather than the hazard @ref mesh_slots exists to refuse: nothing borrows
-  /// the extractor's buffers, so nothing is drawing an arena the next extract
-  /// overwrites. Nothing is drawn *at all* while it runs -- the renderer has
-  /// taken no mesh, so there is no last one to keep showing. The panel says so
-  /// rather than leaving a blank view to be read as a tracking failure.
-  ///
-  /// Because nothing collects, the back-pressure guard in @ref Fusion::remesh
-  /// is inert here: the shipping build skips a remesh whose predecessor the
-  /// renderer has not taken, and this mode extracts on every remesh interval.
-  /// The window each reading covers is therefore published beside it as
-  /// @ref FusionStats::extract_window_frames, because `remeshed_blocks` means
-  /// nothing without it -- a shorter window is less dirt and flatters the
-  /// incremental path.
-  ///
-  /// What it answers is the only question a desktop fixture cannot. room0
-  /// re-meshes 81.67% of its blocks per window, capping the win there at 1.22x;
-  /// what a device walk does is the **unknown this exists to measure**, not
-  /// something to be told in advance. The number is
-  /// `ExtractTimings::remeshed_blocks / ExtractTimings::active_blocks`, over
-  /// @ref FusionStats::extract_window_frames fused frames -- not a millisecond
-  /// row, and meaningful only while `ExtractTimings::incremental` is true.
-  ///
-  /// What it deliberately does **not** show is the in-place tearing. Seeing
-  /// that needs the ring intact *and* the arena de-ringed, so that a reader
-  /// holding an older generation is still drawing while a newer extract mutates
-  /// -- and de-ringing the arena is the open design question this measurement
-  /// exists to decide. At one slot the renderer would simply be shown nothing
-  /// new.
-  ///
-  /// @warning An incremental extract still carries inflation for the ranges it
-  ///          retires -- 1.12x measured on room0 with sharing, against 1.82x
-  ///          without it. That is a working-set cost this mode pays and the
-  ///          normal path does not, and it lands in
-  ///          `DeviceMesh::triangle_count`, which recon sets from the arena
-  ///          watermark rather than its internally-computed live count. So the
-  ///          arena fill row counts retired geometry too.
-  ///
-  /// @note Every figure quoted above is from room0 on a desktop fixture. No
-  ///       reading in the configuration this file now builds has been taken on
-  ///       hardware.
-  bool incremental_benchmark = false;
 
   /// @brief The queue families that will touch the mesh buffers.
   ///
@@ -482,9 +399,9 @@ struct FrameSample {
   ///          overlaid, or draw the host figure alone; a "host vs device"
   ///          split built by subtraction reads a device stall as host time.
   float host_ms = 0.0f;
-  /// Summed device milliseconds. Breakdowns ARE counted here: a device span
-  /// covers one dispatch and never the compaction the stage ran first, so
-  /// skipping them deletes that time rather than deduplicating it.
+  /// Summed device milliseconds, breakdown rows excluded too: since the core's
+  /// 0.20.0 a stage's device time covers every command recorded inside it, its
+  /// breakdowns' included.
   ///
   /// Meaningful only where @ref device_timing_valid is set. A row carrying no
   /// GPU span contributes nothing, so a queue family that reports no timestamps
@@ -705,43 +622,7 @@ struct FusionStats {
   vr::mesh::ExtractTimings extract{};
   /// How many slots that arena is spread over -- the count the **extractor**
   /// was built with, echoed here so the read-out needs no second source for it.
-  ///
-  /// Not always `FusionConfig::mesh_slots`: @ref
-  /// FusionConfig::incremental_benchmark overrides it to 1 on the way into
-  /// `MarchingCubesConfig`, and reporting the request instead had the read-out
-  /// saying "3 slots" while one was in use -- the single line that would have
-  /// shown the mode was on, saying it was off.
   std::uint32_t mesh_slots = 0;
-  /// Whether the extractor is keeping recon's per-block span table.
-  ///
-  /// On only under @ref FusionConfig::incremental_benchmark, and published
-  /// because it is what makes two other rows here non-comparable with a normal
-  /// build: recon folds the table into `extract.arena_bytes` and charges its
-  /// per-extract stamping loop to `arena_alloc_ms`, which this class publishes
-  /// as the `..sizing` stage row. The read-out says so beside those figures
-  /// rather than leaving them to be compared across builds.
-  bool spans_tracked = false;
-  /// Fused frames of changes the last incremental extract re-meshed: those
-  /// since the extract before it.
-  ///
-  /// The denominator `extract.remeshed_blocks` is meaningless without: the
-  /// fraction of the surface a fuse moved is a function of how much fusing
-  /// happened since the previous extract, so a shorter window is simply less
-  /// dirt and flatters the incremental path. 1 in the steady state under
-  /// @ref FusionConfig::incremental_benchmark, which extracts on every remesh
-  /// interval because nothing collects and the back-pressure guard is
-  /// therefore inert; the shipping build can accumulate more.
-  ///
-  /// 0 when no incremental extract has run.
-  std::uint64_t extract_window_frames = 0;
-  /// Whether this scan is running as a measurement rather than as a scan.
-  ///
-  /// Echoes @ref FusionConfig::incremental_benchmark. The read-out needs it for
-  /// something no other field can say: in this mode nothing is published, so
-  /// @ref mesh_version stays 0 while @ref remeshes climbs, and a panel reading
-  /// "remesh 4900 (v0)" is otherwise indistinguishable from a wedged publish
-  /// path. It is also what lets the panel explain an empty view.
-  bool incremental_benchmark = false;
   /// Block-table capacity (@ref volumetric_kit::ios_app::table_blocks_for)
   /// **as of the extract that measured `extract.active_blocks`**, so the
   /// read-out's occupancy divides two figures taken at one instant.
@@ -874,9 +755,7 @@ struct FusionStats {
   /// compaction (a dispatch, a fence wait and a readback of the whole set), a
   /// second fence-waited readback of every block slot's stamps (12 bytes a
   /// slot, free ones included), and an O(active) dilation walk.
-  /// @ref survey_ms is what that actually came to. Not surveyed at all under
-  /// @ref FusionConfig::incremental_benchmark, whose fuse thread that cost
-  /// would land on.
+  /// @ref survey_ms is what that actually came to.
   std::uint32_t survey_active_blocks = 0;
   /// Blocks the fuse actually CHANGED in the window -- not "was dispatched"
   /// (the dispatch covers every active block and returns early for most) and
@@ -1046,7 +925,7 @@ class Fusion {
   /// A failing stage is recorded in @ref stats and skipped rather than
   /// propagated: a single dropped frame should not end a scan the user is in
   /// the middle of.
-  void fuse(const vr::sensor::CapturedFrame& frame);
+  void fuse(const CapturedFrame& frame);
 
   /// @return The camera-to-world pose of the most recently fused frame.
   ///
@@ -1237,8 +1116,7 @@ class Fusion {
   ///                 the rows comparable. The extract is *not* measured into it
   ///                 -- it reports through `mesh::ExtractTimings`; see @ref
   ///                 FusionStats::stages.
-  void remesh(const vr::sensor::CapturedFrame& frame,
-              vkc::StageMetrics* metrics);
+  void remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics);
 
   FusionConfig config_{};
   // recon's per-scan state is create-only (no default constructor), which is
@@ -1397,12 +1275,6 @@ class Fusion {
   // it, and the next survey then refuses rather than counting stamps that
   // cannot see what the remove left to re-mesh; see the survey in `fuse`.
   std::uint64_t survey_epoch_ = 0;
-  // The same idea for the incremental extract: `stats_.frames_fused` at the
-  // last one, whose tick recon's extractor keeps itself. Separate from the
-  // survey's, since the two run on cadences of their own. Published as
-  // FusionStats::extract_window_frames, which is the denominator
-  // `extract.remeshed_blocks` is meaningless without.
-  std::uint64_t extract_window_start_ = 0;
   // `stats_.frames_fused` as of the last survey that actually published, and
   // whether one ever has. The same pair as active_blocks_at_frame_ /
   // active_blocks_measured_ above, for the same reason: a latched read-out
