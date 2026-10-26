@@ -31,6 +31,7 @@
 #import "ViewOrientation.hpp"
 
 #include <os/log.h>
+#include "FailureHandling.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1054,14 +1055,15 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (void)startFusionWithCapture:(VolumetricCapture*)capture {
-  if (_impl->fusing.load()) {
+  // A stop request can clear the flag before the old thread finishes. Do not
+  // replace its retained capture until stopFusion has joined it.
+  if (_impl->fusing.load() || _impl->fuse_thread.joinable()) {
     return;
   }
   // Retained for the life of the thread below, which reads the pointer this
   // unwraps on every iteration.
   _capture = capture;
   _impl->capture = static_cast<app::FrameSource*>([capture captureHandle]);
-  _impl->fusing.store(true);
 
   // The impl pointer, deliberately, and not `self`: this TU is compiled
   // -fobjc-arc, so a by-copy capture of `self` would be __strong and the retain
@@ -1071,34 +1073,43 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // -dealloc would never run at all. The impl outlives the thread by
   // construction: ~RendererImpl joins before destroying anything.
   app::RendererImpl* impl = _impl.get();
-  _impl->fuse_thread = std::thread([impl] {
-    while (impl->fusing.load()) {
-      // Contained here rather than allowed to escape. A throw out of a thread
-      // function is std::terminate -- the app vanishes with no message and no
-      // crash context -- and the reachable one is real: every remesh builds a
-      // fresh ~50 MB host vertex vector inside marching_cubes->download, on a
-      // phone that is already holding the volume. Per iteration, so Fusion's
-      // contract still holds: one bad frame is recorded and skipped, it does
-      // not end a scan the user is in the middle of.
-      try {
-        vkc::Result<std::optional<app::CapturedFrame>> got =
-            impl->capture->poll();
-        if (!got || !got.value()) {
-          // Nothing new: sleep briefly rather than spin. ARKit delivers at
-          // 60 Hz and this loop is otherwise free to burn a core doing nothing.
-          std::this_thread::sleep_for(std::chrono::milliseconds(2));
-          continue;
-        }
-        impl->fusion.fuse(*got.value());
-      } catch (const std::exception& e) {
-        impl->fusion.note_error(std::string("fuse thread: ") + e.what());
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      } catch (...) {
-        impl->fusion.note_error("fuse thread: unknown exception");
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      }
-    }
-  });
+  const bool started = app::start_worker(
+      impl->fusing, impl->fuse_thread,
+      [impl] {
+        return std::thread([impl] {
+          while (impl->fusing.load()) {
+            // Keep the boundary inside the loop: one failed poll/fuse is
+            // reported and skipped without ending the scan. Reporting must
+            // itself remain safe when host allocation is failing.
+            const bool completed = app::contain_frame_failure(
+                [impl] {
+                  vkc::Result<std::optional<app::CapturedFrame>> got =
+                      impl->capture->poll();
+                  if (!got || !got.value()) {
+                    // Nothing new: sleep briefly rather than spin. ARKit
+                    // delivers at 60 Hz and this loop is otherwise free to burn
+                    // a core doing nothing.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    return;
+                  }
+                  impl->fusion.fuse(*got.value());
+                },
+                [impl](std::string_view message) noexcept {
+                  impl->fusion.note_error(message, "fuse thread: ");
+                });
+            if (!completed)
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
+        });
+      },
+      [impl](std::string_view message) noexcept {
+        impl->fusion.note_error(message, "fuse thread startup: ");
+      });
+  if (!started) {
+    // Thread construction failed; no worker can still borrow this capture.
+    impl->capture = nullptr;
+    _capture = nil;
+  }
 }
 
 - (void)beginStopFusion {
