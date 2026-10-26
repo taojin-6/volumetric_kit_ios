@@ -41,7 +41,6 @@
 // <cstdio> and <cstdarg> were here for `fusionSummary` and the read-out's cell
 // builders, which now live in Readout.mm and name them there. Nothing in this
 // file formats any more.
-#include <cstring>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -436,13 +435,13 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
 
-  // --- The atlas sets --------------------------------------------------------
-  // 1x1 white for a frame whose mesh slot has no written keyframe: the
-  // fragment shader samples the atlas only where a triangle carries a real
-  // uv0. Where projective texturing did not win a camera, uv0 is the (-1,-1)
-  // sentinel and the TSDF's per-vertex colour is used instead -- so the white
-  // image is never selected there, and a textured vertex with no keyframe
-  // written behind it reads white rather than a plausible wrong image.
+  // --- The keyframe sets -----------------------------------------------------
+  // 1x1 white for a mesh slot with no keyframe: the fragment shader samples
+  // set 0 only where a triangle carries a real uv0. Where projective texturing
+  // did not win a camera, uv0 is the (-1,-1) sentinel and the TSDF's
+  // per-vertex colour is used instead -- so the white image is never selected
+  // there, and a textured vertex with no keyframe behind it reads white rather
+  // than a plausible wrong image.
   static const std::uint8_t kWhite[4] = {255, 255, 255, 255};
   vg::ImageUploadDesc atlas_desc;
   atlas_desc.extent = {1, 1};
@@ -457,38 +456,21 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->atlas_texture = std::move(atlas_texture).value();
 
-  // The renderer's texture sets are gfx's: each a HybridMeshTextureSet, with
-  // its own pool and sampler, over an image this renderer owns. The sampler is
-  // the one the renderer made before: linear, repeating, every mip level.
-  vg::pipelines::HybridMeshTextureSet::Options atlas_sampling;
-  atlas_sampling.filter = VK_FILTER_LINEAR;
-  atlas_sampling.address = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  atlas_sampling.max_lod = VK_LOD_CLAMP_NONE;
-  vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> atlas_set =
-      vg::pipelines::HybridMeshTextureSet::create(
-          _impl->app.device(), _impl->app.allocator(), *_impl->mesh_pipeline,
-          _impl->atlas_texture.view(), atlas_sampling);
-  if (!atlas_set) {
-    app::set_error(error, atlas_set.status(), "atlas HybridMeshTextureSet");
-    return nil;
-  }
-  _impl->atlas_set = std::move(atlas_set).value();
-
-  // The ring's sets, here and only here -- the images they will name do not
-  // exist yet, and are built on the first textured mesh once ARKit has stated
-  // its colour size. Each starts over the white image and build_atlas_ring
-  // rebinds it to its slot's image once that exists, so the build's commit has
-  // nothing left that can fail. No frame binds a slot set before then.
-  //
-  // A failure here fails bring-up, which is the honest place for it: this is a
-  // fixed, small allocation made before the first frame, so it not being
-  // available is a configuration fault rather than the transient the per-frame
-  // path has to tolerate.
+  // The ring's sets, here and only here, each starting over the white image.
+  // A keyframe is a camera picture's two planes, which gfx samples
+  // clamp-to-edge at level 0 with the filter given here. A failure fails
+  // bring-up, which is the honest place for it: this is a fixed, small
+  // allocation made before the first frame, so it not being available is a
+  // configuration fault rather than the transient the per-frame path has to
+  // tolerate.
+  vg::pipelines::HybridMeshTextureSet::Options keyframe_sampling;
+  keyframe_sampling.filter = VK_FILTER_LINEAR;
+  keyframe_sampling.address = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
     vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> slot_set =
         vg::pipelines::HybridMeshTextureSet::create(
             _impl->app.device(), _impl->app.allocator(), *_impl->mesh_pipeline,
-            _impl->atlas_texture.view(), atlas_sampling);
+            _impl->atlas_texture.view(), keyframe_sampling);
     if (!slot_set) {
       app::set_error(error, slot_set.status(),
                      "atlas ring HybridMeshTextureSet");
@@ -628,117 +610,27 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
       // --- Publish the keyframe this mesh's uv0 index into -----------------
       //
       // Into the SAME slot the mesh just went into. They are one value: the
-      // uv0 recon wrote address this particular image, so a mesh drawn against
-      // any other keyframe samples the wrong place on every textured triangle
-      // -- and the result looks like a plausible photograph of somewhere else,
-      // not like an error.
-      // Gated on `draw_mesh` the property, which is the only half of the draw
-      // decision known this early -- `have_mesh` is being set just above, and
-      // the full `draw_mesh` is computed 120 lines below, after the camera
-      // work. That is far enough down that the whole atlas path used to run
-      // unconditionally: with drawMesh = NO, every accepted mesh still paid an
-      // 11 MB main-thread memcpy and a recorded 11 MB GPU copy for an image no
-      // frame would bind. At remesh_every = 1 and 60 Hz that is ~660 MB/s of
-      // each, on the thread holding the display-link deadline, to serve a
-      // render path deliberately switched off.
+      // uv0 recon wrote address this particular picture, so a mesh drawn
+      // against any other keyframe samples the wrong place on every textured
+      // triangle -- and the result looks like a plausible photograph of
+      // somewhere else, not like an error.
       //
-      // Skipping is safe only together with the slot bookkeeping below: a slot
-      // left unwritten while drawing is off must not be bound when drawing
-      // comes back on, or the first frame after the switch samples a keyframe
-      // several meshes stale. `atlas.slot_written` is what carries that, and
-      // clearing it is why the else-branch exists rather than the skip being a
-      // bare `if`.
-      if (_impl->draw_mesh && fresh->atlas != nullptr) {
-        // Built on the first textured mesh rather than at bring-up, because the
-        // size is ARKit's to state: `imageResolution` is not known until a
-        // frame has arrived, and guessing 1920x1440 would be a constant that
-        // silently mis-sizes the ring on any device that reports otherwise.
-        if (!_impl->atlas.ready) {
-          // Creates the slots' images and rebinds each slot's texture set to
-          // its new image.
-          const vkc::Status built =
-              app::build_atlas_ring(_impl->atlas, _impl->app.allocator(),
-                                    fresh->atlas_width, fresh->atlas_height);
-          if (!built.ok()) {
-            // Not fatal to the frame, and deliberately not latched: the ring is
-            // an allocation of ~kMeshSlots * 11 MB of images plus as much again
-            // in mapped staging buffers, so a refusal here is much more likely
-            // to be transient memory pressure than a permanent fault. The mesh
-            // still draws, with the white atlas bound and every textured
-            // triangle sampling white -- so the failure is visible rather than
-            // silent, and the next remesh retries. The retry can now actually
-            // succeed; see build_atlas_ring for what used to stop it.
-            //
-            // Its own counter, not the mesh-upload pair: that one latches and
-            // means the geometry is undrawable forever. See `atlas_failures`.
-            ++_impl->atlas_failures;
-            _impl->atlas_error = "ring: " + std::string(built.message());
-          }
-        }
-        // Checked, not assumed: a ring built for one colour size and handed
-        // another would read past the staged image. ARKit does not change
-        // `imageResolution` mid-session, which is exactly why an unchecked
-        // mismatch would be a latent read overrun rather than a visible bug.
-        const bool extent_ok = _impl->atlas.ready &&
-                               fresh->atlas_width == _impl->atlas.width &&
-                               fresh->atlas_height == _impl->atlas.height;
-        if (extent_ok) {
-          app::AtlasSlot& slot = _impl->atlas.slots[_impl->mesh_slot];
-          // The same expression that sized the buffer, called rather than
-          // restated: the two live in different translation units now, and a
-          // format change applied to only one of them writes past the mapping.
-          const VkDeviceSize bytes =
-              app::atlas_staging_bytes(_impl->atlas.width, _impl->atlas.height);
-          // The one host copy on this path. `Published::atlas` is valid only
-          // until the next take_mesh, so it is consumed here, in the same call
-          // that received it, rather than remembered.
-          std::memcpy(slot.staging.mapped(), fresh->atlas,
-                      static_cast<std::size_t>(bytes));
-          // Recorded here, above `f.target->begin` below, and that position is
-          // load-bearing rather than incidental: vkCmdCopyBufferToImage may not
-          // be recorded inside a render pass instance, and this build ships
-          // without the validation layer that would say so. See the
-          // precondition on record_atlas_upload.
-          app::record_atlas_upload(f.cmd, slot.staging.handle(), slot.texture);
-          // Two records, deliberately: the image's own layout, which the upload
-          // just moved out of UNDEFINED for good until the ring is rebuilt --
-          // and `slot_written`, which is about bindability and gets cleared
-          // below for reasons that leave the layout exactly as it is.
-          _impl->atlas.slot_written[_impl->mesh_slot] = true;
-        } else if (_impl->atlas.ready) {
-          // A textured mesh whose keyframe could not be staged. Skipping the
-          // upload alone is not enough and was the bug: `fresh->atlas` being
-          // non-null means Fusion *did* texture this mesh, so every vertex
-          // carries a real uv0 -- and the bind below would hand it whichever
-          // keyframe this slot last held, kMeshSlots meshes ago. That renders
-          // as a plausible photograph of somewhere else painted over the live
-          // scan, which is the single failure the mesh/slot pairing exists to
-          // make unrepresentable.
-          //
-          // Marking the slot unwritten is what makes it bind the white fallback
-          // instead: wrong-looking, obviously, and honestly.
-          //
-          // Deliberately not a rebuild. Re-running build_atlas_ring here would
-          // free images that frames still in flight are binding -- a
-          // use-after-free needing a queue drain to make safe, on the thread
-          // that must not stall. ARKit does not resize mid-session, so this
-          // path is defensive; if it ever fires it stays degraded for the rest
-          // of the scan, and says so rather than recovering quietly.
-          _impl->atlas.slot_written[_impl->mesh_slot] = false;
-          ++_impl->atlas_failures;
-          _impl->atlas_error =
-              "keyframe is " + std::to_string(fresh->atlas_width) + "x" +
-              std::to_string(fresh->atlas_height) + " but the ring was built " +
-              std::to_string(_impl->atlas.width) + "x" +
-              std::to_string(_impl->atlas.height) +
-              "; textured meshes render white for the rest of this scan";
-        }
-      } else if (fresh->atlas != nullptr) {
-        // Drawing is off, so the upload above was skipped. The mesh in this
-        // slot still has real uv0, so the slot must not stay bindable -- see
-        // the gate's note. The next remesh reaching it while drawing is on
-        // writes it again.
-        _impl->atlas.slot_written[_impl->mesh_slot] = false;
+      // Every mesh rebinds its slot, textured or not and drawn or not: a mesh
+      // without a keyframe binds white and lets the slot's old picture go, so
+      // the ring never holds a camera picture longer than its slot's mesh. The
+      // rebind is a descriptor write and a 32-byte uniform; the picture itself
+      // is sampled where the camera left it. The slot was last bound by a frame
+      // that has retired (see kMeshSlots), and this frame binds it only below.
+      const vkc::Status bound = app::bind_keyframe(
+          _impl->atlas.slots[_impl->mesh_slot], std::move(fresh->keyframe),
+          _impl->atlas_texture.view());
+      if (!bound.ok()) {
+        // Not fatal and not latched: the mesh still draws, with its textured
+        // triangles white, and the next mesh tries again. Its own counter, not
+        // the mesh-upload pair: that one latches and means the geometry is
+        // undrawable forever. See `atlas_failures`.
+        ++_impl->atlas_failures;
+        _impl->atlas_error = std::string(bound.message());
       }
       // The message is deliberately NOT cleared here. `mesh_upload_failures` is
       // a running total like every other counter on this read-out, and clearing
@@ -972,30 +864,10 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // Either the device pose or the turntable, depending on whether the user
     // has taken the camera over.
     frame_info.view_proj = proj * _impl->camera.view();
-    // The keyframe belonging to the mesh this frame is about to draw, or the
-    // 1x1 white fallback before the ring exists. Indexed by `mesh_slot` because
-    // the two are one value -- see AtlasSlot.
-    //
-    // Gated on the slot having been WRITTEN, not on the ring existing.
-    // build_atlas_ring creates all kMeshSlots images at once and each starts in
-    // VK_IMAGE_LAYOUT_UNDEFINED, but only the slot a textured mesh lands in is
-    // ever uploaded -- so between the first textured mesh and the ring coming
-    // fully round, `atlas.ready` is true for slots that have never been
-    // written. Binding one declares SHADER_READ_ONLY_OPTIMAL for an image in
-    // UNDEFINED, and gfx's hybrid_mesh.frag samples the atlas before it
-    // branches, so the read happens unconditionally: undefined behaviour, with
-    // no validation layer on this configuration to name it. Reachable as soon
-    // as one remesh publishes no keyframe -- a colour the capture refused, a
-    // texture pass that failed -- between two that do.
-    //
-    // On those frames this is also *correct* rather than merely safe: a mesh
-    // Fusion did not texture has every uv0 at recon's sentinel, so the shader
-    // takes the vertex-colour branch and never looks at what is bound here.
-    const bool atlas_bindable =
-        _impl->atlas.ready && _impl->atlas.slot_written[_impl->mesh_slot];
-    frame_info.atlas = atlas_bindable
-                           ? _impl->atlas.slots[_impl->mesh_slot].set->set()
-                           : _impl->atlas_set->set();
+    // The keyframe belonging to the mesh this frame is about to draw, indexed
+    // by `mesh_slot` because the two are one value -- see AtlasSlot. Always
+    // bindable: a slot's set names its held picture or the white texture.
+    frame_info.atlas = _impl->atlas.slots[_impl->mesh_slot].set->set();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
     _impl->mesh_pipeline->submit(f.cmd, frame_info);

@@ -67,7 +67,7 @@ namespace vr = volumetric_kit::recon;
 //
 //   1. A gfx Buffer/Texture's producing Allocator must outlive it, and that
 //      allocator belongs to `app`. So `atlas_texture` and `atlas`, whose slots
-//      each hold a Texture and a Buffer created from `app.allocator()`, must be
+//      each hold a texture set with a uniform from `app.allocator()`, must be
 //      declared *after* `app` to be destroyed *before* it. Those two, and the
 //      pipelines and shaders above them -- not `mesh_slots`, which is borrowed
 //      views of recon's buffers and allocates nothing here, so its position is
@@ -165,20 +165,12 @@ struct RendererImpl {
   vg::ShaderModule fragment_shader;
   vg::GraphicsPipeline pipeline;
   std::optional<vg::pipelines::HybridMeshPipeline> mesh_pipeline;
-  // The 1x1 white atlas a frame binds when its mesh slot has no written
-  // keyframe: before the first textured mesh arrives, whenever a remesh
-  // published no keyframe (a colour the capture refused, a texture pass that
-  // failed), and whenever this frame's mesh slot holds an atlas image nothing
-  // has written yet. That last case is what `atlas.slot_written` decides -- see
-  // where frame_info.atlas is chosen, because binding an unwritten slot is
-  // undefined behaviour rather than merely a wrong colour.
-  //
-  // Never *selected* by the shader where Fusion left uv0 at the sentinel; a
-  // vertex with a real uv0 and no written keyframe samples white. The set over
-  // it is gfx's HybridMeshTextureSet, with its own pool and sampler, after the
-  // pipeline it was made for and the image it names.
+  // The 1x1 white texture a ring slot's set names when the slot has no
+  // keyframe: before its first textured mesh, when a mesh carries no keyframe,
+  // and when the set refuses one. The shader never selects it where Fusion
+  // left uv0 at the sentinel; a vertex with a real uv0 and no keyframe samples
+  // white.
   vkc::Image atlas_texture;
-  std::unique_ptr<vg::pipelines::HybridMeshTextureSet> atlas_set;
 
   // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
   // use-after-free, and at per-frame meshing that would be every frame. One
@@ -234,17 +226,12 @@ struct RendererImpl {
   std::size_t frame_slot = 0;
   std::size_t mesh_slot = 0;
 
-  /// The keyframe images the textured mesh samples, one per @ref mesh_slot,
-  /// together with the state saying which of them may be bound.
+  /// The keyframes the textured mesh samples, one per @ref mesh_slot, each
+  /// holding its camera picture until the slot is rebound.
   ///
-  /// Its own type in AtlasRing.hpp, with the functions that build and write it,
-  /// because those take the ring rather than the whole renderer -- which is
-  /// what lets that unit be plain C++ and lets this header not have to know
-  /// about it in return. Eleven `atlas_*` members spread across this struct
-  /// were what pointed the dependency the other way.
-  ///
-  /// Declared here, after `app`, because its slots own gfx images and buffers:
-  /// rule 1 of the teardown note above.
+  /// Declared here, after `app`, because its slots own gfx texture sets: rule 1
+  /// of the teardown note above. The pictures are images recon imported on
+  /// `recon_device`, which is declared before both and outlives them.
   AtlasRing atlas;
   // The newest generation take_mesh has handed over, drawn or not. What the
   // release logic falls back to when *no* frame is holding a generation: the

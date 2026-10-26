@@ -423,15 +423,15 @@ typedef struct {
 /// than this frame.
 @property(nonatomic, readonly) BOOL extractStale;
 
-/// The fuse thread's per-textured-remesh keyframe copy, which sits inside no
-/// stage row and no other total. Zero when no keyframe was published.
+/// The fuse thread's per-textured-remesh keyframe import, which sits inside no
+/// stage row and no other total. Zero when nothing was imported.
 ///
 /// The extract's unaccounted remainder is deliberately **not** here beside it.
 /// It looks like the same kind of figure and is not: recon publishes it as the
 /// `"  ..other"` stage row, so it is already one of the bars, and a second copy
 /// on the snapshot only ever produced a panel that drew it twice and then said
 /// it was in neither bar. This one really is outside every span there is.
-@property(nonatomic, readonly) double atlasCopyMs;
+@property(nonatomic, readonly) double keyframeImportMs;
 /// Fused frames so far, as the panel's own answer to "has anything completed
 /// yet".
 ///

@@ -36,6 +36,7 @@ add_executable(
   growth_policy_test.cpp
   memory_budget_test.cpp
   orbit_camera_test.cpp
+  picture_slot_test.cpp
   stat_tone_test.cpp
   view_orientation_test.cpp)
 

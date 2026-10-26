@@ -14,12 +14,15 @@
 /// the frame it hands them, and the one call the renderer makes on its source,
 /// here.
 
+#include <CoreVideo/CoreVideo.h>
+
 #include <cstdint>
 #include <optional>
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
+#include "volumetric_kit/recon/sensor/yuv_image.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -38,6 +41,16 @@ struct CapturedFrame {
   volumetric_kit::recon::ColorCameraParams color_camera{};
   /// What @ref color carries; meaningful only when it is set.
   volumetric_kit::recon::ColorEncoding color_encoding{};
+  /// The camera picture @ref color was converted from, borrowed like it:
+  /// ARKit's `capturedImage`, 8-bit NV12 on an IOSurface, for a renderer to
+  /// sample where it is. Null when the frame carries no colour, or colour that
+  /// had to be brought to the canonical encoding, which the picture is not in.
+  CVPixelBufferRef picture = nullptr;
+  /// How @ref picture codes R'G'B' -- matrix weights, range and chroma siting,
+  /// as its buffer declared them -- with no planes: recon's
+  /// `PixelBufferImporter` fills those and leaves the coding as it is.
+  /// Meaningful only when @ref picture is set.
+  volumetric_kit::recon::sensor::YuvImage picture_coding{};
   std::uint64_t timestamp_ns = 0;
 
   bool has_color() const noexcept { return color != nullptr; }

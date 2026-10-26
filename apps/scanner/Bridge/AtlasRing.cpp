@@ -3,177 +3,68 @@
 
 #include "AtlasRing.hpp"
 
-#include <cstddef>
+#include <optional>
 #include <utility>
 
-#include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/core/vulkan/allocator.hpp"
-#include "volumetric_kit/gfx/core/image_barrier.hpp"
+#include "volumetric_kit/gfx/pipelines/ycbcr.hpp"
+#include "volumetric_kit/recon/sensor/chroma_location.hpp"
 
 namespace volumetric_kit::ios_app {
 
-namespace vg = volumetric_kit::gfx;
+namespace vp = volumetric_kit::gfx::pipelines;
+namespace sensor = volumetric_kit::recon::sensor;
 
-void record_atlas_upload(VkCommandBuffer cmd, VkBuffer staging,
-                         vkc::Image& image) {
-  // Never written since it was created: no read to order against, and no
-  // contents to preserve.
-  const bool first_write = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED;
+namespace {
 
-  // gfx's helper rather than a hand-rolled VkImageMemoryBarrier: it owns the
-  // sType, the two VK_QUEUE_FAMILY_IGNORED defaults (a mistyped real family
-  // index here is a silent ownership transfer on a build with no validation
-  // layers) and the whole-image subresource range, and it is unit-tested
-  // upstream where this was not tested at all. It also carries the one
-  // diagnostic this path had none of: `cmd_image_barrier` checks that
-  // new_layout is not UNDEFINED, with file and line, in every build.
-  vg::ImageBarrierDesc to_dst;
-  to_dst.image = image.handle();
-  // The source scope is the FRAGMENT shader, not TOP_OF_PIPE: the previous
-  // frame that bound this slot sampled it there, and this copy must not begin
-  // until that read has finished. The slot ring makes that frame an old one in
-  // the steady state, but "old" is not a dependency -- gfx exposes no fence to
-  // wait on and no semaphore may cross this seam, so the barrier is what
-  // orders them. On a first write there is no such read to order against, and
-  // no contents to preserve either.
-  to_dst.src_stage = first_write ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                                 : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  to_dst.dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  to_dst.src_access = first_write ? 0 : VK_ACCESS_SHADER_READ_BIT;
-  to_dst.dst_access = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_dst.old_layout = image.layout();
-  to_dst.new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  vg::cmd_image_barrier(cmd, to_dst);
-
-  VkBufferImageCopy region{};
-  region.bufferOffset = 0;
-  // Zero means "tightly packed to imageExtent", which the staging buffer is:
-  // it is sized exactly atlas_staging_bytes(width, height) and written by one
-  // memcpy from a vector of the same shape. Stating the row length instead
-  // would be a second place for the packing to be described, and so a second
-  // place to be wrong.
-  region.bufferRowLength = 0;
-  region.bufferImageHeight = 0;
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageOffset = {0, 0, 0};
-  region.imageExtent = {image.width(), image.height(), 1};
-  vkCmdCopyBufferToImage(cmd, staging, image.handle(),
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-  vg::ImageBarrierDesc to_read;
-  to_read.image = image.handle();
-  to_read.src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  to_read.dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  to_read.src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
-  to_read.dst_access = VK_ACCESS_SHADER_READ_BIT;
-  to_read.old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_read.new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  vg::cmd_image_barrier(cmd, to_read);
-  // Recorded, so the next upload's barrier starts from here -- and so does
-  // anything else handed this image, which reads the same record.
-  image.set_layout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+// gfx samples chroma sited Left or Center; the other sitings have no
+// counterpart there.
+std::optional<vp::ChromaSiting> siting_of(sensor::ChromaLocation location) {
+  switch (location) {
+    case sensor::ChromaLocation::Left:
+      return vp::ChromaSiting::Left;
+    case sensor::ChromaLocation::Center:
+      return vp::ChromaSiting::Center;
+    case sensor::ChromaLocation::TopLeft:
+    case sensor::ChromaLocation::Top:
+    case sensor::ChromaLocation::BottomLeft:
+    case sensor::ChromaLocation::Bottom:
+      return std::nullopt;
+  }
+  return std::nullopt;
 }
 
-vkc::Status build_atlas_ring(AtlasRing& ring, vkc::Allocator& allocator,
-                             std::uint32_t width, std::uint32_t height) {
-  // The preconditions, refused rather than asserted. The second would
-  // otherwise fire inside the commit loop below -- after every allocation has
-  // succeeded -- which is the one place this function has no way to unwind
-  // from. See the header for what each one costs when it is not checked.
-  if (ring.ready) {
-    return vkc::Status::invalid_argument(
-        "atlas ring: already built; rebuilding frees images frames in flight "
-        "are still binding");
+}  // namespace
+
+vkc::Status bind_keyframe(AtlasSlot& slot, Keyframe keyframe,
+                          VkImageView white) {
+  std::optional<Keyframe> picture;
+  if (keyframe.image[0] != nullptr && keyframe.image[1] != nullptr) {
+    picture = std::move(keyframe);
   }
-  for (std::size_t i = 0; i < kRingSlots; ++i) {
-    if (ring.slots[i].set == nullptr) {
-      return vkc::Status::invalid_argument(
-          "atlas ring: texture sets were not made at bring-up");
-    }
-  }
-  if (width == 0 || height == 0) {
-    return vkc::Status::invalid_argument("atlas ring: zero colour extent");
-  }
-  const VkDeviceSize bytes = atlas_staging_bytes(width, height);
-
-  // Staged here, committed below. Destroying these on an early return is the
-  // whole point -- see the note above.
-  vkc::Image textures[kRingSlots];
-  vkc::Buffer stagings[kRingSlots];
-
-  for (std::size_t i = 0; i < kRingSlots; ++i) {
-    vkc::ImageDesc tex_desc;
-    tex_desc.extent = {width, height};
-    // _SRGB, matching `fuse_render`'s atlas and for its two reasons.
-    //
-    // The atlas holds canonical-encoded 8-bit R'G'B' -- what ARKitCapture
-    // publishes and what the TSDF fuses -- while `Vertex::color`, the other
-    // albedo source the shader picks between per triangle, is **linear**:
-    // marching cubes decodes the encoded voxel attribute at the corner gather
-    // (recon's mesh.hpp says so where it declares the field). An _SRGB view
-    // makes the sampler decode too, so both sources arrive linear and a surface
-    // does not change brightness at the seam where texturing stops. _UNORM
-    // leaves the atlas encoded, which reads lighter and flatter than the voxel
-    // colour beside it -- a real mismatch, not a subtle one.
-    //
-    // It also fixes the filtering, which is the half easy to miss: bilinear on
-    // an _UNORM view averages ENCODED values, and an average of encoded values
-    // is not the encoding of the average. _SRGB decodes before filtering.
-    //
-    // Four bytes a texel, which is what atlas_staging_bytes assumes. Changing
-    // this format changes that too.
-    tex_desc.format = VK_FORMAT_R8G8B8A8_SRGB;
-    tex_desc.usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    vkc::Result<vkc::Image> tex = allocator.create_image(tex_desc);
-    if (!tex) {
-      return tex.status();
-    }
-
-    vkc::BufferDesc buf_desc;
-    buf_desc.size = bytes;
-    buf_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    // Host memory with copy usage only, mapped for its lifetime: the core's
-    // placement for the source of an upload.
-    buf_desc.memory = vkc::MemoryUsage::Staging;
-    // Sequential: this is written by one memcpy front to back and never read
-    // back, which on a write-combined mapping is the difference between a
-    // streaming store and a read-modify-write per cache line.
-    buf_desc.host_access = vkc::HostAccess::SequentialWrite;
-    vkc::Result<vkc::Buffer> staging = allocator.create_buffer(buf_desc);
-    if (!staging) {
-      return staging.status();
-    }
-
-    textures[i] = std::move(tex).value();
-    stagings[i] = std::move(staging).value();
-  }
-
-  // --- Commit. Nothing below can fail ---------------------------------------
-  //
-  // Which is a property of the checks at the top, not of these statements: a
-  // null set is refused above while unwinding is still possible, and the
-  // rebind below checks only for a null view, which a created image never has.
-  for (std::size_t i = 0; i < kRingSlots; ++i) {
-    ring.slots[i].texture = std::move(textures[i]);
-    ring.slots[i].staging = std::move(stagings[i]);
-    // Pointed here once, where the image is (re)created: the image the set
-    // names never changes after this, only its contents. That is what makes
-    // the per-frame path a copy rather than a descriptor update. The set
-    // itself was made at bring-up.
-    ring.slots[i].set->rebind(ring.slots[i].texture.view());
-    // Fresh images record VK_IMAGE_LAYOUT_UNDEFINED, so each slot's first
-    // upload transitions from there rather than from SHADER_READ_ONLY_OPTIMAL.
-    // Not bindable either, which is a separate question with the same answer
-    // right now: nothing has been written into these images yet, so binding one
-    // would sample undefined contents. See where frame_info.atlas is chosen.
-    ring.slot_written[i] = false;
-  }
-
-  ring.width = width;
-  ring.height = height;
-  ring.ready = true;
-  return vkc::Status();
+  vkc::Status refused;
+  slot.picture.rebind(
+      std::move(picture),
+      [&](const Keyframe& k) {
+        const std::optional<vp::ChromaSiting> siting =
+            siting_of(k.chroma_location);
+        if (!siting) {
+          refused = vkc::Status::unsupported(
+              "keyframe: its chroma siting is neither left nor centre");
+          return false;
+        }
+        vp::YcbcrPicture planes;
+        planes.luma = k.image[0].get();
+        planes.chroma = k.image[1].get();
+        planes.extent = {k.width, k.height};
+        planes.coding.kr = k.kr;
+        planes.coding.kb = k.kb;
+        planes.coding.full_range = k.full_range;
+        planes.coding.chroma_siting = *siting;
+        refused = slot.set->rebind(planes);
+        return refused.ok();
+      },
+      [&] { slot.set->rebind(white); });
+  return refused;
 }
 
 }  // namespace volumetric_kit::ios_app

@@ -179,8 +179,8 @@ final class DashboardModel: ObservableObject {
   /// One, not two. The extract's unaccounted remainder used to sit beside this
   /// and did not belong: recon publishes it as the `"  ..other"` row, so it is
   /// already a bar, and listing it here drew it twice and then said it was in
-  /// neither. The keyframe copy really is outside every span there is.
-  @Published var atlasCopyMs: Double = 0
+  /// neither. The keyframe import really is outside every span there is.
+  @Published var keyframeImportMs: Double = 0
   /// Fused frames so far. What tells an empty `stages` that no frame has
   /// completed yet from one whose measurement is switched off.
   @Published var framesFused: UInt64 = 0
@@ -528,8 +528,8 @@ struct DashboardView: View {
 
   /// The cost of the same fused frame that no bar above covers.
   ///
-  /// The keyframe copy runs on the fuse thread outside every span there is, so
-  /// a reader summing the column gets a frame cost missing it entirely.
+  /// The keyframe import runs on the fuse thread outside every span there is,
+  /// so a reader summing the column gets a frame cost missing it entirely.
   ///
   /// It is the only one. `extract residual` was listed here too and was never
   /// outside anything: recon publishes `max(0, extract_ms - extract.total_ms())`
@@ -539,15 +539,15 @@ struct DashboardView: View {
   /// A reader summing the column double-counted it -- and since that term grows
   /// with `active_blocks`, the over-count grew with the scan.
   @ViewBuilder private var outsideTheBars: some View {
-    if model.atlasCopyMs > 0.005 {
+    if model.keyframeImportMs > 0.005 {
       VStack(alignment: .leading, spacing: 3) {
         Text("not in the bars above")
           .font(.system(size: 10.5, weight: .medium))
           .foregroundStyle(.tertiary)
         HStack(alignment: .firstTextBaseline) {
-          Text("keyframe copy").foregroundStyle(.secondary)
+          Text("keyframe import").foregroundStyle(.secondary)
           Spacer(minLength: 8)
-          Text(String(format: "%.2f ms", model.atlasCopyMs)).monospacedDigit()
+          Text(String(format: "%.2f ms", model.keyframeImportMs)).monospacedDigit()
         }
         .font(.footnote)
       }
