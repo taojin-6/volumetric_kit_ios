@@ -54,3 +54,12 @@ target_compile_definitions(
   PRIVATE
     VI_SCANNER_CONFIG="${PROJECT_SOURCE_DIR}/apps/scanner/config/scanner.json")
 gtest_discover_tests(vi_config_tests)
+
+# Allocation injection stays in its own process; these exercise the exact
+# platform-free policies used by capture and worker entry points.
+find_package(Threads REQUIRED)
+add_executable(vi_failure_tests failure_handling_test.cpp
+                                allocation_failure.cpp)
+target_link_libraries(vi_failure_tests PRIVATE vi_core GTest::gtest_main
+                                               Threads::Threads)
+gtest_discover_tests(vi_failure_tests)

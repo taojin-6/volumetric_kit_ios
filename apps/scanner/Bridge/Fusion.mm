@@ -13,6 +13,8 @@
 
 #import "MemoryQuery.hpp"
 
+#include "FailureHandling.hpp"
+
 namespace volumetric_kit::ios_app {
 namespace {
 
@@ -1556,10 +1558,13 @@ float Fusion::grow_threshold() noexcept {
   return vr::volume::VoxelHashMap::kGrowThreshold;
 }
 
-void Fusion::note_error(const std::string& message) {
+void Fusion::note_error(std::string_view message,
+                        std::string_view context) noexcept try {
   std::lock_guard<std::mutex> lock(mutex_);
-  ++stats_.errors;
-  stats_.last_error = message;
+  record_error(stats_.errors, stats_.last_error, message, context);
+} catch (...) {
+  // A failed lock cannot be reported through the same lock. In particular,
+  // no secondary exception may escape the worker's error handler.
 }
 
 vr::Mat4f Fusion::last_pose() const {

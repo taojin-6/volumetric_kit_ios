@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1025,7 +1026,10 @@ class Fusion {
 
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
-  void note_error(const std::string& message);
+  /// Borrowed text avoids allocation before the boundary. The count survives
+  /// a diagnostic allocation failure; the unavailable text then becomes empty.
+  void note_error(std::string_view message,
+                  std::string_view context = {}) noexcept;
 
   /// @brief Change the projective-texturing visibility tolerance mid-scan.
   ///

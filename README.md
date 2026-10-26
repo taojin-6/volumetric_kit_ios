@@ -106,6 +106,14 @@ headroom of 0, which must be reported as an alarm rather than turned into a
 ceiling, and which cannot otherwise be reached without first persuading a real
 process to run out of memory.
 
+Capture and worker entry points contain C++ exceptions. A failed frame
+conversion is rejected before its scratch buffers are published; a failed
+thread construction restores the stopped state and releases its capture so a
+later start can retry. Error counters still advance when memory pressure
+prevents storing the diagnostic text. These failure policies are covered by
+host allocation-injection and worker-start tests; ARKit and GPU execution
+still require a device.
+
 Two of the facts pinned here were settled on hardware and are expensive to
 re-establish — the sensor-basis-to-viewport turn, which had been wrong twice in
 two directions before an iPad Pro M5 settled it, and the takeover heading in

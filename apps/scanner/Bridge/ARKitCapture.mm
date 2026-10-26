@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "FailureHandling.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
@@ -723,90 +724,101 @@ class ARKitCapture final : public app::FrameSource {
 }
 
 - (void)submitFrame:(ARFrame*)frame {
-  // `smoothedSceneDepth` when the session asked for it. ARKit temporally
-  // filters that map against previous frames, which suppresses the per-frame
-  // flicker a TSDF would otherwise average into the volume -- but it is a
-  // *separate property* from `sceneDepth` (ARFrame.h), not a filter applied in
-  // place, so reading the wrong one silently discards smoothing the session is
-  // already paying to compute. The fallback covers the frames early in a
-  // session where the filter has no history yet.
-  ARDepthData* depth_data = frame.smoothedSceneDepth ?: frame.sceneDepth;
-  if (depth_data == nil) {
-    // Ordinary at session start: tracking begins before the depth sensor has a
-    // result. Not an error, so it is not counted as a rejection either.
-    return;
-  }
+  // A refused copy/conversion never publishes the partially filled scratch.
+  (void)app::contain_frame_failure(
+      [&] {
+        // `smoothedSceneDepth` when the session asked for it. ARKit temporally
+        // filters that map against previous frames, which suppresses the
+        // per-frame flicker a TSDF would otherwise average into the volume --
+        // but it is a *separate property* from `sceneDepth` (ARFrame.h), not a
+        // filter applied in place, so reading the wrong one silently discards
+        // smoothing the session is already paying to compute. The fallback
+        // covers the frames early in a session where the filter has no history
+        // yet.
+        ARDepthData* depth_data = frame.smoothedSceneDepth ?: frame.sceneDepth;
+        if (depth_data == nil) {
+          // Ordinary at session start: tracking begins before the depth sensor
+          // has a result. Not an error, so it is not counted as a rejection
+          // either.
+          return;
+        }
 
-  const auto t0 = std::chrono::steady_clock::now();
+        const auto t0 = std::chrono::steady_clock::now();
 
-  const std::optional<float> kept =
-      copy_depth(depth_data.depthMap, depth_data.confidenceMap, _scratch.depth);
-  if (!kept) {
-    _capture->reject();
-    return;
-  }
-  _scratch.confidence_kept = *kept;
+        const std::optional<float> kept = copy_depth(
+            depth_data.depthMap, depth_data.confidenceMap, _scratch.depth);
+        if (!kept) {
+          _capture->reject();
+          return;
+        }
+        _scratch.confidence_kept = *kept;
 
-  // ARKit reports one set of intrinsics, for capturedImage. The colour camera
-  // is described directly by them; the depth camera is *derived* from it,
-  // because sceneDepth is registered to colour -- one physical camera, so the
-  // two share a pose and differ only by an image-size scale. Letting recon do
-  // that derivation is the point: it is the arithmetic its host tests pin.
-  const simd_float3x3 k = frame.camera.intrinsics;
-  const CGSize image_size = frame.camera.imageResolution;
+        // ARKit reports one set of intrinsics, for capturedImage. The colour
+        // camera is described directly by them; the depth camera is *derived*
+        // from it, because sceneDepth is registered to colour -- one physical
+        // camera, so the two share a pose and differ only by an image-size
+        // scale. Letting recon do that derivation is the point: it is the
+        // arithmetic its host tests pin.
+        const simd_float3x3 k = frame.camera.intrinsics;
+        const CGSize image_size = frame.camera.imageResolution;
 
-  vr::ColorCameraParams color{};
-  color.fx = k.columns[0][0];
-  color.fy = k.columns[1][1];
-  color.cx = k.columns[2][0];
-  color.cy = k.columns[2][1];
-  color.width = static_cast<std::uint32_t>(image_size.width);
-  color.height = static_cast<std::uint32_t>(image_size.height);
+        vr::ColorCameraParams color{};
+        color.fx = k.columns[0][0];
+        color.fy = k.columns[1][1];
+        color.cx = k.columns[2][0];
+        color.cy = k.columns[2][1];
+        color.width = static_cast<std::uint32_t>(image_size.width);
+        color.height = static_cast<std::uint32_t>(image_size.height);
 
-  // ARKit's camera looks down -Z with +Y up; recon projects +Z forward with +Y
-  // down. cv_from_gl_camera is the conversion, and getting it wrong smears the
-  // reconstruction rather than raising anything.
-  const simd_float4x4 t = frame.camera.transform;
-  vr::Mat4f arkit_pose(1.0f);
-  for (int c = 0; c < 4; ++c) {
-    arkit_pose[c] = vr::Vec4f(t.columns[c][0], t.columns[c][1], t.columns[c][2],
-                              t.columns[c][3]);
-  }
-  color.cam_to_world = sensor::cv_from_gl_camera(arkit_pose);
+        // ARKit's camera looks down -Z with +Y up; recon projects +Z forward
+        // with +Y down. cv_from_gl_camera is the conversion, and getting it
+        // wrong smears the reconstruction rather than raising anything.
+        const simd_float4x4 t = frame.camera.transform;
+        vr::Mat4f arkit_pose(1.0f);
+        for (int c = 0; c < 4; ++c) {
+          arkit_pose[c] = vr::Vec4f(t.columns[c][0], t.columns[c][1],
+                                    t.columns[c][2], t.columns[c][3]);
+        }
+        color.cam_to_world = sensor::cv_from_gl_camera(arkit_pose);
 
-  vkc::Result<vr::DepthCameraParams> derived =
-      sensor::depth_from_registered_color(
-          color,
-          static_cast<std::uint32_t>(
-              CVPixelBufferGetWidth(depth_data.depthMap)),
-          static_cast<std::uint32_t>(
-              CVPixelBufferGetHeight(depth_data.depthMap)),
-          kMinDepth, kMaxDepth);
-  if (!derived) {
-    _capture->reject();
-    return;
-  }
-  _scratch.depth_camera = derived.value();
-  _scratch.color_camera = color;
-  _scratch.timestamp_ns = static_cast<std::uint64_t>(frame.timestamp * 1e9);
-  // A colour failure is not a frame failure: depth alone still fuses, and
-  // `CapturedFrame` spells null colour as "no colour this frame".
-  //
-  // Timed around the whole call rather than inside it, so the figure covers the
-  // attachment read and any `to_canonical` pass as well as the vImage
-  // conversion -- a colour number that omitted the conversion would repeat, one
-  // level down, the mistake that splitting it out of `convert_ms` fixed.
-  const auto t_color = std::chrono::steady_clock::now();
-  _scratch.has_color =
-      convert_color(frame.capturedImage, color.width, color.height, _scratch);
-  _scratch.color_convert_ms = std::chrono::duration<float, std::milli>(
-                                  std::chrono::steady_clock::now() - t_color)
-                                  .count();
+        vkc::Result<vr::DepthCameraParams> derived =
+            sensor::depth_from_registered_color(
+                color,
+                static_cast<std::uint32_t>(
+                    CVPixelBufferGetWidth(depth_data.depthMap)),
+                static_cast<std::uint32_t>(
+                    CVPixelBufferGetHeight(depth_data.depthMap)),
+                kMinDepth, kMaxDepth);
+        if (!derived) {
+          _capture->reject();
+          return;
+        }
+        _scratch.depth_camera = derived.value();
+        _scratch.color_camera = color;
+        _scratch.timestamp_ns =
+            static_cast<std::uint64_t>(frame.timestamp * 1e9);
+        // A colour failure is not a frame failure: depth alone still fuses, and
+        // `CapturedFrame` spells null colour as "no colour this frame".
+        //
+        // Timed around the whole call rather than inside it, so the figure
+        // covers the attachment read and any `to_canonical` pass as well as the
+        // vImage conversion -- a colour number that omitted the conversion
+        // would repeat, one level down, the mistake that splitting it out of
+        // `convert_ms` fixed.
+        const auto t_color = std::chrono::steady_clock::now();
+        _scratch.has_color = convert_color(frame.capturedImage, color.width,
+                                           color.height, _scratch);
+        _scratch.color_convert_ms =
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_color)
+                .count();
 
-  const float convert_ms = std::chrono::duration<float, std::milli>(
-                               std::chrono::steady_clock::now() - t0)
-                               .count();
-  _capture->stage(_scratch, convert_ms);
+        const float convert_ms = std::chrono::duration<float, std::milli>(
+                                     std::chrono::steady_clock::now() - t0)
+                                     .count();
+        _capture->stage(_scratch, convert_ms);
+      },
+      [&](std::string_view) { _capture->reject(); });
 }
 
 - (BOOL)pollLatest {
