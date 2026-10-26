@@ -187,13 +187,8 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     // entries themselves become unreachable once it is zero.
     history_next_ = 0;
     // With the same reasoning: a new scan must not hand out the previous one's
-    // keyframe. The ring's storage is deliberately kept -- it is the capacity
-    // that makes the per-remesh copy a memcpy rather than a fresh 11 MB
-    // mapping -- but nothing may be published out of it until a remesh fills it
-    // again.
-    published_atlas_ = nullptr;
-    atlas_width_ = 0;
-    atlas_height_ = 0;
+    // keyframe.
+    published_keyframe_ = vr::sensor::YuvImage{};
     // ...and the mesh half with it, which is the same argument and the more
     // dangerous omission. Clearing only the keyframe left the pair internally
     // asymmetric: `mesh_` still named the *previous* scan's DeviceMesh, whose
@@ -369,6 +364,20 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     return texturer.status();
   }
   texturer_.emplace(std::move(texturer).value());
+
+  // The keyframes are the camera's pictures, imported where they are and
+  // shared with the renderer's family, which samples them.
+  importer_.reset();
+  if (config.texture) {
+    vkc::Result<vr::sensor::PixelBufferImporter> importer =
+        vr::sensor::PixelBufferImporter::create(device, "keyframe import",
+                                                config.queue_families,
+                                                config.queue_family_count);
+    if (!importer) {
+      return importer.status();
+    }
+    importer_.emplace(std::move(importer).value());
+  }
 
   return vkc::Status();
 }
@@ -1322,12 +1331,12 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   const float extract_ms = ms_since(t_extract);
 
   // Texture in place, on the device buffers marching cubes just wrote -- no
-  // host round trip between the two GPU tiers. The current frame would be the
-  // atlas, i.e. the live single-camera path (recon's 2026-07-07 decision).
+  // host round trip between the two GPU tiers. The current frame is the
+  // keyframe, i.e. the live single-camera path (recon's 2026-07-07 decision).
   //
   // On now, and both halves it used to wait on are built: Published carries the
-  // keyframe beside the mesh and the renderer holds a persistent ring of atlas
-  // images indexed by the same slot. See FusionConfig::texture -- including its
+  // keyframe beside the mesh and the renderer holds a ring of keyframes
+  // indexed by the same slot. See FusionConfig::texture -- including its
   // warning that the flag being on is not the same as the pass running.
   float texture_ms = 0.0f;
   // The tolerance this remesh actually ran at, read once and published with the
@@ -1344,17 +1353,41 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // Whether it *succeeded*, which is what the keyframe publish below is gated
   // on -- distinct from whether it was attempted. See there.
   bool textured_ok = false;
-  // Gated on the frame actually carrying colour, not on the switch alone. A
-  // frame whose colour was refused -- `convert_color` drops an unsupported
-  // pixel format, an HLG or PQ transfer, a primaries set with no enumerator --
-  // still fuses its depth and still reaches here, and texturing it would write
-  // real `uv0` addressing an atlas this remesh never uploads. The renderer
-  // would then sample whatever that slot last held: a previous keyframe's
-  // image, smeared across every surface the camera can currently see. Skipping
-  // leaves every `uv0` at marching cubes' sentinel, so the frame renders as
-  // fused voxel colour -- which is exactly what a frame with no colour should
-  // look like.
-  const bool do_texture = config_.texture && frame.has_color();
+
+  // --- Import the keyframe this mesh's uv0 will index into ------------------
+  //
+  // The camera picture itself: its two planes become images where the camera
+  // left them, held by those images, so neither this thread nor the renderer
+  // copies a pixel. Imported before texturing and gating it: a frame with no
+  // picture -- `convert_color` drops an unsupported pixel format, an HLG or PQ
+  // transfer, a primaries set with no enumerator, and publishes no picture for
+  // colour it had to convert -- or one the import refuses still fuses its
+  // depth and still reaches here, and texturing it would write real `uv0`
+  // addressing a keyframe the renderer never has. Skipping leaves every `uv0`
+  // at marching cubes' sentinel, so the frame renders as fused voxel colour.
+  //
+  // Outside the publish mutex: `mutex_` is the lock the main thread takes
+  // several times per rendered frame, and the first picture on a camera
+  // surface waits on a submit.
+  vr::sensor::YuvImage keyframe = frame.picture_coding;
+  float keyframe_import_ms = 0.0f;
+  bool imported = false;
+  if (config_.texture && frame.picture != nullptr && importer_) {
+    const auto t_import = Clock::now();
+    const vkc::Status got =
+        importer_->import(frame.picture, frame.color_camera.width,
+                          frame.color_camera.height, keyframe);
+    keyframe_import_ms = ms_since(t_import);
+    imported = got.ok();
+    if (!imported) {
+      texture_state = TextureState::Failed;
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++stats_.errors;
+      // The importer names itself ("keyframe import: ...").
+      stats_.last_error = got.message();
+    }
+  }
+  const bool do_texture = imported;
   if (do_texture) {
     const auto t_texture = Clock::now();
     // The window reaches this tier too. `fuse` seeds the row when this flag is
@@ -1374,67 +1407,15 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
     texture_ms = ms_since(t_texture);
   }
 
-  // --- Stage the keyframe this mesh's uv0 index into -----------------------
-  //
-  // Copied rather than pointed at: `frame.color` is a view into the capture's
-  // rotating staging buffers, valid only until its next poll -- and this thread
-  // is what polls, so the pointer is stale by the time the renderer looks at
-  // it. ~11 MB memcpy at ARKit's 1920x1440, which the capture path already
-  // prices at ~0.06 ms against this device's measured unified-memory
-  // bandwidth.
-  //
-  // Written into the entry the consumer is NOT reading; see `atlas_ring_`.
-  // Outside the publish mutex deliberately: this is the largest single copy on
-  // the fuse thread, and `mutex_` is the lock the main thread takes several
-  // times per rendered frame. Safe because the entry being written is by
-  // construction the one no consumer holds.
-  const std::uint32_t* staged_atlas = nullptr;
-  std::uint32_t staged_w = 0;
-  std::uint32_t staged_h = 0;
-  float atlas_copy_ms = 0.0f;
-  // Gated on the pass having SUCCEEDED, not on the decision to attempt it.
-  //
-  // Those are different conditions and the difference is the whole of this
-  // guard. A non-OK `texture` above bumps `stats_.errors` and falls through --
-  // it does not return -- so gating on `do_texture` alone staged 11 MB and
-  // published an atlas for a mesh whose `uv0` the failed pass never wrote. The
-  // renderer then binds a real keyframe against a mesh that is entirely
-  // sentinel, which is the pairing Published::atlas promises cannot happen, and
-  // burns 11 MB host plus 11 MB of GPU copy per remesh to do it.
-  //
+  // Published only when the pass SUCCEEDED, not on the decision to attempt it.
+  // A non-OK `texture` above bumps `stats_.errors` and falls through, leaving
+  // `uv0` at the sentinel -- or, on a partial failure, some real and some not
+  // -- so publishing the keyframe would assert a pairing that does not hold.
   // Not a hypothetical: recon refuses a shared-vertex mesh until its per-vertex
-  // dispatch lands, and this file asks for shared vertices (see start()), so
-  // against such a revision this is *every* remesh rather than a rare one. It
-  // is also the right answer on a partial failure, where some `uv0` are real
-  // and some are sentinel: the atlas would be honest for one half of the mesh
-  // and wrong for the other, with nothing to say which.
-  if (do_texture && textured_ok) {
-    const auto t_atlas = Clock::now();
-    const std::uint32_t next = (atlas_slot_ + 1u) % 2u;
-    const std::size_t pixels =
-        static_cast<std::size_t>(frame.color_camera.width) *
-        static_cast<std::size_t>(frame.color_camera.height);
-    std::vector<std::uint32_t>& dst = atlas_ring_[next];
-    // resize() rather than assign(): the vector keeps its capacity across
-    // remeshes, so the 11 MB mapping is faulted in once per session instead of
-    // once per frame -- the same reason ARKitCapture rotates its buffers by
-    // swap rather than move-assigning fresh ones.
-    dst.resize(pixels);
-    std::memcpy(dst.data(), frame.color, pixels * sizeof(std::uint32_t));
-    atlas_slot_ = next;
-    staged_atlas = dst.data();
-    staged_w = frame.color_camera.width;
-    staged_h = frame.color_camera.height;
-    // Measured, because nothing else here covers it. `texture_ms` closed above
-    // and the extract span closed before that, and recon's StageMetrics only
-    // ever sees what recon runs -- so this copy, the one cost this tier adds to
-    // the fuse thread, was the single figure the read-out could not see. The
-    // comment above prices it at ~0.06 ms; that is a claim about warm memory
-    // and steady state, and a cold first-touch resize or an 11 MB vector being
-    // faulted back in under pressure is exactly when it stops being true. If it
-    // grows, the fuse loop slows and every published number moves with it --
-    // ms_since_fuse and the frame chart included -- so this is what says why.
-    atlas_copy_ms = ms_since(t_atlas);
+  // dispatch lands, and this file asks for shared vertices (see start()).
+  // Dropping the keyframe here lets its picture go back to the camera.
+  if (!textured_ok) {
+    keyframe = vr::sensor::YuvImage{};
   }
 
   // No host copy of the GEOMETRY. The renderer draws those very buffers --
@@ -1449,12 +1430,10 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   published_generation_ = device_mesh.value().generation;
   published_taken_ = false;
   // Published together, under one lock, because they are one value: `uv0` is
-  // a coordinate into *this* keyframe. Zeroed rather than left alone when this
+  // a coordinate into *this* keyframe. Replaced by one with no planes when this
   // remesh did not texture, so a consumer cannot bind the previous keyframe
   // against a mesh whose uv0 are all sentinel.
-  atlas_width_ = staged_w;
-  atlas_height_ = staged_h;
-  published_atlas_ = staged_atlas;
+  published_keyframe_ = std::move(keyframe);
   ++mesh_version_;
   stats_.mesh_version = mesh_version_;
   ++stats_.remeshes;
@@ -1491,7 +1470,7 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // of textured vertices is not derivable at this tier.
   stats_.texture_state = texture_state;
   stats_.occlusion_threshold = threshold;
-  stats_.atlas_copy_ms = atlas_copy_ms;
+  stats_.keyframe_import_ms = keyframe_import_ms;
 }
 
 std::optional<Fusion::Published> Fusion::take_mesh(
@@ -1511,13 +1490,14 @@ std::optional<Fusion::Published> Fusion::take_mesh(
   Published out;
   out.mesh = mesh_;
   out.version = mesh_version_;
-  // The atlas travels with the mesh or not at all. A caller that got a mesh and
-  // had to ask separately for its keyframe could pair a mesh with the *next*
-  // remesh's image, which is the one failure this pairing exists to make
-  // unrepresentable -- every textured triangle would sample the wrong place.
-  out.atlas = published_atlas_;
-  out.atlas_width = atlas_width_;
-  out.atlas_height = atlas_height_;
+  // The keyframe travels with the mesh or not at all. A caller that got a mesh
+  // and had to ask separately for its keyframe could pair a mesh with the
+  // *next* remesh's picture, which is the one failure this pairing exists to
+  // make unrepresentable -- every textured triangle would sample the wrong
+  // place. Moved, not copied: the consumer holds the picture from here, and a
+  // copy kept here would hold a camera buffer nothing will sample again.
+  out.keyframe = std::move(published_keyframe_);
+  published_keyframe_ = vr::sensor::YuvImage{};
   return out;
 }
 

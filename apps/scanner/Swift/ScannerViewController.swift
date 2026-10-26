@@ -775,7 +775,7 @@ final class ScannerViewController: UIViewController {
     // What the bars do not cover, and how far they can be trusted. The age is
     // two figures because it is a comparison: `msSinceStages` alone cannot tell
     // a stalled pipeline from a paused camera.
-    dashboard.atlasCopyMs = snapshot.atlasCopyMs
+    dashboard.keyframeImportMs = snapshot.keyframeImportMs
     dashboard.framesFused = snapshot.framesFused
     dashboard.msSinceStages = snapshot.msSinceStages
     dashboard.msSinceFuse = snapshot.msSinceFuse

@@ -118,7 +118,8 @@ function(vi_add_scanner_bridge bridge_target)
   target_include_directories(${bridge_target}
                              PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-  # recon_sensor carries the camera and colour conversions ARKitCapture applies.
+  # recon_sensor carries the camera and colour conversions ARKitCapture applies,
+  # and recon_sensor_apple imports the camera pictures the keyframes sample.
   # recon_tsdf and recon_texture supply fusion; recon_mesh and recon_volume
   # arrive transitively.
   #
@@ -134,6 +135,7 @@ function(vi_add_scanner_bridge bridge_target)
            volumetric_kit::gfx_app
            volumetric_kit::gfx_core
            volumetric_kit::recon_sensor
+           volumetric_kit::recon_sensor_apple
            volumetric_kit::recon_texture
            volumetric_kit::recon_tsdf
            volumetric_kit::gfx_pipelines

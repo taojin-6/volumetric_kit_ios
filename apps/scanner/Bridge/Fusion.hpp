@@ -29,7 +29,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 // @ref AllocationStop, which this file sets and Core/AllocationStop.hpp turns
 // into what the log, the trace and the panel each say about it. The enum lives
@@ -51,6 +50,8 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/recon/sensor/apple/pixel_buffer_importer.hpp"
+#include "volumetric_kit/recon/sensor/yuv_image.hpp"
 #include "volumetric_kit/recon/texture/projective_texturer.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -187,9 +188,9 @@ struct FusionConfig {
   /// Project the current keyframe onto the mesh after each remesh.
   ///
   /// **On**, and both halves it used to wait on are now built:
-  /// @ref Fusion::Published carries the keyframe alongside the mesh, and the
-  /// renderer holds a persistent ring of atlas images indexed by the same slot
-  /// as the mesh.
+  /// @ref Fusion::Published carries the keyframe alongside the mesh -- the
+  /// camera picture itself, imported where it is -- and the renderer holds a
+  /// ring of keyframes indexed by the same slot as the mesh.
   ///
   /// What it does: after each remesh, `ProjectiveTexturer` projects the current
   /// frame into the mesh and writes a real `uv0` for every vertex it can see
@@ -203,10 +204,9 @@ struct FusionConfig {
   /// not a defect -- a persistent textured reconstruction needs the
   /// multi-keyframe atlas, which is a later slice.
   ///
-  /// Gated at the call site on the frame actually carrying colour, not on this
-  /// flag alone: a frame whose colour the capture refused would otherwise get
-  /// real `uv0` addressing an atlas that was never uploaded. See
-  /// @ref Fusion::remesh.
+  /// Gated at the call site on the frame's picture having been imported, not
+  /// on this flag alone: a frame without one would otherwise get real `uv0`
+  /// addressing a keyframe the renderer never has. See @ref Fusion::remesh.
   ///
   /// @warning **This flag being on does not mean the pass runs.** recon's
   ///          `ProjectiveTexturer::texture` refuses a mesh whose vertices are
@@ -286,7 +286,8 @@ struct FusionConfig {
   /// higher is not free -- see recon's `slot_count`.
   std::uint32_t mesh_slots = 2;
 
-  /// @brief The queue families that will touch the mesh buffers.
+  /// @brief The queue families that will touch the mesh buffers and the
+  ///        keyframes' plane images; recon's device's own family among them.
   ///
   /// Both of them, unconditionally -- recon reduces the pair to its distinct
   /// entries and picks EXCLUSIVE where they turn out to be one family. Under
@@ -323,12 +324,15 @@ enum class TextureState : std::uint8_t {
   Pending,
   /// On, and the last remesh ran the pass to completion.
   Ran,
-  /// Skipped because the frame carried no colour -- `convert_color` refuses an
-  /// unsupported pixel format, HLG and PQ, so this is reachable on real
-  /// hardware rather than only at session start. Not a fault: the mesh renders
-  /// as fused voxel colour, which is what a colourless frame should look like.
+  /// Skipped because the frame carried no colour, or no camera picture to
+  /// sample as captured -- `convert_color` refuses an unsupported pixel
+  /// format, HLG and PQ, and publishes no picture for colour it had to bring
+  /// to the canonical encoding, so this is reachable on real hardware rather
+  /// than only at session start. Not a fault: the mesh renders as fused voxel
+  /// colour, which is what such a frame should look like.
   NoColor,
-  /// The pass was attempted and refused or failed; the reason is in
+  /// The pass, or the import of the picture it textures from, was attempted
+  /// and refused or failed; the reason is in
   /// @ref FusionStats::last_error. Distinct from @ref NoColor because this one
   /// *is* a fault -- and it is the state a build against a recon that still
   /// refuses shared-vertex meshes sits in permanently, which otherwise looks
@@ -506,15 +510,15 @@ struct FusionStats {
   /// at one surface and watch where texturing stops -- has nothing to correlate
   /// the watching against.
   float occlusion_threshold = 0.0f;
-  /// The host span around the ~11 MB keyframe copy the fuse thread makes per
+  /// The host span around the keyframe import the fuse thread makes per
   /// textured remesh, in ms.
   ///
   /// Measured because it is otherwise invisible: it sits outside recon's stage
-  /// spans, outside @ref extract_ms and outside @ref texture_ms, so a copy that
-  /// costs more than the ~0.06 ms the capture path prices it at would slow the
-  /// fuse loop with every published figure showing no cause. Zero on a remesh
-  /// that published no keyframe.
-  float atlas_copy_ms = 0.0f;
+  /// spans, outside @ref extract_ms and outside @ref texture_ms. Usually a
+  /// lookup, since the importer keeps each camera surface's images; the first
+  /// picture on a surface makes them and waits on one submit. Zero on a remesh
+  /// that imported nothing.
+  float keyframe_import_ms = 0.0f;
 
   /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
   ///        @ref stages_truncated, not grown into.
@@ -915,6 +919,10 @@ class Fusion {
   Fusion& operator=(const Fusion&) = delete;
 
   /// @brief Build the grid and the compute pipelines on the shared device.
+  ///
+  /// With @ref FusionConfig::texture on, also the keyframe importer, so a
+  /// device that cannot import camera pictures fails here rather than every
+  /// remesh.
   /// @param device     recon's adopted view of the shared `VkDevice`.
   /// @param allocator  recon's allocator on that device.
   /// @param config     Per-scan tuning.
@@ -948,10 +956,10 @@ class Fusion {
   ///
   /// `uv0` is a normalized coordinate into the image of the camera that
   /// textured it, and @ref texture rewrites every vertex's `uv0` on every call
-  /// against the *current* frame. So a mesh and the atlas it indexes are only
-  /// meaningful together: draw a mesh against a later frame's image and every
-  /// textured triangle samples the wrong place. They are published, versioned,
-  /// and taken as one.
+  /// against the *current* frame. So a mesh and the keyframe it indexes are
+  /// only meaningful together: draw a mesh against a later frame's image and
+  /// every textured triangle samples the wrong place. They are published,
+  /// versioned, and taken as one.
   struct Published {
     /// The extractor's own buffers, borrowed. Nothing is copied to the host at
     /// all -- this is interop seam B, and the ~53 MB round trip per remesh that
@@ -961,38 +969,27 @@ class Fusion {
     /// releases it: see @ref release_through.
     vr::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
-    /// @brief The keyframe image @ref mesh's `uv0` index into, as packed RGB
-    ///        (one `uint32` per pixel, R in the low byte) -- or null when this
-    ///        mesh was not textured.
+    /// @brief The keyframe @ref mesh's `uv0` index into: the camera picture
+    ///        the mesh was textured from, its two planes imported as images
+    ///        where the camera left them, with the matrix, range and chroma
+    ///        siting it was coded with -- or no planes when this mesh was not
+    ///        textured.
     ///
-    /// The atlas half of the pair this struct's own documentation describes: a
-    /// mesh and the image its `uv0` address are only meaningful together, and
-    /// drawing one against a later frame's image samples the wrong place
+    /// The second half of the pair this struct's own documentation describes:
+    /// a mesh and the picture its `uv0` address are only meaningful together,
+    /// and drawing one against a later frame's picture samples the wrong place
     /// everywhere it was textured.
     ///
-    /// **Valid only until the next @ref take_mesh**, which is a shorter promise
-    /// than @ref mesh carries. It points into a small ring this class owns, and
-    /// the consumer is expected to copy out of it during the same call --
-    /// which the renderer does, into the atlas image for the slot it just put
-    /// the mesh in. Two entries is enough for that discipline and is what the
-    /// ring holds: the fuse thread cannot publish again until the previous mesh
-    /// is taken, so at most one unread entry exists, and the entry being copied
-    /// is never the one being written.
+    /// The images hold the camera's pixel buffer, so the picture stays as long
+    /// as the consumer holds this; @ref take_mesh hands it over and keeps no
+    /// copy. The capture's writer has finished with it, so sampling it waits on
+    /// nothing.
     ///
-    /// Null rather than stale whenever the texture pass did not both run and
-    /// succeed, which is two cases and not one. `convert_color` refuses an
-    /// unsupported pixel format, HLG and PQ, so a colourless frame is reachable
-    /// on a real device rather than only at session start, and @ref
-    /// Fusion::remesh skips texturing entirely on one. A pass that *was*
-    /// attempted and failed publishes nothing either: it is gated on the
-    /// returned @ref vkc::Status, not on the decision to try, because a refusal
-    /// leaves `uv0` untouched and staging 11 MB against it would assert a
-    /// pairing that does not hold. Either way no coordinate points at an atlas
-    /// that was never uploaded, and @ref FusionStats::texture_state says which
-    /// of the two happened.
-    const std::uint32_t* atlas = nullptr;
-    std::uint32_t atlas_width = 0;
-    std::uint32_t atlas_height = 0;
+    /// No planes whenever the import or the texture pass did not succeed: a
+    /// refusal leaves `uv0` at the sentinel, so no coordinate points at a
+    /// keyframe the consumer never has, and @ref FusionStats::texture_state
+    /// says which happened.
+    vr::sensor::YuvImage keyframe;
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
@@ -1156,40 +1153,14 @@ class Fusion {
   // one frame in the steady state.
   std::uint64_t published_generation_ = 0;
   bool published_taken_ = true;
-  /// @brief The keyframe images published meshes index into; see
-  ///        @ref Published::atlas.
-  ///
-  /// @warning Not the renderer's ring of the same name. `AtlasRing.hpp` holds a
-  ///          second `atlas ring` in this namespace -- `kRingSlots` VkImages
-  ///          plus mapped staging buffers, written on the render thread, one
-  ///          per mesh slot. This is the producer side and that is the consumer
-  ///          side; the depth argument below is about `take_mesh` handing out
-  ///          an entry while the next remesh fills the other, and says nothing
-  ///          at all about how deep that one has to be.
-  ///
-  /// Two, alternating, and the argument for two rather than one is the whole
-  /// reason this is a ring at all. `take_mesh` marks the mesh taken and returns
-  /// while the consumer is still copying out of the entry it was handed, so a
-  /// single buffer would let the very next remesh overwrite the bytes being
-  /// read. Alternating means the entry being written is never the entry being
-  /// read: a third publish needs a second take first (the uncollected guard in
-  /// @ref remesh), and the consumer is single-threaded, so it has finished with
-  /// the older entry before it asks for the newer one.
-  ///
-  /// A copy rather than a borrow, because `CapturedFrame::color` points into
-  /// the capture's rotating staging buffers and is documented valid only until
-  /// its next poll -- and the poll is on this thread, so the pointer would go
-  /// stale the moment this one loops. ~11 MB at ARKit's 1920x1440, memcpy'd
-  /// once per remesh on the fuse thread.
-  std::vector<std::uint32_t> atlas_ring_[2];
-  std::uint32_t atlas_slot_ = 0;
-  /// The entry the currently-published mesh indexes into, and its dimensions;
-  /// null / 0 when the last remesh did not texture. Guarded by @ref mutex_ with
-  /// the mesh they belong to -- see @ref Published::atlas for why they are one
-  /// value.
-  const std::uint32_t* published_atlas_ = nullptr;
-  std::uint32_t atlas_width_ = 0;
-  std::uint32_t atlas_height_ = 0;
+  /// Imports each textured frame's camera picture as two plane images,
+  /// shared with the renderer's queue family. Made in @ref start when
+  /// texturing is on, and used on the fuse thread alone.
+  std::optional<vr::sensor::PixelBufferImporter> importer_;
+  /// The keyframe the published mesh indexes into, until @ref take_mesh hands
+  /// it over; no planes when the last remesh did not texture. Guarded by
+  /// @ref mutex_ with the mesh it belongs to -- see @ref Published::keyframe.
+  vr::sensor::YuvImage published_keyframe_;
   // The consumer's high-water mark, recorded by @ref release_through and handed
   // to recon by the fuse thread at the top of the next remesh. See that method:
   // this indirection is what keeps recon's extractor single-threaded.

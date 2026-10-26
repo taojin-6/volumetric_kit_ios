@@ -111,9 +111,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 4e16bbca41920b9a9df4191b10142b9827ccb365) # core #52 (0.21.0)
+  GIT_TAG fa4638c2bcd4aee4a0a02819dc106ecd640441d9) # core #57 (0.22.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.21.0)
+vkc_require_core(0.22.0)
 
 # --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs recon, gfx and MoltenVK, none of which a
@@ -160,12 +160,12 @@ find_package(glm CONFIG REQUIRED)
 # Its vulkan tier is on, as gfx requires -- gfx refuses to configure against a
 # core without it, or older than its own pin -- and recon's Device, Allocator
 # and SharedDevice live there. Bump it with, or at or after, recon's and gfx's
-# core pins: recon pins core #52 (0.21.0), this pin, and gfx core #50 (0.20.0).
+# core pins: recon pins core #57 (0.22.0), this pin, and gfx core #50 (0.20.0).
 
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 9fde92e1d8a596addf6ab9ce0a8b295ba3f7722c) # recon #280
+  GIT_TAG 978f6d4fef4dd2355c590e51100c0b9a1ffa9708) # recon #293
 
 # recon's VR_BUILD_EXAMPLES / VR_BUILD_TESTS default to PROJECT_IS_TOP_LEVEL, so
 # a fetched copy builds the library tiers only -- no gtest, no example
@@ -182,7 +182,7 @@ FetchContent_MakeAvailable(volumetric_kit_recon)
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG 2d40d1e850539d4337c133ad1e3dfcf526481e67) # gfx #156
+  GIT_TAG 0106609fdbc395e3f733648382e4e86101c770b2) # gfx #158
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)

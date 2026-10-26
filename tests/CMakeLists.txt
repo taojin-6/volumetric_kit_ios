@@ -34,8 +34,10 @@ add_executable(
   allocation_stop_test.cpp
   freshness_test.cpp
   growth_policy_test.cpp
+  keyframe_binding_test.cpp
   memory_budget_test.cpp
   orbit_camera_test.cpp
+  picture_slot_test.cpp
   stat_tone_test.cpp
   view_orientation_test.cpp)
 

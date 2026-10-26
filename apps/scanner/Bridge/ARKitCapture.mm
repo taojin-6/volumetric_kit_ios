@@ -22,7 +22,9 @@
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/sensor/camera_conventions.hpp"
+#include "volumetric_kit/recon/sensor/chroma_location.hpp"
 #include "volumetric_kit/recon/sensor/color_conventions.hpp"
+#include "volumetric_kit/recon/sensor/yuv_image.hpp"
 
 namespace vkc = volumetric_kit::core;
 
@@ -75,12 +77,51 @@ class PixelBufferLock {
   bool locked_ = false;
 };
 
+/// A CVPixelBuffer retained for as long as this holds it. ARC does not manage
+/// CoreFoundation types, so the retain is this type's.
+class RetainedPixels {
+ public:
+  RetainedPixels() = default;
+  explicit RetainedPixels(CVPixelBufferRef _Nullable pixels)
+      : pixels_(pixels != nullptr ? CVPixelBufferRetain(pixels) : nullptr) {}
+  RetainedPixels(RetainedPixels&& other) noexcept
+      : pixels_(std::exchange(other.pixels_, nullptr)) {}
+  RetainedPixels& operator=(RetainedPixels&& other) noexcept {
+    if (this != &other) {
+      reset();
+      pixels_ = std::exchange(other.pixels_, nullptr);
+    }
+    return *this;
+  }
+  ~RetainedPixels() { reset(); }
+  RetainedPixels(const RetainedPixels&) = delete;
+  RetainedPixels& operator=(const RetainedPixels&) = delete;
+
+  CVPixelBufferRef _Nullable get() const { return pixels_; }
+  void reset() {
+    if (pixels_ != nullptr) {
+      CVPixelBufferRelease(pixels_);
+      pixels_ = nullptr;
+    }
+  }
+
+ private:
+  CVPixelBufferRef _Nullable pixels_ = nullptr;
+};
+
 /// One frame's converted pixels. Owned, because ARKit recycles its
 /// CVPixelBuffers as soon as the delegate returns, while `CapturedFrame` is a
 /// non-owning view that must stay valid until the *next* poll.
 struct FrameBuffers {
   std::vector<float> depth;
   std::vector<std::uint32_t> color;
+  /// The camera picture @ref color was converted from, retained so a
+  /// renderer can sample it where it is; empty when `convert_color` publishes
+  /// none. The one exception to the copy above: this is ARKit's own buffer,
+  /// so it is let go as soon as the frame is superseded.
+  RetainedPixels picture;
+  /// How @ref picture codes R'G'B'; see `CapturedFrame::picture_coding`.
+  vr::sensor::YuvImage picture_coding{};
   vr::DepthCameraParams depth_camera{};
   vr::ColorCameraParams color_camera{};
   /// What the frame carries once staged: always canonical, because
@@ -229,6 +270,8 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
 /// and iOS ones routinely do.
 struct SourceColor {
   const vImage_YpCbCrToARGBMatrix* matrix;
+  /// The same matrix, as recon describes a picture's coding.
+  vr::sensor::VideoColorMatrix video_matrix;
   const char* matrix_name;
   const char* transfer_name;
   const char* primaries_name;
@@ -236,6 +279,12 @@ struct SourceColor {
   /// `false` when an attachment named something this driver cannot represent,
   /// so the frame's colour must be dropped rather than declared.
   bool understood;
+  /// Where the picture's chroma samples sit; none for a siting the renderer
+  /// does not sample (it samples left or centre), whose picture is then not
+  /// published: its frame is not textured, rather than textured against a
+  /// keyframe that renders white. vImage's conversion does not read the
+  /// siting, so the colour still is published.
+  std::optional<vr::sensor::ChromaLocation> chroma_location;
 };
 
 /// Read @p image's colour attachments rather than assuming them.
@@ -263,12 +312,15 @@ SourceColor source_color(CVPixelBufferRef image) {
   // up that way on screen. An ARKit buffer is tagged in practice, making this
   // nearly dead code; a silently different guess in nearly dead code is exactly
   // the kind of thing that surfaces once, years later, on one device.
+  // An untagged chroma siting is taken as left, recon's default for a picture.
   SourceColor out{kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
+                  vr::sensor::VideoColorMatrix::Bt709,
                   "BT.709 (assumed)",
                   "sRGB (assumed)",
                   "BT.709 (assumed)",
                   vr::ColorEncoding{},
-                  true};
+                  true,
+                  vr::sensor::ChromaLocation::Left};
 
   const auto matches = [](CFTypeRef value, CFStringRef expected) {
     return value != nullptr && CFGetTypeID(value) == CFStringGetTypeID() &&
@@ -283,6 +335,7 @@ SourceColor source_color(CVPixelBufferRef image) {
   if (CFTypeRef matrix = attachment(kCVImageBufferYCbCrMatrixKey)) {
     if (matches(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
       out.matrix = kvImage_YpCbCrToARGBMatrix_ITU_R_601_4;
+      out.video_matrix = vr::sensor::VideoColorMatrix::Bt601;
       out.matrix_name = "BT.601";
     } else if (matches(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)) {
       out.matrix_name = "BT.709";
@@ -354,6 +407,19 @@ SourceColor source_color(CVPixelBufferRef image) {
       out.understood = false;
     }
     CFRelease(transfer);
+  }
+
+  // The siting of a progressive picture's chroma is its top field's. Only the
+  // two the renderer samples (see `bind_keyframe`); any other means no picture.
+  if (CFTypeRef siting = attachment(kCVImageBufferChromaLocationTopFieldKey)) {
+    if (matches(siting, kCVImageBufferChromaLocation_Left)) {
+      out.chroma_location = vr::sensor::ChromaLocation::Left;
+    } else if (matches(siting, kCVImageBufferChromaLocation_Center)) {
+      out.chroma_location = vr::sensor::ChromaLocation::Center;
+    } else {
+      out.chroma_location = std::nullopt;
+    }
+    CFRelease(siting);
   }
   return out;
 }
@@ -436,6 +502,8 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   out.color_primaries = "(none)";
   out.color_converted = false;
   out.color_refused = false;
+  out.picture.reset();
+  out.picture_coding = vr::sensor::YuvImage{};
 
   if (CVPixelBufferGetPlaneCount(image) < 2) {
     return false;
@@ -543,6 +611,20 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   // but the alpha byte vImage already wrote as 255.
   out.color_encoding = source.encoding;
   if (vr::is_canonical(out.color_encoding)) {
+    // The picture itself, for the keyframes the renderer samples where the
+    // camera left them. Only here: a non-canonical picture would be sampled as
+    // though it were canonical, since a renderer applies the matrix and the
+    // range but no transfer or primaries conversion.
+    if (source.chroma_location) {
+      out.picture = RetainedPixels(image);
+      const vr::sensor::YcbcrWeights weights =
+          vr::sensor::ycbcr_weights(source.video_matrix);
+      out.picture_coding.layout = vr::sensor::YuvLayout::Nv12;
+      out.picture_coding.kr = weights.kr;
+      out.picture_coding.kb = weights.kb;
+      out.picture_coding.full_range = true;  // '420f', checked above
+      out.picture_coding.chroma_location = *source.chroma_location;
+    }
     return true;
   }
   // Wide gamut, most likely: converting in place, since the source is our own
@@ -609,6 +691,9 @@ class ARKitCapture final : public app::FrameSource {
     }
     std::swap(front_, back_);
     staged_ = false;
+    // The frame this poll supersedes is no longer the consumer's, so its
+    // picture goes back to ARKit now rather than at the next stage.
+    back_.picture.reset();
     ++stats_.frames_polled;
 
     app::CapturedFrame frame{};
@@ -621,6 +706,10 @@ class ARKitCapture final : public app::FrameSource {
     // the default *is* a declaration -- so a source we failed to convert would
     // be fused through the wrong curve rather than refused.
     frame.color_encoding = front_.color_encoding;
+    if (front_.has_color) {
+      frame.picture = front_.picture.get();
+      frame.picture_coding = front_.picture_coding;
+    }
     frame.timestamp_ns = front_.timestamp_ns;
     return std::optional<app::CapturedFrame>{frame};
   }
@@ -640,6 +729,9 @@ class ARKitCapture final : public app::FrameSource {
       ++stats_.frames_dropped;  // nobody took the previous one
     }
     std::swap(back_, buffers);
+    // The retired frame's picture goes back to ARKit now rather than when the
+    // caller next converts into these buffers.
+    buffers.picture.reset();
     staged_ = true;
     ++stats_.frames_submitted;
 
@@ -682,6 +774,9 @@ class ARKitCapture final : public app::FrameSource {
   void reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     staged_ = false;
+    // The discarded frame's picture with it; `front_` stays, as the consumer
+    // may still be reading it until its next poll.
+    back_.picture.reset();
     stats_ = initial_stats();
   }
 

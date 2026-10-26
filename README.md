@@ -298,6 +298,11 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 - **LiDAR required** for the ARKit slice: iPhone 12 Pro and later Pro models,
   iPad Pro 2020 and later. Guard with
   `ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`.
+- **The scanner's keyframes are ARKit's own pictures.** Each mesh slot samples
+  the `capturedImage` its mesh was textured from where ARKit left it, imported
+  by recon's `PixelBufferImporter`, so the ring holds up to three of ARKit's
+  pixel buffers beyond the frames being captured and fused. Fusion still
+  converts each frame's colour on the CPU.
 - **Shaders are compiled on the host** by `glslc` and embedded into the binary
   as constexpr byte arrays, so there is no runtime shader file and nothing to
   resolve in the app bundle.
