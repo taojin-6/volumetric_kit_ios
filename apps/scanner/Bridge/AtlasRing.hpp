@@ -57,17 +57,19 @@ struct AtlasRing {
 };
 
 /// @brief Point @p slot at @p keyframe, or at @p white when it has no planes
-///        or the set refuses it.
+///        or cannot be sampled.
 ///
 /// The slot then holds @p keyframe until it is next rebound, and has let go of
-/// the picture it held before.
+/// the picture it held before. Core's `rebind_keyframe` (KeyframeBinding.hpp)
+/// decides what the set samples; this binds it through gfx's set.
 ///
 /// @pre No pending frame has bound the slot's set, and none being recorded
 ///      has: the ring depth guarantees it for the slot a new mesh lands in.
 /// @param slot      The slot, its set made.
 /// @param keyframe  The mesh's keyframe; no planes when the mesh carries none.
 /// @param white     The white texture's view, in `SHADER_READ_ONLY_OPTIMAL`.
-/// @return OK, or why the set refused @p keyframe; the slot samples white then.
+/// @return OK, or why @p keyframe cannot be sampled: its chroma siting, or
+///         the set's refusal. The slot samples white then.
 vkc::Status bind_keyframe(AtlasSlot& slot, Keyframe keyframe,
                           VkImageView white);
 
