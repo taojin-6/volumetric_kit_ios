@@ -466,7 +466,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   atlas_sampling.max_lod = VK_LOD_CLAMP_NONE;
   vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> atlas_set =
       vg::pipelines::HybridMeshTextureSet::create(
-          _impl->app.device(), *_impl->mesh_pipeline,
+          _impl->app.device(), _impl->app.allocator(), *_impl->mesh_pipeline,
           _impl->atlas_texture.view(), atlas_sampling);
   if (!atlas_set) {
     app::set_error(error, atlas_set.status(), "atlas HybridMeshTextureSet");
@@ -487,7 +487,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
     vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> slot_set =
         vg::pipelines::HybridMeshTextureSet::create(
-            _impl->app.device(), *_impl->mesh_pipeline,
+            _impl->app.device(), _impl->app.allocator(), *_impl->mesh_pipeline,
             _impl->atlas_texture.view(), atlas_sampling);
     if (!slot_set) {
       app::set_error(error, slot_set.status(),
