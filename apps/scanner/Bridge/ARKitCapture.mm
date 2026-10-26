@@ -691,6 +691,9 @@ class ARKitCapture final : public app::FrameSource {
     }
     std::swap(front_, back_);
     staged_ = false;
+    // The frame this poll supersedes is no longer the consumer's, so its
+    // picture goes back to ARKit now rather than at the next stage.
+    back_.picture.reset();
     ++stats_.frames_polled;
 
     app::CapturedFrame frame{};
