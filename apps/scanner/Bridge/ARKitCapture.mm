@@ -279,9 +279,11 @@ struct SourceColor {
   /// `false` when an attachment named something this driver cannot represent,
   /// so the frame's colour must be dropped rather than declared.
   bool understood;
-  /// Where the picture's chroma samples sit; none for a siting recon has no
-  /// name for, whose picture is then not published (vImage's conversion does
-  /// not read it, so the colour still is).
+  /// Where the picture's chroma samples sit; none for a siting the renderer
+  /// does not sample (it samples left or centre), whose picture is then not
+  /// published: its frame is not textured, rather than textured against a
+  /// keyframe that renders white. vImage's conversion does not read the
+  /// siting, so the colour still is published.
   std::optional<vr::sensor::ChromaLocation> chroma_location;
 };
 
@@ -407,23 +409,14 @@ SourceColor source_color(CVPixelBufferRef image) {
     CFRelease(transfer);
   }
 
-  // The siting of a progressive picture's chroma is its top field's.
+  // The siting of a progressive picture's chroma is its top field's. Only the
+  // two the renderer samples (see `bind_keyframe`); any other means no picture.
   if (CFTypeRef siting = attachment(kCVImageBufferChromaLocationTopFieldKey)) {
-    using vr::sensor::ChromaLocation;
     if (matches(siting, kCVImageBufferChromaLocation_Left)) {
-      out.chroma_location = ChromaLocation::Left;
+      out.chroma_location = vr::sensor::ChromaLocation::Left;
     } else if (matches(siting, kCVImageBufferChromaLocation_Center)) {
-      out.chroma_location = ChromaLocation::Center;
-    } else if (matches(siting, kCVImageBufferChromaLocation_TopLeft)) {
-      out.chroma_location = ChromaLocation::TopLeft;
-    } else if (matches(siting, kCVImageBufferChromaLocation_Top)) {
-      out.chroma_location = ChromaLocation::Top;
-    } else if (matches(siting, kCVImageBufferChromaLocation_BottomLeft)) {
-      out.chroma_location = ChromaLocation::BottomLeft;
-    } else if (matches(siting, kCVImageBufferChromaLocation_Bottom)) {
-      out.chroma_location = ChromaLocation::Bottom;
+      out.chroma_location = vr::sensor::ChromaLocation::Center;
     } else {
-      // DV 4:2:0, or something newer.
       out.chroma_location = std::nullopt;
     }
     CFRelease(siting);

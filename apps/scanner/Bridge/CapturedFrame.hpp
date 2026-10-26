@@ -43,8 +43,10 @@ struct CapturedFrame {
   volumetric_kit::recon::ColorEncoding color_encoding{};
   /// The camera picture @ref color was converted from, borrowed like it:
   /// ARKit's `capturedImage`, 8-bit NV12 on an IOSurface, for a renderer to
-  /// sample where it is. Null when the frame carries no colour, or colour that
-  /// had to be brought to the canonical encoding, which the picture is not in.
+  /// sample where it is. Null when the frame carries no colour, colour that
+  /// had to be brought to the canonical encoding, which the picture is not in,
+  /// or chroma sited other than left or centre, which the renderer does not
+  /// sample.
   CVPixelBufferRef picture = nullptr;
   /// How @ref picture codes R'G'B' -- matrix weights, range and chroma siting,
   /// as its buffer declared them -- with no planes: recon's
