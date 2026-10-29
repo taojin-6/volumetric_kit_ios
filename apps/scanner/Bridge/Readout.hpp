@@ -27,7 +27,7 @@
 #include <cstdint>
 #include <string>
 
-// `recon::StageRow`, named in the category at the foot of this file. Included
+// `vkc::StageRow`, named in the category at the foot of this file. Included
 // rather than left to Fusion.hpp's copy: a transitive include is not a
 // dependency, and reordering the imports above would turn this into a hard
 // error in a header whose whole job is to be included from two places.
@@ -107,7 +107,7 @@ NSArray<VolumetricStageRow*>* stage_rows(const FusionStats& s);
 ///
 /// Alerts appears only when something has failed. `Fuse timing` and
 /// `Extract phases` appear only when `FusionConfig::measure_stages` is off:
-/// with it on, recon publishes both as stage rows, and a section carrying them
+/// with it on, both arrive as stage rows, and a section carrying them
 /// as well would draw and print every figure twice. See where they are built.
 ///
 /// Every figure the read-out has is in here, including the ones the panel draws

@@ -6,16 +6,16 @@
 /// @file Fusion.hpp
 /// @brief The reconstruction spine, driven off captured ARKit frames.
 ///
-/// Owns recon's per-scan state — the sparse block grid, the TSDF integrator,
-/// marching cubes, and the projective texturer — and turns polled
+/// Owns the per-scan state — grid's sparse block grid and marching cubes,
+/// recon's TSDF integrator and projective texturer — and turns polled
 /// `CapturedFrame`s into a host mesh the renderer draws. The desktop
 /// `fuse_viewer` is the reference; this is that loop with ARKit in place of a
 /// Replica sequence.
 ///
 /// @warning **No cross-library GPU wait.** iOS gives one queue in the family,
-///          so recon and gfx submit through one mutex — and gfx's
-///          `Swapchain::recreate` drains via `Device::wait_idle`, which takes
-///          that mutex *and then* waits on the queue. Any command buffer
+///          so the compute libraries and gfx submit through one mutex — and
+///          gfx's `Swapchain::recreate` drains via `Device::wait_idle`, which
+///          takes that mutex *and then* waits on the queue. Any command buffer
 ///          waiting on a value the sibling has not signalled yet deadlocks
 ///          against a rotation. So the handoff here is a **host mesh** (interop
 ///          seam A): readiness is checked on the host and a not-ready frame is
@@ -34,7 +34,7 @@
 // into what the log, the trace and the panel each say about it. The enum lives
 // there rather than here because those renderings are decisions made without
 // the device, and this header cannot be reached from a host build: it pulls in
-// all of recon.
+// all of the compute libraries.
 #include "AllocationStop.hpp"
 #include "CapturedFrame.hpp"
 // @ref kSurveyEveryFrames and the staleness rules the read-out shares with the
@@ -48,18 +48,21 @@
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/sensor/apple/pixel_buffer_importer.hpp"
-#include "volumetric_kit/recon/sensor/yuv_image.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/texture/projective_texturer.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/sensor/apple/pixel_buffer_importer.hpp"
+#include "volumetric_kit/sensor/frame/vector_types.hpp"
+#include "volumetric_kit/sensor/yuv_image.hpp"
 
 namespace volumetric_kit::ios_app {
 
 namespace vkc = volumetric_kit::core;
 
+namespace sensor = volumetric_kit::sensor;
+namespace vgrid = volumetric_kit::grid;
 namespace vr = volumetric_kit::recon;
 
 /// @brief Per-scan tuning. Defaults target *first light* rather than room
@@ -112,7 +115,7 @@ struct FusionConfig {
   /// @note **The grid is not the term that binds, and this ceiling has never
   ///       run at 32768 on device.** The value was raised from 16384 against a
   ///       grid-only derivation (805 -> 1610 MB), which is the smaller half:
-  ///       recon's `MarchingCubes::plan_capacity` sizes the mesh arena from
+  ///       grid's `MarchingCubes::plan_capacity` sizes the mesh arena from
   ///       `num_active`, so the reachable block count scales the arena ring
   ///       too, and `scanner.entitlements` records the measured split as 3089
   ///       MB of arenas beside an 805 MB grid. The arenas are what got a scan
@@ -163,7 +166,7 @@ struct FusionConfig {
   /// **A field rather than a constant at the call site: turning this off must
   /// not need a source edit and a rebuild.** A non-null `StageMetrics*` is not
   /// merely somewhere to write timings; it routes every dispatch behind it onto
-  /// recon's *timed* submit path, which resets a query pool, writes two
+  /// the libraries' *timed* submit path, which resets a query pool, writes two
   /// timestamps and reads them back per command buffer. On a fused frame that
   /// is the allocate (once per grow retry, so up to `kMaxGrowAttempts + 1`
   /// times), the fusion dispatch, and the active-set compaction -- every frame,
@@ -178,7 +181,7 @@ struct FusionConfig {
   /// back to them.
   ///
   /// @warning Device timing can retire itself mid-run, and does not come back.
-  ///          recon's tiers hold long-lived `GpuTimer`s; a failed
+  ///          grid's and recon's tiers hold long-lived `GpuTimer`s; a failed
   ///          `vkWaitForFences` leaks the command buffer carrying that window's
   ///          queries, so the timer calls `abandon()` and every row is
   ///          host-only from then on. Nothing here can reset it, and without
@@ -271,11 +274,11 @@ struct FusionConfig {
   /// floor**: @ref Fusion::start refuses anything lower rather than running
   /// with it.
   ///
-  /// One is recon's own default and means a single arena reused in
+  /// One is grid's own default and means a single arena reused in
   /// place, with `release_through` recording a number and changing no
   /// behaviour -- but every @ref Published::mesh here is a *borrowed*
-  /// @ref vr::mesh::DeviceMesh, so at one slot the next extract overwrites the
-  /// buffers an in-flight draw is reading, and a grow frees them outright
+  /// @ref vgrid::mesh::DeviceMesh, so at one slot the next extract overwrites
+  /// the buffers an in-flight draw is reading, and a grow frees them outright
   /// (`vmaDestroyBuffer`, no fence wait). That is silent geometry corruption or
   /// a GPU fault, raised as neither a Status nor a validation message, and it
   /// is not a state worth leaving one defaulted field away.
@@ -283,17 +286,18 @@ struct FusionConfig {
   /// Two only *arms* the contract. A consumer drawing these buffers has to size
   /// it to its own frames in flight plus one, which is what the renderer passes
   /// (`RendererImpl::kMeshSlots`). Each slot costs a full vertex arena, so
-  /// higher is not free -- see recon's `slot_count`.
+  /// higher is not free -- see grid's `slot_count`.
   std::uint32_t mesh_slots = 2;
 
   /// @brief The queue families that will touch the mesh buffers and the
-  ///        keyframes' plane images; recon's device's own family among them.
+  ///        keyframes' plane images; the compute device's own family among
+  ///        them.
   ///
-  /// Both of them, unconditionally -- recon reduces the pair to its distinct
-  /// entries and picks EXCLUSIVE where they turn out to be one family. Under
-  /// the two-family queue plan a phone actually gets, they differ, and a mesh
-  /// created EXCLUSIVE would be read by a family that does not own it: silently
-  /// undefined, not an error.
+  /// Both of them, unconditionally -- grid and sensor reduce the pair to its
+  /// distinct entries and pick EXCLUSIVE where they turn out to be one family.
+  /// Under the two-family queue plan a phone actually gets, they differ, and a
+  /// mesh created EXCLUSIVE would be read by a family that does not own it:
+  /// silently undefined, not an error.
   std::uint32_t queue_families[2] = {0, 0};
   std::uint32_t queue_family_count = 0;
 };
@@ -352,7 +356,7 @@ enum class TextureState : std::uint8_t {
 /// So the sample is taken where the frame is produced, not where the UI asks.
 ///
 /// Assembled field by field, which is the opposite of the rule the fuse loop
-/// follows for @ref FusionStats::extract ("recon's struct, whole -- not a
+/// follows for @ref FusionStats::extract ("grid's struct, whole -- not a
 /// field-by-field transcription"). That rule is about *transcription*: copying
 /// a struct one member at a time so a field added upstream goes missing. This
 /// is a **reduction** -- 240 of these are resident for the whole scan, so it
@@ -396,7 +400,8 @@ struct FrameSample {
   /// Summed host milliseconds across the frame's stages, breakdown rows
   /// excluded -- they restate time the stage above already counted.
   ///
-  /// @warning Not a host-only measurement. recon documents `StageRow::cpu_ms`
+  /// @warning Not a host-only measurement. The core documents
+  /// `StageRow::cpu_ms`
   ///          as wall clock around a *blocking* submit, so for a compute stage
   ///          this covers record, submit, the fence stall and device execution
   ///          -- an end-to-end cost. It therefore already contains most of
@@ -423,9 +428,9 @@ struct FrameSample {
   ///
   /// Carried separately because it is **not** in @ref host_ms or
   /// @ref device_ms: `MarchingCubes::extract_device` reports through
-  /// `vr::mesh::ExtractTimings` rather than the stage row set, so neither total
-  /// can see it. It is also the largest cost in a remesh frame -- 132.7 ms
-  /// against ~20 ms of fuse on this device's own measurement -- and with
+  /// `vgrid::mesh::ExtractTimings` rather than the stage row set, so neither
+  /// total can see it. It is also the largest cost in a remesh frame -- 132.7
+  /// ms against ~20 ms of fuse on this device's own measurement -- and with
   /// @ref FusionConfig::remesh_every at its default of 1 it is on every frame.
   /// A history without it is a history that cannot show the spike this type was
   /// built for.
@@ -481,7 +486,7 @@ struct FusionStats {
   /// These are what the read-out falls back to when @ref stage_count is 0, so
   /// turning stage measurement off costs the device column and nothing else.
   /// When rows *are* present they carry these same host spans and more --
-  /// recon's `allocate` row accumulates across the grow retries this pair can
+  /// grid's `allocate` row accumulates across the grow retries this pair can
   /// only total, and each row has a device half beside it.
   float allocate_ms = 0.0f;
   float integrate_ms = 0.0f;
@@ -513,9 +518,9 @@ struct FusionStats {
   /// The host span around the keyframe import the fuse thread makes per
   /// textured remesh, in ms.
   ///
-  /// Measured because it is otherwise invisible: it sits outside recon's stage
-  /// spans, outside @ref extract_ms and outside @ref texture_ms. Usually a
-  /// lookup, since the importer keeps each camera surface's images; the first
+  /// Measured because it is otherwise invisible: it sits outside the libraries'
+  /// stage spans, outside @ref extract_ms and outside @ref texture_ms. Usually
+  /// a lookup, since the importer keeps each camera surface's images; the first
   /// picture on a surface makes them and waits on one submit. Zero on a remesh
   /// that imported nothing.
   float keyframe_import_ms = 0.0f;
@@ -530,7 +535,8 @@ struct FusionStats {
   /// reader has to rejoin.
   static constexpr std::size_t kMaxStages = 16;
 
-  /// @brief The per-stage host/device rows recon reported for the last fused
+  /// @brief The per-stage host/device rows the libraries reported for the last
+  /// fused
   ///        frame, or none when @ref FusionConfig::measure_stages is off.
   ///
   /// Empty until a frame fuses all the way through, and **not cleared by a
@@ -557,13 +563,14 @@ struct FusionStats {
   /// @ref frames_fused published the previous remesh's phases as this frame's.
   ///
   /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
-  ///          from a recon tier reporting with a string literal, or from a
-  ///          literal this file passes to `StageScope`, so the pointers outlive
-  ///          any read -- but a row added from a non-literal would dangle.
+  ///          from a grid or recon tier reporting with a string literal, or
+  ///          from a literal this file passes to `StageScope`, so the pointers
+  ///          outlive any read -- but a row added from a non-literal would
+  ///          dangle.
   vkc::StageRow stages[kMaxStages]{};
   /// How many of @ref stages are real.
   std::uint32_t stage_count = 0;
-  /// Whether recon reported more rows than @ref kMaxStages held.
+  /// Whether the libraries reported more rows than @ref kMaxStages held.
   ///
   /// A dropped row is otherwise invisible: `stage_count == kMaxStages` reads
   /// exactly like a frame that happened to have eight. A consumer summing the
@@ -586,24 +593,25 @@ struct FusionStats {
   float ms_since_stages = 0.0f;
   /// Whether device timing was measured once and has since retired itself.
   ///
-  /// recon's tiers hold long-lived `GpuTimer`s that `abandon()` on a failed
-  /// fence wait, permanently and process-wide. Without this the aftermath --
-  /// every row host-only, every device cell a dash -- is indistinguishable from
-  /// a queue family that never reported timestamps, which is a hardware verdict
-  /// rather than a fault. See @ref FusionConfig::measure_stages.
+  /// grid's and recon's tiers hold long-lived `GpuTimer`s that `abandon()` on a
+  /// failed fence wait, permanently and process-wide. Without this the
+  /// aftermath -- every row host-only, every device cell a dash -- is
+  /// indistinguishable from a queue family that never reported timestamps,
+  /// which is a hardware verdict rather than a fault. See @ref
+  /// FusionConfig::measure_stages.
   bool gpu_timing_retired = false;
   /// @brief The last successful extract's own timings and counts, held whole.
   ///
-  /// recon's struct by value rather than a hand-picked copy of its fields.
+  /// grid's struct by value rather than a hand-picked copy of its fields.
   /// Eleven of its twelve were mirrored into scalars here, which meant every
-  /// field recon added or renamed wanted three lockstep edits in this app --
+  /// field upstream added or renamed wanted three lockstep edits in this app --
   /// declaration, copy, read-out -- with no compile error when one was missed;
   /// and because all seven spans are the same type, any permutation slip in the
   /// copy block compiled clean and surfaced only as a suspicious device
   /// read-out. That is the same class of gap this diff exists to close, one
   /// struct over. recon's own `fuse_viewer` holds it whole for the same reason.
   /// Costs nothing new: marching_cubes.hpp is already included above, and
-  /// @ref Published already exposes a `vr::mesh::DeviceMesh` publicly.
+  /// @ref Published already exposes a `vgrid::mesh::DeviceMesh` publicly.
   ///
   /// Where @ref extract_ms goes. The phases are worth the read-out space
   /// because they have *nothing* in common as optimisation targets and the
@@ -614,17 +622,17 @@ struct FusionStats {
   /// app measured extract at 132.7 ms, of which the lut was 102.2 and the
   /// dispatch 25.9.
   ///
-  /// @warning `dispatch_ms` is **not** GPU time. recon submits through
+  /// @warning `dispatch_ms` is **not** GPU time. grid submits through
   ///          `Device::submit_single_time`, which blocks on a fence, and
   ///          `ExtractTimings` documents the span as covering host record
   ///          *plus* device execution rather than either alone. Sizing a
   ///          triangle-reduction win against it overstates the ceiling by
   ///          however much of it is recording, submit and stall.
   ///
-  /// @note `arena_bytes` is recon's sum across the whole ring, while
+  /// @note `arena_bytes` is grid's sum across the whole ring, while
   ///       `triangle_capacity` is what this extract planned for the one slot it
   ///       wrote -- not the same scale. See @ref mesh_slots.
-  vr::mesh::ExtractTimings extract{};
+  vgrid::mesh::ExtractTimings extract{};
   /// How many slots that arena is spread over -- the count the **extractor**
   /// was built with, echoed here so the read-out needs no second source for it.
   std::uint32_t mesh_slots = 0;
@@ -923,8 +931,9 @@ class Fusion {
   /// With @ref FusionConfig::texture on, also the keyframe importer, so a
   /// device that cannot import camera pictures fails here rather than every
   /// remesh.
-  /// @param device     recon's adopted view of the shared `VkDevice`.
-  /// @param allocator  recon's allocator on that device.
+  /// @param device     The compute libraries' adopted view of the shared
+  ///                   `VkDevice`.
+  /// @param allocator  Their allocator on that device.
   /// @param config     Per-scan tuning.
   vkc::Status start(vkc::Device& device, vkc::Allocator& allocator,
                     const FusionConfig& config);
@@ -942,7 +951,7 @@ class Fusion {
   /// origin looking down +Z while the scan happens somewhere else entirely --
   /// which renders as a flat fill, because the camera ends up inside the
   /// surface rather than looking at it.
-  vr::Mat4f last_pose() const;
+  sensor::Mat4f last_pose() const;
 
   /// @brief Take the mesh if it is newer than @p known_version.
   ///
@@ -967,7 +976,7 @@ class Fusion {
     ///
     /// Valid until its slot is reused, which cannot happen before the consumer
     /// releases it: see @ref release_through.
-    vr::mesh::DeviceMesh mesh;
+    vgrid::mesh::DeviceMesh mesh;
     std::uint32_t version = 0;
     /// @brief The keyframe @ref mesh's `uv0` index into: the camera picture
     ///        the mesh was textured from, its two planes imported as images
@@ -989,7 +998,7 @@ class Fusion {
     /// refusal leaves `uv0` at the sentinel, so no coordinate points at a
     /// keyframe the consumer never has, and @ref FusionStats::texture_state
     /// says which happened.
-    vr::sensor::YuvImage keyframe;
+    sensor::YuvImage keyframe;
   };
 
   std::optional<Published> take_mesh(std::uint32_t known_version);
@@ -1007,12 +1016,12 @@ class Fusion {
   /// warning at the top of this file). Reporting completion after the fact
   /// cannot.
   ///
-  /// Takes recon's @ref vr::mesh::DeviceMesh::generation, not @ref
+  /// Takes grid's @ref vgrid::mesh::DeviceMesh::generation, not @ref
   /// Published::version -- the two number different things, and the ring is
-  /// recon's.
+  /// grid's.
   ///
-  /// **This records the mark; it does not hand it to recon.** The fuse thread
-  /// applies it at the top of its next remesh, which is what keeps recon's
+  /// **This records the mark; it does not hand it to grid.** The fuse thread
+  /// applies it at the top of its next remesh, which is what keeps grid's
   /// extractor single-threaded. `MarchingCubes::release_through` is not atomic
   /// and its header makes serializing it against the extracting thread a caller
   /// obligation -- calling it from here would race `extract_device` on the fuse
@@ -1096,13 +1105,13 @@ class Fusion {
 
   bool valid() const noexcept { return grid_.has_value(); }
 
-  /// @brief recon's `VoxelHashMap::kGrowThreshold`.
+  /// @brief grid's `VoxelHashMap::kGrowThreshold`.
   ///
   /// Re-exported so the read-out can tone the occupancy figure against the same
   /// number the map grows at without restating it -- see GrowthPolicy.hpp's
   /// note, and @ref volumetric_kit::ios_app::occupancy_thresholds, which is
   /// what this feeds. A function returning a `float` rather than a constant, so
-  /// the recon header stays in Fusion.mm: two more bridge translation units
+  /// the grid header stays in Fusion.mm: two more bridge translation units
   /// taking `voxel_hash_map.hpp` to read one threshold is the header fanout
   /// this target has been trimming, and neither of them needs the type.
   static float grow_threshold() noexcept;
@@ -1120,11 +1129,11 @@ class Fusion {
   void remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics);
 
   FusionConfig config_{};
-  // recon's per-scan state is create-only (no default constructor), which is
-  // why these are optional rather than plain members.
-  std::optional<vr::volume::VoxelBlockGrid> grid_;
+  // The libraries' per-scan state is create-only (no default constructor),
+  // which is why these are optional rather than plain members.
+  std::optional<vgrid::volume::VoxelBlockGrid> grid_;
   std::optional<vr::tsdf::TsdfIntegrator> integrator_;
-  std::optional<vr::mesh::MarchingCubes> marching_cubes_;
+  std::optional<vgrid::mesh::MarchingCubes> marching_cubes_;
   std::optional<vr::texture::ProjectiveTexturer> texturer_;
 
   std::uint64_t captured_ = 0;
@@ -1132,18 +1141,18 @@ class Fusion {
   mutable std::mutex mutex_;
   // The published view of the extractor's buffers -- handles and counts, not
   // bytes. Copying it is copying five words.
-  vr::mesh::DeviceMesh mesh_;
+  vgrid::mesh::DeviceMesh mesh_;
   std::uint32_t mesh_version_ = 0;
-  // recon's generation for the mesh currently published, and whether anyone has
+  // grid's generation for the mesh currently published, and whether anyone has
   // taken it. Fusion outruns the render loop routinely -- it remeshes every
   // fused frame -- so a mesh can be superseded before the renderer ever asks
   // for it, and that mesh still holds a slot.
   //
   // What `remesh` does about it is *not extract*. Publishing over it and
-  // releasing the old generation is the obvious move and it is unsound: recon's
+  // releasing the old generation is the obvious move and it is unsound: grid's
   // release_through is a monotonic high-water mark, so releasing the untaken
   // generation also retires every older one -- including the generation the
-  // renderer's in-flight frames are still drawing out of. recon has a
+  // renderer's in-flight frames are still drawing out of. grid has a
   // single-slot primitive for this (`free_slot_of`) and keeps it private,
   // precisely because the high-water mark is the consumer's to move.
   //
@@ -1156,14 +1165,14 @@ class Fusion {
   /// Imports each textured frame's camera picture as two plane images,
   /// shared with the renderer's queue family. Made in @ref start when
   /// texturing is on, and used on the fuse thread alone.
-  std::optional<vr::sensor::PixelBufferImporter> importer_;
+  std::optional<sensor::PixelBufferImporter> importer_;
   /// The keyframe the published mesh indexes into, until @ref take_mesh hands
   /// it over; no planes when the last remesh did not texture. Guarded by
   /// @ref mutex_ with the mesh it belongs to -- see @ref Published::keyframe.
-  vr::sensor::YuvImage published_keyframe_;
+  sensor::YuvImage published_keyframe_;
   // The consumer's high-water mark, recorded by @ref release_through and handed
-  // to recon by the fuse thread at the top of the next remesh. See that method:
-  // this indirection is what keeps recon's extractor single-threaded.
+  // to grid by the fuse thread at the top of the next remesh. See that method:
+  // this indirection is what keeps grid's extractor single-threaded.
   std::uint64_t consumer_released_ = 0;
   // `stats_.frames_fused` as of the last extract that published a breakdown,
   // and whether one ever has. These fed the occupancy guard too, until it moved
@@ -1256,7 +1265,7 @@ class Fusion {
   // needs something that can tell a live sample from a frozen one.
   std::uint64_t survey_at_frame_ = 0;
   bool survey_measured_ = false;
-  vr::Mat4f last_pose_{1.0f};
+  sensor::Mat4f last_pose_{1.0f};
   // The frame history, written on the fuse thread and read under mutex_ with
   // everything else it publishes.
   //

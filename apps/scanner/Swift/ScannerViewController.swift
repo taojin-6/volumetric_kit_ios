@@ -41,7 +41,7 @@ final class ScannerViewController: UIViewController {
   /// has a view callback. `viewDidDisappear` does **not** fire on backgrounding,
   /// which is exactly how a backgrounded scan kept fusing: the display link
   /// suspends on its own, but the fuse thread is a plain `std::thread` that goes
-  /// on submitting recon work — Metal submits from a backgrounded process, which
+  /// on submitting compute work — Metal submits from a backgrounded process, which
   /// iOS terminates the app for.
   private var isOnScreen = false
   private var isBackgrounded = false
@@ -287,7 +287,7 @@ final class ScannerViewController: UIViewController {
     guard isCapturing else { return }
     isCapturing = false
     stopDisplayLink()
-    // Fusion first, and explicitly. It submits recon work on the same queue the
+    // Fusion first, and explicitly. It submits compute work on the same queue the
     // drain below empties, so a fuse thread still running would enqueue behind
     // the teardown -- and waitIdle does not stop it: it waits on the queues and
     // never touches the thread. Until stopFusion returns, the thread is also
@@ -464,7 +464,7 @@ final class ScannerViewController: UIViewController {
       \(Self.hardwareSummary())
       Vulkan \(brought.apiVersion) via MoltenVK
       device    \(brought.sharedDeviceSummary)
-      shared    \(brought.sharesOneDevice ? "yes - recon and gfx hold one VkDevice" : "NO - separate devices")
+      shared    \(brought.sharesOneDevice ? "yes - compute and gfx hold one VkDevice" : "NO - separate devices")
       """
     // The view may have appeared, or been backgrounded, or both, while bring-up
     // was in flight. `resume` is what reconciles that rather than assuming.

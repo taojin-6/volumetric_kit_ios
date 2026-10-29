@@ -1,7 +1,6 @@
 # Plain Google base, 80-column lines, left-aligned pointers, preserved include
-# blocks. The Cpp section matches volumetric_kit_recon's and
-# volumetric_kit_gfx's byte for byte, so all three siblings format C++
-# identically.
+# blocks. The Cpp section matches the sibling libraries' byte for byte, so the
+# whole family formats C++ identically.
 Language: Cpp
 BasedOnStyle: Google
 ColumnLimit: 80

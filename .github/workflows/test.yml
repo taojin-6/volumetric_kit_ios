@@ -4,14 +4,14 @@ name: test
 #
 # This is the only job in this repo that *runs* anything. The app targets are
 # build-only by nature: MoltenVK ships no simulator slice and ARKit scene depth
-# needs LiDAR, so nothing that touches Vulkan, recon or ARKit can execute
+# needs LiDAR, so nothing that touches Vulkan, the libraries or ARKit can execute
 # anywhere but a real device. vi_core is the part that carries no such
 # dependency, and it is deliberately the part that decides things -- a sign, a
 # threshold, whether a kernel reading is trustworthy -- so it is where a test
 # earns the most.
 #
 # It configures with -DVI_HOST_TESTS=ON, which builds vi_core and the tests and
-# nothing else: no recon, no gfx, no MoltenVK, no Xcode project. That is why
+# nothing else: no sibling library but the core, no MoltenVK, no Xcode project. That is why
 # this leg is a couple of minutes rather than the build leg's tens.
 #
 # Invoked by ci.yml, which owns the triggers and the concurrency group.

@@ -5,10 +5,10 @@ name: ci
 # requires just that one check ("ci / required"), so the protected `main`
 # required-checks list stays stable as legs are added or renamed -- adding a job
 # never silently leaves an old required context unreported and blocking every
-# PR. Same shape as volumetric_kit_recon's and volumetric_kit_gfx's CI.
+# PR. Same shape as the sibling libraries' CI.
 #
 # No scheduled trigger: nothing changes between commits here. CMakeLists.txt
-# pins volumetric_kit_recon and volumetric_kit_gfx by commit, so an upstream
+# pins the sibling libraries by commit, so an upstream
 # change reaches this build only through a PR that bumps a pin -- adopted
 # deliberately, with a change in hand to fix it against. (They used to track
 # `main`, and a nightly then reported upstream drift as a red `main` on mornings

@@ -19,13 +19,13 @@
 /// `resize`, the `allocate_from_depth`, the stage rows, the error strings that
 /// quote these figures back to the reader.
 ///
-/// @note **Nothing here restates recon's grow threshold.** `VoxelHashMap`
+/// @note **Nothing here restates grid's grow threshold.** `VoxelHashMap`
 ///       documents `kGrowThreshold` as a property of that table, and says
 ///       outright that an embedder refusing at its own threshold ends up
 ///       disagreeing with the library it is guarding. So @ref
-///       GrowthInputs::grow_threshold is a field the caller fills from recon,
+///       GrowthInputs::grow_threshold is a field the caller fills from grid,
 ///       never a constant on this side. @ref kRefuseAllocateAtOccupancy *is*
-///       this app's own number, and is the one thing in this file recon has no
+///       this app's own number, and is the one thing in this file grid has no
 ///       opinion about.
 
 #include <cstdint>
@@ -68,7 +68,7 @@ inline constexpr std::int32_t kVoxelsPerBlock =
 /// this left behind would under-report the commit by a third and hand the
 /// headroom check a number the process cannot survive. `Fusion.mm`
 /// static_asserts the specs against it beside the table itself, which is the
-/// one place both are visible -- this library cannot include recon.
+/// one place both are visible -- this library cannot include grid.
 inline constexpr std::int32_t kAttributeBytesPerVoxel = 12;
 
 /// @brief How many times one frame may grow the map and retry its allocation.
@@ -128,7 +128,7 @@ constexpr bool memory_decline_active(
 
 /// @brief The occupancy past which no new blocks are allocated at all.
 ///
-/// **Deliberately not recon's `kGrowThreshold`.** That one says "start
+/// **Deliberately not grid's `kGrowThreshold`.** That one says "start
 /// growing"; this says "stop feeding the overflow scan", and the band between
 /// them is the room a doubling needs to land in. Collapsing them would refuse
 /// allocation at the moment growth begins, on a table with plenty of room.
@@ -154,8 +154,8 @@ constexpr bool memory_decline_active(
 ///       a contended atomicCompSwap per slot: a candidate's pointer is read
 ///       unlocked first, so only free-looking slots pay the atomic (~25x fewer
 ///       at 96% occupancy), and an empty heap short-circuits on a single atomic
-///       load. CMakeLists.txt tracks recon's `main`, so this app already builds
-///       that kernel.
+///       load. The grid CMakeLists.txt pins carries both, so this app already
+///       builds that kernel.
 ///
 ///       Kept in force regardless, because a cliff that costs coverage is the
 ///       safe side of an unmeasured guess and nothing has run on device since
@@ -169,7 +169,7 @@ inline constexpr float kRefuseAllocateAtOccupancy = 0.85f;
 /// Derived rather than written out, because both tiers already exist and one of
 /// them is not this app's to state. The critical tier **is** @ref
 /// kRefuseAllocateAtOccupancy, so the bar goes red at the cliff rather than at
-/// a second copy of it; the warn tier is recon's grow threshold, passed in for
+/// a second copy of it; the warn tier is grid's grow threshold, passed in for
 /// the reason this file's note gives. Written out as a `{0.7, 0.85}` pair
 /// beside the other gauges, they were two more literals free to drift -- and
 /// already were not the same quantity: `(double)0.85f` is 0.85000002384 and the
@@ -234,7 +234,7 @@ struct GrowthInputs {
   /// the threshold: a fabricated full table would otherwise read as a standing
   /// instruction to double.
   bool occupancy_known = false;
-  /// recon's `VoxelHashMap::kGrowThreshold`, passed in rather than restated --
+  /// grid's `VoxelHashMap::kGrowThreshold`, passed in rather than restated --
   /// see this file's note.
   ///
   /// Defaulted to 1.0 rather than 0.0, which is the difference between an
@@ -346,7 +346,7 @@ constexpr bool growth_due(const GrowthInputs& in) noexcept {
 /// Measured on an M5 iPad Pro at 1 cm voxels: at 7809 of 8192 blocks the
 /// allocate dispatch went 1.2 ms -> 3.1 ms -> 4.2 ms over ~65 frames, dropped
 /// the capture to 45 fps, and then hung the GPU outright --
-/// kIOGPUCommandBufferCallbackErrorHang on recon's queue, which took gfx's
+/// kIOGPUCommandBufferCallbackErrorHang on the compute queue, which took gfx's
 /// queue down with it and surfaced as VK_ERROR_DEVICE_LOST from the next
 /// vkWaitForFences.
 ///

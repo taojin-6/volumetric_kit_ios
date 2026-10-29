@@ -6,7 +6,7 @@
 // dispatch through MoltenVK on iOS, and hand back a result the host can verify.
 //
 // A flat uint array needs no scalar block layout; std430 and scalar agree for
-// uint. The scalar-layout ABI that recon's hash structs depend on is proven by
+// uint. The scalar-layout ABI that grid's hash structs depend on is proven by
 // the next stage, which round-trips a real HashEntry through the volume tier.
 
 layout(local_size_x = 64) in;

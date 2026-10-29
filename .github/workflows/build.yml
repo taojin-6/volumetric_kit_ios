@@ -54,8 +54,8 @@ jobs:
         if: steps.cache-moltenvk.outputs.cache-hit != 'true'
         run: tools/fetch_moltenvk.sh
 
-      # Every FetchContent dependency is pinned in CMakeLists.txt -- the core,
-      # recon and gfx by commit -- so hashing that file keys the cache on
+      # Every FetchContent dependency is pinned in CMakeLists.txt -- the
+      # siblings by commit -- so hashing that file keys the cache on
       # exactly the sources a run compiles: a pin bump changes the hash and
       # forces a clean miss. (Before the siblings were pinned, they tracked
       # `main`, and a step folded both resolved tips into this key.)

@@ -5,7 +5,7 @@
 /// @brief The Swift-facing seam onto volumetric_kit_gfx.
 ///
 /// Swift owns the app: lifecycle, the view, and (later) the ARSession. It does
-/// not own Vulkan. Everything below this header is C++ — and recon/gfx are
+/// not own Vulkan. Everything below this header is C++ — and the libraries' are
 /// move-only types with `Result<T>` returns that Swift's C++ interop handles
 /// poorly — so the seam is a narrow Objective-C class that hands Swift plain
 /// values and `NSError`s and keeps the C++ entirely on this side.
@@ -42,8 +42,8 @@ FOUNDATION_EXPORT NSErrorDomain const VolumetricRendererErrorDomain;
 /// @brief `NSError.code` values: the *domain* of the library `Status` that
 ///        failed.
 ///
-/// The domain is the primary discriminator on both sides of the seam — recon
-/// and gfx each document their numeric result code as meaningful only for a
+/// The domain is the primary discriminator on both sides of the seam — the
+/// libraries each document their numeric result code as meaningful only for a
 /// backend/Vulkan failure and zero everywhere else, so surfacing that code as
 /// `NSError.code` would report almost every failure as `0`. The `VkResult`,
 /// when there is one, rides in @ref VolumetricRendererVulkanResultKey instead
@@ -123,7 +123,8 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 ///       device does not support GPU timestamps" off a false here is a hardware
 ///       verdict drawn from a correct measurement of a stage that merely
 ///       early-returned. Nothing on this object can tell the three apart --
-///       recon's own rule is that a caller who must know asks the device.
+///       the libraries' own rule is that a caller who must know asks the
+///       device.
 @interface VolumetricStageRow : NSObject
 /// Unavailable; see @ref VolumetricStatRow.init. A zeroed row would also plot
 /// as a real stage that measured 0.00 ms, which is the one reading this file
@@ -135,7 +136,7 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 ///          of the row above it, so summing either column over every row
 ///          double-counts the breakdowns.
 @property(nonatomic, readonly, copy) NSString* name;
-/// Wall clock around the stage. For a recon compute stage this covers host
+/// Wall clock around the stage. For a compute stage this covers host
 /// record, submit, the fence stall AND device execution -- an end-to-end cost,
 /// not a host-only one.
 @property(nonatomic, readonly) double cpuMs;
@@ -201,11 +202,11 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 @property(nonatomic, readonly) uint64_t timestampNs;
 /// Summed host milliseconds, breakdown rows excluded.
 ///
-/// @warning Not host-only time, and not stackable with @ref deviceMs. recon
-///          measures a compute stage as wall clock around a *blocking* submit,
-///          so this covers record, submit, fence stall and device execution --
-///          it already contains most of `deviceMs`. Stacking the two
-///          double-counts; subtracting them reports a device stall as host
+/// @warning Not host-only time, and not stackable with @ref deviceMs. The
+///          libraries measure a compute stage as wall clock around a *blocking*
+///          submit, so this covers record, submit, fence stall and device
+///          execution -- it already contains most of `deviceMs`. Stacking the
+///          two double-counts; subtracting them reports a device stall as host
 ///          overhead. Overlay them, or plot this one alone.
 @property(nonatomic, readonly) double hostMs;
 /// Summed device milliseconds, breakdown rows excluded, as for @ref hostMs.
@@ -405,7 +406,7 @@ typedef struct {
 /// Triangles the last extract planned room for, in the one slot it wrote.
 ///
 /// The denominator of the arena fill gauge. Not @ref VolumetricRenderer's arena
-/// byte total, which is recon's sum across the whole ring -- see
+/// byte total, which is grid's sum across the whole ring -- see
 /// `FusionStats::extract`.
 @property(nonatomic, readonly) uint32_t triangleCapacity;
 /// The capacity @ref occupancy is a fraction of, sampled in the same breath as
@@ -427,7 +428,7 @@ typedef struct {
 /// stage row and no other total. Zero when nothing was imported.
 ///
 /// The extract's unaccounted remainder is deliberately **not** here beside it.
-/// It looks like the same kind of figure and is not: recon publishes it as the
+/// It looks like the same kind of figure and is not: Fusion publishes it as the
 /// `"  ..other"` stage row, so it is already one of the bars, and a second copy
 /// on the snapshot only ever produced a panel that drew it twice and then said
 /// it was in neither bar. This one really is outside every span there is.
@@ -467,8 +468,8 @@ typedef struct {
 /// above against a literal `1000`. Three copies of one rule, and the two
 /// renderings were free to disagree about a figure they draw side by side.
 @property(nonatomic, readonly) BOOL stagesStale;
-/// Whether recon reported more stages than the snapshot could hold, making the
-/// bars an under-report rather than a short pipeline.
+/// Whether the libraries reported more stages than the snapshot could hold,
+/// making the bars an under-report rather than a short pipeline.
 @property(nonatomic, readonly) BOOL stagesTruncated;
 /// Whether device timing measured once and has since retired itself, which is a
 /// fault -- as distinct from a queue family that never reported timestamps,
@@ -571,7 +572,7 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
 /// so a dropped renderer cannot leave the thread running — but call it
 /// explicitly when leaving the screen, because until it returns the thread is
-/// still submitting recon work on the shared queue.
+/// still submitting compute work on the shared queue.
 ///
 /// **Blocks** for as long as the iteration in progress takes; see
 /// @ref beginStopFusion for the non-blocking half and why the two are split.
@@ -851,8 +852,8 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// device was built.
 @property(nonatomic, readonly, copy) NSString* sharedDeviceSummary;
 
-/// Whether recon and gfx both hold the bootstrap's one `VkDevice` *and* neither
-/// owns it.
+/// Whether the compute libraries and gfx both hold the bootstrap's one
+/// `VkDevice` *and* neither owns it.
 ///
 /// Handle equality alone would be a post-condition, not evidence: both wrappers
 /// were handed the same field, so they cannot differ once bring-up succeeds.

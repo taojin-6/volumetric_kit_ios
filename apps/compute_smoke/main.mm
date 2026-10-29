@@ -8,7 +8,7 @@
 //
 // This is an .mm (Objective-C++) translation unit: the ARKit capture source
 // that lands next uses the same seam, since ARKit is reachable only from
-// Objective-C / Swift while recon is C++.
+// Objective-C / Swift while the libraries are C++.
 
 #import <UIKit/UIKit.h>
 

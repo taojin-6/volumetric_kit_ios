@@ -7,7 +7,7 @@
 /// renders *inside* the Vulkan pass, so on a device where meshing already costs
 /// over 100 ms the overlay competes with the reconstruction for the same queue
 /// and lands in every GPU capture. SwiftUI composites on the UI layer -- the OS
-/// draws it and the recon pass pays nothing. gfx also ships only the Vulkan
+/// draws it and the compute pass pays nothing. gfx also ships only the Vulkan
 /// backend by design (the platform half is the consumer's), so ImGui here would
 /// have meant writing a UIKit input backend first.
 ///
@@ -55,7 +55,7 @@ struct StageBar: Identifiable {
   let hostMs: Double
   let deviceMs: Double
   let hasGPU: Bool
-  /// recon marks a breakdown of the row above it by indenting the label.
+  /// The libraries mark a breakdown of the row above it by indenting the label.
   var isBreakdown: Bool { name.hasPrefix(" ") }
   var trimmed: String { name.trimmingCharacters(in: .whitespaces) }
 }
@@ -177,7 +177,7 @@ final class DashboardModel: ObservableObject {
   /// The one cost of a fused frame that no stage bar covers.
   ///
   /// One, not two. The extract's unaccounted remainder used to sit beside this
-  /// and did not belong: recon publishes it as the `"  ..other"` row, so it is
+  /// and did not belong: Fusion publishes it as the `"  ..other"` row, so it is
   /// already a bar, and listing it here drew it twice and then said it was in
   /// neither. The keyframe import really is outside every span there is.
   @Published var keyframeImportMs: Double = 0
@@ -253,7 +253,7 @@ struct DashboardView: View {
   ///
   /// Static because none of them moves during a run: the far side folds each
   /// from constants -- the occupancy pair through `Fusion::grow_threshold()`,
-  /// which hands back recon's -- so this is a value read once rather than a
+  /// which hands back grid's -- so this is a value read once rather than a
   /// per-tick bridge call.
   private static let thresholds = VolumetricRenderer.gaugeThresholds
 
@@ -490,8 +490,8 @@ struct DashboardView: View {
     }
   }
 
-  /// The end-to-end breakdown: every stage recon reported, then what it did not
-  /// report, then how much of either to believe.
+  /// The end-to-end breakdown: every stage the libraries reported, then what
+  /// they did not report, then how much of either to believe.
   ///
   /// The three parts are separate because they are separately wrong when they
   /// are wrong. The bars are a measurement; the rows beneath them are costs
@@ -532,7 +532,7 @@ struct DashboardView: View {
   /// so a reader summing the column gets a frame cost missing it entirely.
   ///
   /// It is the only one. `extract residual` was listed here too and was never
-  /// outside anything: recon publishes `max(0, extract_ms - extract.total_ms())`
+  /// outside anything: Fusion publishes `max(0, extract_ms - extract.total_ms())`
   /// as the `"  ..other"` stage row, the bridge recomputed the byte-identical
   /// expression into a second field, and this heading then asserted the
   /// opposite of the truth over a figure already drawn as a bar six rows up.

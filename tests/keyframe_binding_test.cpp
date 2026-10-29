@@ -20,7 +20,7 @@ namespace {
 
 namespace app = volumetric_kit::ios_app;
 
-// Look-alikes of recon's YuvImage and gfx's YcbcrPicture: the members, the
+// Look-alikes of sensor's YuvImage and gfx's YcbcrPicture: the members, the
 // defaults and the enumerators the bridge's instantiation uses.
 struct Image {};
 

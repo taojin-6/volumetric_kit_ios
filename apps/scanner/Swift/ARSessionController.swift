@@ -18,8 +18,8 @@ struct TrackingReport {
 ///
 /// Swift owns the session — configuration, capability checks, lifecycle,
 /// and the camera permission prompt UIKit raises on first run — because that is
-/// what Swift is good at and what grows as the app grows. It never touches
-/// recon: each `ARFrame` crosses to `VolumetricCapture`, and everything below
+/// what Swift is good at and what grows as the app grows. It never touches the
+/// libraries: each `ARFrame` crosses to `VolumetricCapture`, and everything below
 /// that is C++.
 final class ARSessionController: NSObject, ARSessionDelegate {
   let capture = VolumetricCapture()

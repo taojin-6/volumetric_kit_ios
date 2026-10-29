@@ -11,10 +11,10 @@
 #
 # volumetric_kit_core's iOS module (its cmake/vkc_ios.cmake, run as the core is
 # added) links it: from MoltenVK_ROOT it sets Vulkan_LIBRARY /
-# Vulkan_INCLUDE_DIR, so every find_package(Vulkan) in volumetric_kit_recon and
-# volumetric_kit_gfx makes Vulkan::Vulkan from MoltenVK's iOS xcframework, and
-# it links MoltenVK's system frameworks into the core's vulkan tier. This file
-# names the platform, the MoltenVK the module takes, and the host tools.
+# Vulkan_INCLUDE_DIR, so every find_package(Vulkan) in the sibling libraries
+# makes Vulkan::Vulkan from MoltenVK's iOS xcframework, and it links MoltenVK's
+# system frameworks into the core's vulkan tier. This file names the platform,
+# the MoltenVK the module takes, and the host tools.
 #
 # Usage:
 #

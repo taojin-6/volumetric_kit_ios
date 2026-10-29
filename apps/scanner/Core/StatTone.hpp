@@ -87,7 +87,7 @@ constexpr StatTone tone_for(double fraction, ToneThresholds t) noexcept {
 ///
 /// Block-table occupancy is deliberately **not** here. Neither of its tiers is
 /// this file's to state -- the critical one is the allocate guard and the warn
-/// one is recon's grow threshold -- so it is derived from both by @ref
+/// one is grid's grow threshold -- so it is derived from both by @ref
 /// occupancy_thresholds, in the header that owns the first and takes the second
 /// as a parameter.
 ///

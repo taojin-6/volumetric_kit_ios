@@ -11,7 +11,7 @@
 /// jetsam headroom will not cover it, a resize that already failed once, and a
 /// fabricated occupancy tripping the allocate guard on a table with room left.
 ///
-/// Neither number these enforce has been re-measured on device since the recon
+/// Neither number these enforce has been re-measured on device since the grid
 /// kernel they guard was repaired (see `kRefuseAllocateAtOccupancy`). That is a
 /// separate debt. What these tests pin is that the guards *behave as
 /// documented* -- which was previously not checkable at all.
@@ -27,11 +27,11 @@ namespace {
 
 namespace app = volumetric_kit::ios_app;
 
-/// recon's `VoxelHashMap::kGrowThreshold`. Restated here, in a test, on
+/// grid's `VoxelHashMap::kGrowThreshold`. Restated here, in a test, on
 /// purpose: the point of `GrowthInputs::grow_threshold` being a field is that
 /// the app never hardcodes it, and a test that took it from the app could not
-/// tell whether the app was still asking recon.
-constexpr float kReconGrowThreshold = 0.7f;
+/// tell whether the app was still asking grid.
+constexpr float kGridGrowThreshold = 0.7f;
 
 /// A scan sitting just past the grow threshold, with a healthy budget and room
 /// below the ceiling: the ordinary "time to double" case.
@@ -39,7 +39,7 @@ app::GrowthInputs due_to_grow() {
   app::GrowthInputs in;
   in.occupancy = 0.75f;
   in.occupancy_known = true;
-  in.grow_threshold = kReconGrowThreshold;
+  in.grow_threshold = kGridGrowThreshold;
   in.num_buckets = 1024;
   in.max_buckets = 32768;
   in.declined_at = 0;
@@ -69,11 +69,11 @@ TEST(GrowthPolicy, GridBytesMatchTheRecordedMeasurement) {
 /// `grid_bytes_for` carried 512 and 12 as literals in its body while
 /// `Fusion::start` configured the grid from its own copies of both -- in a
 /// different directory and a different library, since this one cannot include
-/// recon. `GridBytesMatchTheRecordedMeasurement` above pins the *output*, so it
+/// grid. `GridBytesMatchTheRecordedMeasurement` above pins the *output*, so it
 /// stays green through a fourth attribute or a 16^3 block while the headroom
 /// check silently under-reports the commit by a third or by 8x. This pins the
 /// relationship; the static_assert beside the AttributeSpec table in Fusion.mm
-/// pins the half that has to be checked where recon is visible.
+/// pins the half that has to be checked where grid is visible.
 TEST(GrowthPolicy, GridBytesIsTheProductOfItsNamedFactors) {
   EXPECT_EQ(
       app::kVoxelsPerBlock,
@@ -101,7 +101,7 @@ TEST(GrowthPolicy, GrowTargetDoublesButNeverPassesTheCeiling) {
 
 // --- When to grow ------------------------------------------------------------
 
-TEST(GrowthPolicy, GrowsWhenOccupancyPassesReconsThreshold) {
+TEST(GrowthPolicy, GrowsWhenOccupancyPassesGridsThreshold) {
   const app::GrowthPlan plan = app::plan_growth(due_to_grow());
 
   EXPECT_EQ(plan.action, app::GrowthAction::Resize);
@@ -116,13 +116,13 @@ TEST(GrowthPolicy, LeavesAHealthyTableAlone) {
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
 }
 
-/// The threshold is recon's, and it is compared strictly: sitting *exactly* on
+/// The threshold is grid's, and it is compared strictly: sitting *exactly* on
 /// it is not yet past it. Pinned because the allocate guard below is inclusive
 /// in the other direction, and having the two disagree silently is the kind of
 /// off-by-one that only shows up as a table that grew a frame early.
 TEST(GrowthPolicy, TheThresholdItselfIsNotYetPastIt) {
   app::GrowthInputs in = due_to_grow();
-  in.occupancy = kReconGrowThreshold;
+  in.occupancy = kGridGrowThreshold;
 
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::None);
 }
@@ -143,7 +143,7 @@ TEST(GrowthPolicy, AnUnreadableOccupancyNeverTriggersAGrow) {
 
 /// An omitted threshold means "never grow", not "grow on every fused frame".
 ///
-/// The deleted code named recon's constant inside the condition, so there was
+/// The deleted code named grid's constant inside the condition, so there was
 /// nothing to omit; a field can be. Defaulted to 0.0 it was satisfied at 2%
 /// occupancy -- so a second call site, or a partial copy of the assignment
 /// block in `Fusion::fuse`, would put the `task_info` trap back on the
@@ -515,15 +515,15 @@ TEST(AllocationGuard, AFabricatedOccupancyIsNotAFullVolume) {
   EXPECT_TRUE(app::allocation_stop_text(g.stop).on_errors_row);
 }
 
-/// The band between recon's grow threshold and this app's refusal is the room a
+/// The band between grid's grow threshold and this app's refusal is the room a
 /// doubling needs to land in. Collapsing them would refuse allocation at the
 /// moment growth begins, on a table with plenty of room -- so the ordering is
 /// pinned rather than left to two constants that read as interchangeable.
 TEST(AllocationGuard, LeavesRoomForADoublingToLandIn) {
-  EXPECT_GT(app::kRefuseAllocateAtOccupancy, kReconGrowThreshold);
+  EXPECT_GT(app::kRefuseAllocateAtOccupancy, kGridGrowThreshold);
 
   app::GrowthInputs in = due_to_grow();
-  in.occupancy = (kReconGrowThreshold + app::kRefuseAllocateAtOccupancy) / 2.0f;
+  in.occupancy = (kGridGrowThreshold + app::kRefuseAllocateAtOccupancy) / 2.0f;
 
   EXPECT_EQ(app::plan_growth(in).action, app::GrowthAction::Resize);
   EXPECT_TRUE(app::guard_allocation(in.occupancy, true).allocate);
@@ -532,7 +532,7 @@ TEST(AllocationGuard, LeavesRoomForADoublingToLandIn) {
 /// The tiers the occupancy figure is *reported* against are the two numbers
 /// that decide, not a second pair beside them.
 ///
-/// They were a `{0.7, 0.85}` literal in StatTone.hpp -- restating recon's grow
+/// They were a `{0.7, 0.85}` literal in StatTone.hpp -- restating grid's grow
 /// threshold, which GrowthPolicy.hpp forbids categorically, and the allocate
 /// guard, which it invites re-measuring on the next device pass. They were not
 /// even the same quantity: `(double)0.85f` is 0.85000002384 against a literal
@@ -540,16 +540,16 @@ TEST(AllocationGuard, LeavesRoomForADoublingToLandIn) {
 /// tick and the `occupied` row would all have gone on reddening at 0.85 while
 /// the table allocated normally for another seven points.
 TEST(AllocationGuard, TheReportedTiersAreTheNumbersThatDecide) {
-  const app::ToneThresholds t = app::occupancy_thresholds(kReconGrowThreshold);
+  const app::ToneThresholds t = app::occupancy_thresholds(kGridGrowThreshold);
 
-  EXPECT_EQ(t.warn, static_cast<double>(kReconGrowThreshold));
+  EXPECT_EQ(t.warn, static_cast<double>(kGridGrowThreshold));
   EXPECT_EQ(t.critical, static_cast<double>(app::kRefuseAllocateAtOccupancy));
 
-  // Warn arrives where recon starts growing; red arrives *at* the cliff rather
+  // Warn arrives where grid starts growing; red arrives *at* the cliff rather
   // than after it -- the guard is strict and the tone inclusive, so the table
   // sitting exactly on it still allocates and already reads Critical. That is
   // the direction an alarm should err, and it is now one number, not two.
-  EXPECT_EQ(app::tone_for(static_cast<double>(kReconGrowThreshold), t),
+  EXPECT_EQ(app::tone_for(static_cast<double>(kGridGrowThreshold), t),
             app::StatTone::Warn);
   const double at_cliff = static_cast<double>(app::kRefuseAllocateAtOccupancy);
   EXPECT_EQ(app::tone_for(at_cliff, t), app::StatTone::Critical);

@@ -55,9 +55,9 @@ namespace volumetric_kit::ios_app {
 ///         `com.apple.developer.kernel.extended-virtual-addressing`, which this
 ///         app deliberately does not carry (a personal development team cannot
 ///         provision it). Exhausting *that* one fails an allocation rather than
-///         the process, so it surfaces as a `vkc::Status` out of recon -- which
-///         is what distinguishes the two after the fact: one reports, one does
-///         not.
+///         the process, so it surfaces as a `vkc::Status` out of a library --
+///         which is what distinguishes the two after the fact: one reports, one
+///         does not.
 struct MemoryBudget {
   /// Bytes this process is charged for: `phys_footprint`, the ledger jetsam
   /// compares against the limit.

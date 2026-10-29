@@ -24,7 +24,8 @@
 /// point — six degrees of freedom under three gestures is how a hand-driven
 /// camera ends up rolled onto its side with no obvious way back.
 ///
-/// Pure math and glm, deliberately: no Vulkan, no recon, no Objective-C. It
+/// Pure math and glm, deliberately: no Vulkan, no sibling library, no
+/// Objective-C. It
 /// takes a camera-to-world pose and returns a view matrix, and holds no opinion
 /// about who produced either.
 ///
@@ -76,7 +77,7 @@ class OrbitCamera {
   ///
   /// Call once per frame, in the **OpenGL camera convention** (−Z forward, +Y
   /// up) — the same convention `glm::perspective` and `glm::lookAt` assume.
-  /// recon's poses are CV, so they need `cv_from_gl_camera` on the way in.
+  /// sensor's poses are CV, so they need `cv_from_gl_camera` on the way in.
   ///
   /// Kept even while the user is driving, because it is what a later takeover
   /// is seeded from.

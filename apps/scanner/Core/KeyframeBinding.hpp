@@ -8,7 +8,7 @@
 ///        planes, their size and how they code R'G'B'.
 ///
 /// Pure, so the mapping can be tested on the host: the bridge
-/// (Bridge/AtlasRing.cpp) instantiates it with recon's `YuvImage` and gfx's
+/// (Bridge/AtlasRing.cpp) instantiates it with sensor's `YuvImage` and gfx's
 /// `YcbcrPicture`; a test with look-alikes that have the same members.
 
 #include <optional>
@@ -29,7 +29,7 @@ namespace volumetric_kit::ios_app {
 ///
 /// @tparam Planes    gfx's `YcbcrPicture`: `luma`, `chroma`, `extent` and
 ///                   `coding` (`kr`, `kb`, `full_range`, `chroma_siting`).
-/// @tparam Keyframe  recon's `YuvImage`: `image[2]`, `width`, `height`, `kr`,
+/// @tparam Keyframe  sensor's `YuvImage`: `image[2]`, `width`, `height`, `kr`,
 ///                   `kb`, `full_range` and `chroma_location`.
 /// @param bind        `bool(const Planes&)`: rewrites the set over the planes,
 ///                    or returns false and leaves the set as it was.

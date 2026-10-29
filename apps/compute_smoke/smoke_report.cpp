@@ -7,7 +7,7 @@
 // real driver on real hardware, in four stages that fail independently so a
 // late failure still leaves the earlier evidence on screen.
 //
-// Everything here is plain C++ against recon's and the core's public headers;
+// Everything here is plain C++ against the libraries' public headers;
 // nothing is iOS-specific except that it happens to be running there. main.mm
 // supplies the app shell that displays the report.
 
@@ -26,22 +26,26 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/device_requirements.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/shader.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/camera_params.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/sensor/frame/camera_params.hpp"
 
 namespace vkc = volumetric_kit::core;
 
 namespace vr = volumetric_kit::recon;
-namespace vol = volumetric_kit::recon::volume;
+namespace vgrid = volumetric_kit::grid;
+namespace sensor = volumetric_kit::sensor;
+namespace vol = volumetric_kit::grid::volume;
 namespace tsdf = volumetric_kit::recon::tsdf;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace mesh = volumetric_kit::grid::mesh;
 
 namespace volumetric_kit::ios_app {
 namespace {
@@ -94,9 +98,9 @@ std::string api_version_string(std::uint32_t v) {
 
 // --- Stage 0: what MoltenVK actually exposes on this GPU --------------------
 // The three headline questions for this family on iOS: does the device reach
-// the 1.2 floor recon requires (and the 1.3 floor gfx requires, for the shared
-// device later); is scalarBlockLayout there (recon's whole buffer ABI rests on
-// it); and are timeline semaphores there (the interop-seam handoff).
+// the 1.2 floor grid and recon require (and the 1.3 floor gfx requires, for the
+// shared device later); is scalarBlockLayout there (their whole buffer ABI
+// rests on it); and are timeline semaphores there (the interop-seam handoff).
 //
 // The version is read through a probe instance of its own, not the core's
 // instance the stages below run on. The core asks for Vulkan 1.3 (or the
@@ -208,11 +212,11 @@ void stage_device_caps(Report& report, const vkc::Instance& instance,
   vkGetPhysicalDeviceFeatures2(physical, &features2);
 
   report.check(props.apiVersion >= VK_API_VERSION_1_2,
-               "Vulkan 1.2 (recon's floor)");
+               "Vulkan 1.2 (grid's and recon's floor)");
   report.check(props.apiVersion >= VK_API_VERSION_1_3,
                "Vulkan 1.3 (gfx's floor -- needed for the shared device)");
   report.check(features12.scalarBlockLayout == VK_TRUE,
-               "scalarBlockLayout (recon's host/GLSL buffer ABI)");
+               "scalarBlockLayout (grid's and recon's host/GLSL buffer ABI)");
   report.check(features12.timelineSemaphore == VK_TRUE,
                "timelineSemaphore (the interop-seam handoff)");
   report.check(features13.dynamicRendering == VK_TRUE,
@@ -390,7 +394,7 @@ vol::VoxelGridParams smoke_grid_params() {
 }
 
 // --- Stage 2: the scalar-block-layout ABI -----------------------------------
-// The genuine iOS risk. recon's host PODs (HashEntry, BlockIndex -- both
+// The genuine iOS risk. grid's host PODs (HashEntry, BlockIndex -- both
 // carrying a Vec3i) are byte-identical to their GLSL mirrors only under
 // GL_EXT_scalar_block_layout; std430 would 16-byte-align the vec3 and shift
 // every field. If MoltenVK's iOS SPIR-V -> MSL translation got that wrong, the
@@ -416,7 +420,7 @@ void stage_scalar_abi(Report& report, vkc::Device& device,
   std::vector<vol::BlockIndex> blocks;
   for (int i = 0; i < 8; ++i) {
     vol::BlockIndex b{};
-    b.coord = vr::Vec3i(i - 3, 2 * i + 1, -5 * i);
+    b.coord = vgrid::Vec3i(i - 3, 2 * i + 1, -5 * i);
     blocks.push_back(b);
   }
   // The map allocates from a device list, as a kernel would hand it one, so
@@ -497,7 +501,7 @@ void stage_vertical_slice(Report& report, vkc::Device& device,
   // A 160x120 depth frame at a constant 0.5 m -- a flat wall filling the view.
   // Deliberately close to ARKit's 256x192 sceneDepth resolution rather than a
   // desktop 640x480, so the dispatch shape is representative.
-  vr::DepthCameraParams cam{};
+  sensor::DepthCameraParams cam{};
   cam.width = 160;
   cam.height = 120;
   cam.fx = 130.0f;
@@ -506,14 +510,14 @@ void stage_vertical_slice(Report& report, vkc::Device& device,
   cam.cy = static_cast<float>(cam.height) * 0.5f;
   cam.min_depth = 0.1f;
   cam.max_depth = 5.0f;
-  cam.cam_to_world = vr::Mat4f(1.0f);
+  cam.cam_to_world = sensor::Mat4f(1.0f);
 
   const float plane_z = 0.5f;
   const std::vector<float> depth(
       static_cast<std::size_t>(cam.width) * cam.height, plane_z);
 
   vkc::Result<std::uint32_t> overflow =
-      vbg.map().allocate_from_depth(depth.data(), cam);
+      vbg.map().allocate_from_depth(depth.data(), tsdf::to_depth_pinhole(cam));
   if (!overflow) {
     report.abort_stage("allocate_from_depth: " + overflow.status().message());
     return;
@@ -573,16 +577,17 @@ void stage_vertical_slice(Report& report, vkc::Device& device,
 
 std::string run_smoke_report() {
   Report report;
-  report.line("volumetric_kit_recon -- iOS / MoltenVK smoke");
+  report.line("volumetric_kit grid + recon -- iOS / MoltenVK smoke");
 
   vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     report.abort_stage("Instance::create: " + instance.status().message());
     return report.text();
   }
-  // Any GPU, not one already filtered by recon's requirements: on hardware
-  // short of them, Stage 0's report of what it does have is the evidence this
-  // gate exists for, and Device::create below names the requirement it fails.
+  // Any GPU, not one already filtered by the libraries' requirements: on
+  // hardware short of them, Stage 0's report of what it does have is the
+  // evidence this gate exists for, and Device::create below names the
+  // requirement it fails.
   vkc::Result<vkc::PhysicalDeviceInfo> gpu = instance->select_physical_device();
   if (!gpu) {
     report.abort_stage("select_physical_device: " + gpu.status().message());
@@ -591,11 +596,16 @@ std::string run_smoke_report() {
 
   stage_device_caps(report, instance.value(), gpu->handle());
 
-  // What recon's kernels need: a compute queue, timeline semaphores and
-  // scalar block layout, the ABI every recon shader declares.
-  const vkc::DeviceRequirements reqs = vr::device_requirements();
+  // What grid's and recon's kernels need: a compute queue, timeline semaphores
+  // and scalar block layout, the ABI every one of their shaders declares.
+  vkc::Result<vkc::DeviceRequirements> reqs =
+      vkc::merge(vgrid::device_requirements(), vr::device_requirements());
+  if (!reqs) {
+    report.abort_stage("merge requirements: " + reqs.status().message());
+    return report.text();
+  }
   vkc::Result<vkc::Device> device =
-      vkc::Device::create(instance.value(), gpu.value(), reqs);
+      vkc::Device::create(instance.value(), gpu.value(), reqs.value());
   if (!device) {
     report.abort_stage("Device::create: " + device.status().message());
     return report.text();

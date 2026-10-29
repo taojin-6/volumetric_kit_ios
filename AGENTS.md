@@ -7,24 +7,25 @@ do not duplicate these rules or create a circular reference.
 ## Project and boundaries
 
 `volumetric_kit_ios` is the iOS application shell: ARKit capture →
-`volumetric_kit_recon` fusion → `volumetric_kit_gfx` rendering on MoltenVK.
+`volumetric_kit_recon` fusion on `volumetric_kit_grid` → `volumetric_kit_gfx`
+rendering on MoltenVK, with `volumetric_kit_sensor`'s camera contract.
 This repository owns the app, platform bridge, toolchain, and packaging.
 The libraries remain independent siblings with their own guidance.
 
 - Swift owns the app/UI/lifecycle; Objective-C++ owns the platform bridge;
   C++ owns the engine and host-testable app logic.
-- `apps/scanner/Core/` stays plain C++ over glm: no Vulkan, recon, gfx,
+- `apps/scanner/Core/` stays plain C++ over glm: no Vulkan, sibling library,
   Objective-C, ARKit, or mach dependencies. Keep platform queries in `Bridge/`
   and the decisions made from their results in `Core/`.
 - The bridge presents plain values and `NSError` to Swift. Keep the bridge's
   static-library target separate from the Swift app target under Xcode.
-- Share one `VkDevice` between recon and gfx through the core's
-  `SharedDevice` and each library's adopt. Preserve the documented
-  requirements merge, queue selection, and lifetimes.
-- recon and gfx share volumetric_kit_core's types: write them as the core does,
+- Share one `VkDevice` between the compute libraries (sensor, grid, recon) and
+  gfx through the core's `SharedDevice` and each side's adopt. Preserve the
+  documented requirements merge, queue selection, and lifetimes.
+- The libraries share volumetric_kit_core's types: write them as the core does,
   `vkc::Status`, `vkc::Device`, `VKC_TRY` (`vkc` aliases
-  `volumetric_kit::core`), from the core's headers -- recon's and gfx's own
-  names (`vr::`, `vg::`) only for what each library defines.
+  `volumetric_kit::core`), from the core's headers -- each library's own names
+  (`sensor::`, `vgrid::`, `vr::`, `vg::`) only for what it defines.
 - Include Vulkan through the core's `volumetric_kit/core/vulkan/vulkan.hpp`
   umbrella, never directly through `<vulkan/...>`.
 
@@ -69,7 +70,8 @@ pre-commit run --all-files --show-diff-on-failure
 git -C "$ios_root" diff --check
 ```
 
-The host mode needs no iOS toolchain, MoltenVK, recon, or gfx. Changes to the
+The host mode needs no iOS toolchain, MoltenVK, or sibling library beyond the
+core's config tier. Changes to the
 bridge, Swift, shaders, or app packaging need the iOS build on macOS with Xcode
 and host `glslc` and glm installed (`brew install shaderc glm`):
 
@@ -97,16 +99,18 @@ cmake --build "$ios_root/build-ios" --config Debug -- \
 
 ## Dependency and documentation upkeep
 
-- recon and gfx are pinned by commit in `CMakeLists.txt`. Adopt upstream
-  changes by bumping a pin in its own PR, and say which commits the build used.
-  Both depend on `volumetric_kit_core`, which is declared first so both build
-  against one pinned copy (the core's README); bump it with, or at or after,
-  recon's and gfx's core pins.
+- The core, sensor, grid, recon and gfx are pinned by commit in
+  `CMakeLists.txt`, in that order, each floor at its pin's version
+  ([README build guide](README.md#build)). Adopt upstream changes by bumping a
+  pin in its own PR, and say which commits the build used. The first
+  declaration wins, so every sibling builds against these pins: bump the core
+  at or after every sibling's core pin, and sensor and grid at or after recon's
+  floors for them.
 - Local sibling source overrides use CMake's
-  `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON` / `_VOLUMETRIC_KIT_GFX` /
-  `_VOLUMETRIC_KIT_CORE` options; a local recon or gfx needing a newer core
-  needs the core override too. Keep machine-specific paths out of committed
-  build configuration.
+  `FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_<NAME>` options (`CORE`, `SENSOR`,
+  `GRID`, `RECON`, `GFX`); a local sibling needing a newer core, sensor or grid
+  needs that override too. Keep machine-specific paths out of committed build
+  configuration.
 - Keep shared rules here concise (roughly 100–200 lines). Detailed build,
   architecture, and platform rationale belong in the relevant README section
   or a dedicated supporting document, linked from the task map.

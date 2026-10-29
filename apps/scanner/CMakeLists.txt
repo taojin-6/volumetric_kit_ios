@@ -10,7 +10,7 @@
 # anyway.
 #
 # ~~~
-#   scanner_bridge  Objective-C++ + C++  -- owns Vulkan, recon, gfx
+#   scanner_bridge  Objective-C++ + C++  -- owns Vulkan and the siblings
 #   scanner         Swift                -- owns the app, view, lifecycle
 # ~~~
 #
@@ -118,24 +118,26 @@ function(vi_add_scanner_bridge bridge_target)
   target_include_directories(${bridge_target}
                              PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-  # recon_sensor carries the camera and colour conversions ARKitCapture applies,
-  # and recon_sensor_apple imports the camera pictures the keyframes sample.
-  # recon_tsdf and recon_texture supply fusion; recon_mesh and recon_volume
-  # arrive transitively.
+  # sensor_interface carries the camera and colour conversions ARKitCapture
+  # applies, and sensor_apple imports the camera pictures the keyframes sample.
+  # grid_volume and grid_mesh hold the block grid and Marching Cubes; recon_tsdf
+  # and recon_texture fuse and texture on them.
   #
   # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
   # holds an OrbitCamera by value and hands MemoryBudget across the seam. The
-  # core's vulkan tier is named too, not left to recon's and gfx's links: the
-  # bridge builds the SharedDevice, adopts recon's Device and makes its
-  # Allocator itself.
+  # core's vulkan tier is named too, not left to the siblings' links: the bridge
+  # builds the SharedDevice, adopts the compute Device and makes its Allocator
+  # itself.
   target_link_libraries(
     ${bridge_target}
     PUBLIC vi_core
            volumetric_kit::core_vulkan
            volumetric_kit::gfx_app
            volumetric_kit::gfx_core
-           volumetric_kit::recon_sensor
-           volumetric_kit::recon_sensor_apple
+           volumetric_kit::sensor_interface
+           volumetric_kit::sensor_apple
+           volumetric_kit::grid_volume
+           volumetric_kit::grid_mesh
            volumetric_kit::recon_texture
            volumetric_kit::recon_tsdf
            volumetric_kit::gfx_pipelines

@@ -3,7 +3,7 @@
 
 # vi_core: the scanner's pure logic.
 #
-# Everything here is plain C++ over glm -- no Vulkan, no recon, no gfx, no
+# Everything here is plain C++ over glm -- no Vulkan, no sibling library, no
 # Objective-C, no ARKit, no mach. That is a deliberate boundary rather than an
 # accident of what happened to have no dependencies: it is what makes this the
 # one part of the app a host can build and a test can run, on a repo whose CI

@@ -7,7 +7,7 @@
 /// @brief The keyframes the textured mesh samples, one per mesh slot.
 ///
 /// Each keyframe is the camera's picture where it is: ARKit's `capturedImage`,
-/// its two planes imported by recon's `PixelBufferImporter` and sampled by
+/// its two planes imported by sensor's `PixelBufferImporter` and sampled by
 /// gfx's texture set, with no copy. A ring rather than one set for the same
 /// reason the mesh slots are a ring: a slot's set is rewritten, and its old
 /// picture let go, only once no pending frame has bound it. Indexed by
@@ -20,7 +20,7 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
-#include "volumetric_kit/recon/sensor/yuv_image.hpp"
+#include "volumetric_kit/sensor/yuv_image.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -35,7 +35,7 @@ inline constexpr std::size_t kRingSlots = 3;
 
 /// @brief A keyframe: the camera picture's two plane images and how they code
 ///        R'G'B'. The images hold the picture's pixel buffer.
-using Keyframe = volumetric_kit::recon::sensor::YuvImage;
+using Keyframe = volumetric_kit::sensor::YuvImage;
 
 /// @brief One mesh slot's keyframe.
 struct AtlasSlot {
