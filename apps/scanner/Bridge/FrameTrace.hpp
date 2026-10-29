@@ -36,9 +36,9 @@ namespace volumetric_kit::ios_app {
 struct FrameTrace {
   struct Entry {
     std::uint64_t frame = 0;
-    std::uint64_t generation = 0;  // recon generation this frame drew
+    std::uint64_t generation = 0;  // grid generation this frame drew
     std::size_t mesh_slot = 0;
-    std::uint64_t released_through = 0;  // what we told recon it may reuse
+    std::uint64_t released_through = 0;  // what we told grid it may reuse
     std::uint32_t triangles = 0;
     std::uint32_t triangle_capacity = 0;
     std::uint64_t arena_bytes = 0;  // grew? compare against the previous entry

@@ -6,11 +6,11 @@
 ///        thread polls.
 ///
 /// This is the driver the 2026-08-02 sensor-tier decision placed *here* rather
-/// than in recon: ARKit is iOS-only Objective-C and needs LiDAR hardware to
-/// exercise, so recon's CI could neither build nor test it. What recon keeps is
-/// the arithmetic — `cv_from_gl_camera` and `depth_from_registered_color`,
-/// pinned by host tests — and this file is the platform plumbing that feeds
-/// them.
+/// than in the library: ARKit is iOS-only Objective-C and needs LiDAR hardware
+/// to exercise, so the library's CI could neither build nor test it. What
+/// volumetric_kit_sensor keeps is the arithmetic — `cv_from_gl_camera` and
+/// `depth_from_registered_color`, pinned by host tests — and this file is the
+/// platform plumbing that feeds them.
 ///
 /// Swift owns the `ARSession` (configuration, permissions, lifecycle) and hands
 /// each `ARFrame` across; the conversion to a `CapturedFrame` happens on this
@@ -32,7 +32,7 @@ typedef struct {
   uint64_t frames_polled;   ///< Frames a consumer actually took.
   uint64_t frames_dropped;  ///< Superseded before anyone polled them.
   /// Frames that carried depth but could not be converted -- an unreadable
-  /// pixel buffer, or intrinsics recon refused. Counted rather than dropped on
+  /// pixel buffer, or intrinsics sensor refused. Counted rather than dropped on
   /// the floor, so a persistent failure reads as a rising number instead of a
   /// submitted count stuck at zero.
   uint64_t frames_rejected;

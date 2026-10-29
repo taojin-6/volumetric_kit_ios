@@ -1,10 +1,10 @@
 # Formatting + hygiene hooks. Run once after cloning:
 #   pre-commit install
 #
-# Mirrors volumetric_kit_recon's and volumetric_kit_gfx's configuration so the
-# three siblings format identically -- same pinned clang-format, same
-# cmake-format, same .clang-format / .cmake-format.yaml -- plus a Swift hook,
-# which is this repo's own concern.
+# Mirrors the sibling libraries' configuration so the family formats
+# identically -- same pinned clang-format, same cmake-format, same
+# .clang-format / .cmake-format.yaml -- plus a Swift hook, which is this repo's
+# own concern.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -71,14 +71,3 @@ repos:
         entry: '^\s*#\s*include\s*[<"]vulkan/'
         language: pygrep
         files: \.(h|hpp|hxx|inl|ipp|c|cc|cpp|cxx|m|mm)$
-
-# pre-commit.ci (https://pre-commit.ci) runs the hooks it can on every PR and
-# pushes auto-fixes back to the branch. It runs on Linux, so the swift-format
-# hook is skipped there -- CI's own macOS lint job is the gate that actually
-# enforces it.
-ci:
-  autofix_prs: true
-  autofix_commit_msg: "style: auto-fixes from pre-commit.ci hooks"
-  autoupdate_schedule: monthly
-  autoupdate_commit_msg: "chore: pre-commit autoupdate"
-  skip: [swift-format]

@@ -26,7 +26,8 @@ float ms_since(Clock::time_point t0) {
 
 /// The stage labels this file seeds, restated from the tiers that report them.
 ///
-/// Restated rather than pointed at because recon has no constants to point at:
+/// Restated rather than pointed at because the libraries have no constants to
+/// point at:
 /// each tier passes its own literal, and `StageMetrics` matches rows by string
 /// **content** precisely so a label named from two places still lands in one
 /// row. That is what lets this file seed a row whose timing happens inside the
@@ -60,36 +61,37 @@ struct ChangedBlocks {
 };
 
 /// A copy of the helper of the same name in recon's
-/// `examples/fuse_replica/main.cpp`, which is what lets this survey claim the
-/// same number as that harness's `--dirty-every`. recon exports neither the
-/// helper nor a count, so the two are kept in step by hand: the guards, the
-/// slot rule and `tick_after` are recon's, and the early return and the
+/// `examples/common/remesh_report.hpp`, which is what lets this survey claim
+/// the same number as `fuse_replica`'s `fusion.dirty_every`. recon exports
+/// neither the helper nor a count, so the two are kept in step by hand: the
+/// guards and the slot rule are recon's, `tick_after` is grid's, and the early
+/// return and the
 /// `reserve` are this copy's own, neither of which changes the answer.
 vkc::Result<ChangedBlocks> changed_since(
-    const vr::volume::VoxelBlockGrid& grid,
-    const std::vector<vr::volume::BlockIndex>& active, std::uint32_t since) {
+    const vgrid::volume::VoxelBlockGrid& grid,
+    const std::vector<vgrid::volume::BlockIndex>& active, std::uint32_t since) {
   const auto vpb = static_cast<std::uint32_t>(grid.grid().voxels_per_block);
   if (vpb == 0) {
     return vkc::Status::invalid_argument(
         "changed_since: voxels_per_block is 0");
   }
-  vkc::Result<std::vector<vr::volume::BlockStamp>> read =
+  vkc::Result<std::vector<vgrid::volume::BlockStamp>> read =
       grid.map().read_block_stamps();
   if (!read) {
     return read.status();
   }
-  const std::vector<vr::volume::BlockStamp>& stamps = read.value();
+  const std::vector<vgrid::volume::BlockStamp>& stamps = read.value();
   // A slot past the stamps counts as changed, as the extract's kernel has it.
-  const auto is_changed = [&](const vr::volume::BlockIndex& b) {
+  const auto is_changed = [&](const vgrid::volume::BlockIndex& b) {
     const std::size_t slot = static_cast<std::uint32_t>(b.ptr) / vpb;
     return slot >= stamps.size() ||
-           vr::volume::tick_after(stamps[slot].changed, since);
+           vgrid::volume::tick_after(stamps[slot].changed, since);
   };
   // Counted first, so the set is sized once and the steady state on a
   // converged surface -- nothing changed -- skips the dilation's eight lookups
   // per active block outright.
   std::size_t count = 0;
-  for (const vr::volume::BlockIndex& b : active) {
+  for (const vgrid::volume::BlockIndex& b : active) {
     count += is_changed(b) ? 1 : 0;
   }
   ChangedBlocks out;
@@ -97,7 +99,7 @@ vkc::Result<ChangedBlocks> changed_since(
     return out;
   }
   // 21 bits an axis, through unsigned casts since coordinates go negative.
-  const auto key = [](const vr::Vec3i& c) {
+  const auto key = [](const vgrid::Vec3i& c) {
     constexpr std::uint64_t kMask = (std::uint64_t{1} << 21) - 1;
     return ((std::uint64_t{static_cast<std::uint32_t>(c.x)} & kMask) << 42) |
            ((std::uint64_t{static_cast<std::uint32_t>(c.y)} & kMask) << 21) |
@@ -105,17 +107,17 @@ vkc::Result<ChangedBlocks> changed_since(
   };
   std::unordered_set<std::uint64_t> changed;
   changed.reserve(count);
-  for (const vr::volume::BlockIndex& b : active) {
+  for (const vgrid::volume::BlockIndex& b : active) {
     if (is_changed(b)) {
       changed.insert(key(b.coord));
     }
   }
   out.changed = static_cast<std::uint32_t>(changed.size());
-  for (const vr::volume::BlockIndex& b : active) {
+  for (const vgrid::volume::BlockIndex& b : active) {
     bool hit = false;
     for (int d = 0; d < 8 && !hit; ++d) {
       hit = changed.count(
-                key(b.coord + vr::Vec3i(d & 1, (d >> 1) & 1, d >> 2))) != 0;
+                key(b.coord + vgrid::Vec3i(d & 1, (d >> 1) & 1, d >> 2))) != 0;
     }
     out.remesh += hit ? 1u : 0u;
   }
@@ -127,7 +129,7 @@ vkc::Result<ChangedBlocks> changed_since(
 vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
                           const FusionConfig& config) {
   // Refused, not clamped, and refused here rather than trusted from the caller.
-  // At one slot recon reuses a single arena in place and `release_through`
+  // At one slot grid reuses a single arena in place and `release_through`
   // changes no behaviour -- so every DeviceMesh this class publishes would be
   // valid only until the next extract, while the renderer draws it. The failure
   // is a destroyed VkBuffer under a live draw, which raises no Status and no
@@ -136,7 +138,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   if (config.mesh_slots < kMinMeshSlots) {
     return vkc::Status::invalid_argument(
         "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
-        ", which switches recon's slot-release contract off; Published::mesh "
+        ", which switches grid's slot-release contract off; Published::mesh "
         "borrows the extractor's buffers, so it needs at least " +
         std::to_string(kMinMeshSlots) +
         " (and the consumer's frames in flight "
@@ -188,7 +190,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     history_next_ = 0;
     // With the same reasoning: a new scan must not hand out the previous one's
     // keyframe.
-    published_keyframe_ = vr::sensor::YuvImage{};
+    published_keyframe_ = sensor::YuvImage{};
     // ...and the mesh half with it, which is the same argument and the more
     // dangerous omission. Clearing only the keyframe left the pair internally
     // asymmetric: `mesh_` still named the *previous* scan's DeviceMesh, whose
@@ -200,13 +202,13 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     //
     // `consumer_released_` goes too, and for its own reason: it is a monotonic
     // high-water mark over the *old* extractor's generations, and carrying it
-    // into a new one would hand recon a release covering slots the fresh
+    // into a new one would hand grid a release covering slots the fresh
     // extractor has not written yet on its very first remesh.
     //
     // `published_taken_ = true` rather than false -- it is the member's own
     // default and it means "nothing outstanding", which is exactly the state a
     // scan starts in. False would claim a mesh is waiting to be collected.
-    mesh_ = vr::mesh::DeviceMesh{};
+    mesh_ = vgrid::mesh::DeviceMesh{};
     published_generation_ = 0;
     published_taken_ = true;
     consumer_released_ = 0;
@@ -255,7 +257,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   declined_grow_to_ = 0;
   declined_grow_bytes_ = 0;
 
-  vr::volume::VoxelGridParams grid{};
+  vgrid::volume::VoxelGridParams grid{};
   grid.voxel_size = config.voxel_size;
   grid.block_size = kBlockEdgeVoxels;
   grid.voxels_per_block = kVoxelsPerBlock;
@@ -265,7 +267,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   // Through the same helper the four *reporting* sites use, which is the one
   // that was left open-coded when they moved. A `table_blocks_for` that gained
   // a term would otherwise update every sentence about the block count and not
-  // the number recon is actually given, and the read-out's denominator would
+  // the number grid is actually given, and the read-out's denominator would
   // quote a capacity the grid does not have.
   grid.num_blocks =
       static_cast<std::int32_t>(table_blocks_for(config.num_buckets));
@@ -274,11 +276,12 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   // tsdf + weight are what the integrator writes; color is what makes the
   // reconstruction look like the room rather than a grey shell, and marching
   // cubes interpolates it into Vertex::color for gfx's hybrid path.
-  const vr::volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                             {"weight", sizeof(float)},
-                                             {"color", sizeof(std::uint32_t)}};
+  const vgrid::volume::AttributeSpec attrs[] = {
+      {"tsdf", sizeof(float)},
+      {"weight", sizeof(float)},
+      {"color", sizeof(std::uint32_t)}};
   // The link `grid_bytes_for` cannot make for itself. It lives in vi_core,
-  // which cannot include recon, so its per-voxel figure and this table are in
+  // which cannot include grid, so its per-voxel figure and this table are in
   // different libraries; here is the one scope that sees both. A fourth
   // attribute added above without moving the constant would leave the headroom
   // check under-reporting the commit by a third -- and that check is what
@@ -288,8 +291,8 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
       sizeof(float) + sizeof(float) + sizeof(std::uint32_t) ==
           static_cast<std::size_t>(kAttributeBytesPerVoxel),
       "kAttributeBytesPerVoxel and this AttributeSpec table disagree");
-  vkc::Result<vr::volume::VoxelBlockGrid> made =
-      vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 3);
+  vkc::Result<vgrid::volume::VoxelBlockGrid> made =
+      vgrid::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 3);
   if (!made) {
     return made.status();
   }
@@ -306,9 +309,9 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   }
   integrator_.emplace(std::move(integrator).value());
 
-  vkc::Result<vr::mesh::MarchingCubes> mc =
-      vr::mesh::MarchingCubes::create(device, allocator, [&] {
-        vr::mesh::MarchingCubesConfig mc_config;
+  vkc::Result<vgrid::mesh::MarchingCubes> mc =
+      vgrid::mesh::MarchingCubes::create(device, allocator, [&] {
+        vgrid::mesh::MarchingCubesConfig mc_config;
         // The renderer binds these buffers as geometry rather than being handed
         // a host copy, so it needs its own usage bits on the same allocation --
         // only it knows which, which is why this tier takes them.
@@ -316,7 +319,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
         mc_config.extra_index_usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
         // In-block vertex sharing: one vertex where the cells meeting on an
         // edge would each have emitted their own, instead of three private ones
-        // per triangle. Selects recon's second sparse kernel at create().
+        // per triangle. Selects grid's second sparse kernel at create().
         //
         // On together with FusionConfig::texture, which is a change from what
         // this comment used to say and is deliberate. The old pairing was:
@@ -369,10 +372,10 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   // shared with the renderer's family, which samples them.
   importer_.reset();
   if (config.texture) {
-    vkc::Result<vr::sensor::PixelBufferImporter> importer =
-        vr::sensor::PixelBufferImporter::create(device, "keyframe import",
-                                                config.queue_families,
-                                                config.queue_family_count);
+    vkc::Result<sensor::PixelBufferImporter> importer =
+        sensor::PixelBufferImporter::create(device, "keyframe import",
+                                            config.queue_families,
+                                            config.queue_family_count);
     if (!importer) {
       return importer.status();
     }
@@ -409,10 +412,10 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // wall-clock span around a fence-blocked submit can show.
   //
   // Every call below passes `metrics`, never `&stages`: null is what makes
-  // FusionConfig::measure_stages an actual switch, because recon measures
-  // nothing *and takes its untimed submit path* on a null. Passing the address
-  // unconditionally would leave a per-dispatch query-pool round trip armed at
-  // capture rate with no way to turn it off short of a rebuild.
+  // FusionConfig::measure_stages an actual switch, because the libraries
+  // measure nothing *and take their untimed submit path* on a null. Passing the
+  // address unconditionally would leave a per-dispatch query-pool round trip
+  // armed at capture rate with no way to turn it off short of a rebuild.
   vkc::StageMetrics stages;
   vkc::StageMetrics* metrics = config_.measure_stages ? &stages : nullptr;
   if (metrics != nullptr) {
@@ -421,7 +424,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // makes a live read-out unreadable -- and worse in a chart indexed by
     // position, where the series silently relabel instead. The two that need it
     // most are the ones a frame routinely skips: `allocate` is short-circuited
-    // whole by the occupancy guard below, so recon never reaches its own seed,
+    // whole by the occupancy guard below, so grid never reaches its own seed,
     // and `resize` runs a handful of times in a scan's life.
     //
     // Seeded in report order, which is why the breakdown is named here rather
@@ -469,7 +472,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // --- How full is the table, right now? -----------------------------------
   //
   // `VoxelHashMap::load_factor` -- a 4-byte read of the mapped heap counter,
-  // which recon added as the constant-time reading a per-frame caller can
+  // which grid offers as the constant-time reading a per-frame caller can
   // afford. Both guards below used `stats_.extract.active_blocks` instead,
   // which only a *successful extract* refreshes, so a persistent extract
   // failure froze the numerator while the real table went on filling and the
@@ -522,7 +525,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // Measured on an M5 iPad Pro at 1 cm voxels: at 7809 of 8192 blocks the
   // allocate dispatch went 1.2 ms -> 3.1 ms -> 4.2 ms over ~65 frames, dropped
   // the capture to 45 fps, and then hung the GPU outright --
-  // kIOGPUCommandBufferCallbackErrorHang on recon's queue, which took gfx's
+  // kIOGPUCommandBufferCallbackErrorHang on the compute queue, which took gfx's
   // queue down with it as kIOGPUCommandBufferCallbackErrorInnocentVictim and
   // surfaced as VK_ERROR_DEVICE_LOST from the next vkWaitForFences.
   //
@@ -532,19 +535,19 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // The reactive path below stays as a backstop for a frame that fills the
   // table faster than one doubling absorbs.
   // The decision itself is in Core/GrowthPolicy.hpp -- occupancy against
-  // recon's threshold, the ceiling, a size already refused, and whether the
+  // grid's threshold, the ceiling, a size already refused, and whether the
   // jetsam headroom covers the transient. It is pure, so it is host tested;
   // what stays here is the `resize` it authorises and the sentences that quote
   // its figures back to the reader.
   //
-  // recon's threshold is *passed in*, not restated: the map's header gives that
+  // grid's threshold is *passed in*, not restated: the map's header gives that
   // figure as the occupancy a caller should grow at rather than run past, and
   // says outright that an embedder refusing at its own threshold ends up
   // disagreeing with the library it is guarding.
   GrowthInputs growth;
   growth.occupancy = occupancy;
   growth.occupancy_known = occupancy_known;
-  growth.grow_threshold = vr::volume::VoxelHashMap::kGrowThreshold;
+  growth.grow_threshold = vgrid::volume::VoxelHashMap::kGrowThreshold;
   growth.num_buckets = config_.num_buckets;
   growth.max_buckets = config_.max_buckets;
   growth.declined_at = preemptive_grow_failed_at_;
@@ -617,7 +620,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     case GrowthAction::Resize: {
       const std::int32_t grown_to = plan.grow_to;
       const vkc::Status grown = [&] {
-        // Its own row, because nothing else covers it. recon's `allocate` row
+        // Its own row, because nothing else covers it. grid's `allocate` row
         // spans `allocate_from_depth`'s own dispatches and voxel_hash_map.hpp
         // says so where it documents that row, directing a caller to give a
         // resize between retries a row of its own. This is the *other* doubling
@@ -661,7 +664,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
 
   // --- Refuse to allocate into a table with no room left --------------------
   //
-  // The threshold, why it is not recon's grow threshold, and the two causes it
+  // The threshold, why it is not grid's grow threshold, and the two causes it
   // separates are all in Core/GrowthPolicy.hpp, where a host test can reach
   // them -- including the one that matters most and is hardest to produce on a
   // device: a fabricated occupancy tripping the guard on a table with room
@@ -672,12 +675,14 @@ void Fusion::fuse(const CapturedFrame& frame) {
 
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
-  vr::volume::AllocFailures failures;
+  vgrid::volume::AllocFailures failures;
+  // grid's own pinhole, the frame's depth camera field for field.
+  const vgrid::volume::DepthPinhole depth_pinhole =
+      vr::tsdf::to_depth_pinhole(frame.depth_camera);
   vkc::Result<std::uint32_t> overflow =
-      table_exhausted
-          ? vkc::Result<std::uint32_t>(0u)
-          : grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
-                                             &failures, metrics);
+      table_exhausted ? vkc::Result<std::uint32_t>(0u)
+                      : grid_->map().allocate_from_depth(
+                            frame.depth, depth_pinhole, &failures, metrics);
   // Whether this frame took no new geometry in, by either route. The guard
   // above is one of them; the reactive loop below hitting the ceiling, or
   // running out of per-frame grow budget with blocks still dropped, is the
@@ -794,7 +799,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // reports success.
     // Accumulates into the same "allocate" row: a frame that resizes and
     // re-allocates reports what it actually cost, not just the last attempt.
-    overflow = grid_->map().allocate_from_depth(frame.depth, frame.depth_camera,
+    overflow = grid_->map().allocate_from_depth(frame.depth, depth_pinhole,
                                                 &failures, metrics);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -968,7 +973,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // -- so an off switch costs the device column and no timing at all.
   if (metrics != nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Copied whole rather than picked apart: every field recon adds to a row
+    // Copied whole rather than picked apart: every field the core adds to a row
     // arrives without a lockstep edit here, and the read-out reads the same
     // rows the bridge publishes -- one source, not two that can disagree.
     stats_.stage_count = 0;
@@ -1025,7 +1030,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // so appending these in the block above published the *previous* remesh's
     // phases as this frame's, unmarked. Above, they are fresh by construction.
     //
-    // They do not report through StageMetrics -- recon wired
+    // They do not report through StageMetrics -- the libraries wired
     // volume/tsdf/texture and left mesh's GPU column for later -- so these come
     // from ExtractTimings and carry `has_gpu = false`. That is honest rather
     // than unfortunate: the rows without a device half are exactly the part of
@@ -1051,7 +1056,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     push_stage("  ..readback", stats_.extract.readback_ms);
     // The residual, published rather than left implicit -- the same six cells
     // the text summary carries, for the reason it gives: these phases do not
-    // sum to `extract_ms` and never did. recon's spans open after the slot
+    // sum to `extract_ms` and never did. grid's spans open after the slot
     // claim and close before the O(active_blocks) teardown of the neighbour
     // table, so the gap grows with the scan. That is the one direction in which
     // an unlabelled remainder is misread as rounding, and on the panel it read
@@ -1213,7 +1218,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
       survey_error =
           "dirty survey: blocks were removed in this window, so the stamps do "
           "not cover every block a remove leaves to re-mesh";
-    } else if (vkc::Result<std::vector<vr::volume::BlockIndex>> all =
+    } else if (vkc::Result<std::vector<vgrid::volume::BlockIndex>> all =
                    grid_->map().compact_active_blocks();
                !all) {
       survey_error = "dirty survey (compact): " + all.status().message();
@@ -1268,7 +1273,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
 }
 
 void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
-  // --- Hand the consumer's release to recon, on this thread -----------------
+  // --- Hand the consumer's release to grid, on this thread ------------------
   //
   // `MarchingCubes::release_through` is not atomic, and its header makes
   // serializing it against the extracting thread a caller obligation: calling
@@ -1277,7 +1282,7 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // output slot is still outstanding" -- which then freezes the occupancy guard
   // in `fuse` and is self-sustaining. So `Fusion::release_through` only records
   // the mark, and it is applied here, on the fuse thread. Nothing else in this
-  // class touches the extractor, so recon sees exactly one thread.
+  // class touches the extractor, so grid sees exactly one thread.
   //
   // *Before* the extract, not after. This release is what makes room for the
   // extract below; running it afterwards kept the ring permanently one slot
@@ -1300,11 +1305,11 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // It still holds its slot, and freeing that slot is not something this side
   // can do: `release_through` is a monotonic high-water mark, so releasing the
   // uncollected generation retires every *older* one with it -- including the
-  // generations the renderer's in-flight frames are drawing out of. recon
+  // generations the renderer's in-flight frames are drawing out of. grid
   // reclaims one, a grow frees its buffers outright (`vmaDestroyBuffer`, no
   // fence wait), and the live `vkCmdDrawIndexedIndirect` reads a destroyed
   // VkBuffer: VK_ERROR_DEVICE_LOST, which is the fault this seam was built to
-  // remove. recon does have a single-slot primitive for this and keeps it
+  // remove. grid does have a single-slot primitive for this and keeps it
   // private (`free_slot_of`), precisely because the high-water mark is the
   // consumer's to move and not the producer's.
   //
@@ -1319,8 +1324,8 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   }
 
   const auto t_extract = Clock::now();
-  vr::mesh::ExtractTimings extract_timings{};
-  vkc::Result<vr::mesh::DeviceMesh> device_mesh =
+  vgrid::mesh::ExtractTimings extract_timings{};
+  vkc::Result<vgrid::mesh::DeviceMesh> device_mesh =
       marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
   if (!device_mesh) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1369,7 +1374,7 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // Outside the publish mutex: `mutex_` is the lock the main thread takes
   // several times per rendered frame, and the first picture on a camera
   // surface waits on a submit.
-  vr::sensor::YuvImage keyframe = frame.picture_coding;
+  sensor::YuvImage keyframe = frame.picture_coding;
   float keyframe_import_ms = 0.0f;
   bool imported = false;
   if (config_.texture && frame.picture != nullptr && importer_) {
@@ -1415,7 +1420,7 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // dispatch lands, and this file asks for shared vertices (see start()).
   // Dropping the keyframe here lets its picture go back to the camera.
   if (!textured_ok) {
-    keyframe = vr::sensor::YuvImage{};
+    keyframe = sensor::YuvImage{};
   }
 
   // No host copy of the GEOMETRY. The renderer draws those very buffers --
@@ -1440,7 +1445,7 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   stats_.vertices = device_mesh.value().vertex_count;
   stats_.triangles = device_mesh.value().triangle_count;
   stats_.extract_ms = extract_ms;
-  // recon's struct, whole -- not a field-by-field transcription. `extract_ms`
+  // grid's struct, whole -- not a field-by-field transcription. `extract_ms`
   // above is this call measured from here; this is what it decomposes into.
   // See FusionStats::extract for why the copy is one assignment.
   stats_.extract = extract_timings;
@@ -1497,15 +1502,15 @@ std::optional<Fusion::Published> Fusion::take_mesh(
   // place. Moved, not copied: the consumer holds the picture from here, and a
   // copy kept here would hold a camera buffer nothing will sample again.
   out.keyframe = std::move(published_keyframe_);
-  published_keyframe_ = vr::sensor::YuvImage{};
+  published_keyframe_ = sensor::YuvImage{};
   return out;
 }
 
 void Fusion::release_through(std::uint64_t generation) {
   std::lock_guard<std::mutex> lock(mutex_);
-  // Recorded, not forwarded. recon's extractor is touched by the fuse thread
+  // Recorded, not forwarded. grid's extractor is touched by the fuse thread
   // and only the fuse thread; `remesh` applies this at the top of its next run.
-  // Forwarding from here would race `extract_device` -- recon's header names
+  // Forwarding from here would race `extract_device` -- grid's header names
   // that a caller obligation rather than making the member atomic -- and the
   // repair that would keep the call here, holding this mutex across the
   // extract, blocks the caller for a whole extract. The caller is the render
@@ -1535,7 +1540,7 @@ float Fusion::occlusion_threshold() const {
 }
 
 float Fusion::grow_threshold() noexcept {
-  return vr::volume::VoxelHashMap::kGrowThreshold;
+  return vgrid::volume::VoxelHashMap::kGrowThreshold;
 }
 
 void Fusion::note_error(std::string_view message,
@@ -1547,7 +1552,7 @@ void Fusion::note_error(std::string_view message,
   // no secondary exception may escape the worker's error handler.
 }
 
-vr::Mat4f Fusion::last_pose() const {
+sensor::Mat4f Fusion::last_pose() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return last_pose_;
 }

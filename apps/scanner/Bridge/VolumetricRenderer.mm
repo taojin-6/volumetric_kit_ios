@@ -80,54 +80,59 @@
 // vkc::StageRow, named directly by -initWithRow: and by the read-out's row
 // loop. Reached transitively through Fusion.hpp today, which is the pattern the
 // <cstdio> note above records going wrong: pruning that header's includes, or
-// recon relocating the type, breaks this file with an unknown-type error in a
-// translation unit nobody edited.
+// a library relocating the type, breaks this file with an unknown-type error in
+// a translation unit nobody edited.
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/device_requirements.hpp"
 #include "volumetric_kit/core/vulkan/shared_device.hpp"
 #include "volumetric_kit/core/vulkan/vk_result.hpp"
 #include "volumetric_kit/gfx/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/sensor/camera_conventions.hpp"
+#include "volumetric_kit/sensor/camera_conventions.hpp"
+#include "volumetric_kit/sensor/frame/device_requirements.hpp"
 
 namespace vkc = volumetric_kit::core;
 
 namespace vg = volumetric_kit::gfx;
+namespace vgrid = volumetric_kit::grid;
 namespace vr = volumetric_kit::recon;
+namespace sensor = volumetric_kit::sensor;
 namespace app = volumetric_kit::ios_app;
 
-// --- The recon/gfx vertex layout, pinned across repos ------------------------
-// This TU is the only place `recon::mesh::Vertex` and `gfx::assets::Vertex` are
+// --- The grid/gfx vertex layout, pinned across repos -------------------------
+// This TU is the only place `grid::mesh::Vertex` and `gfx::assets::Vertex` are
 // both visible, which makes it the only place they can be compared. Each repo
-// pins its own struct against its own literals -- recon in mesh.hpp, gfx in
+// pins its own struct against its own literals -- grid in mesh.hpp, gfx in
 // hybrid_mesh_pipeline.cpp -- and neither pins against the other, so a
 // self-consistent change on either side satisfies its own asserts and lands.
 //
 // These assertions used to be justified by a host `memcpy` and were removed
 // with it. That is exactly backwards: under interop seam B nothing is copied,
 // gfx builds its vertex input description from *its* offsets and
-// vkCmdDrawIndexedIndirect reads *recon's* buffer through them. A repacked or
-// reordered vertex is then read at the wrong offsets with no size mismatch to
+// vkCmdDrawIndexedIndirect reads *grid's* buffer through them. A vertex whose
+// fields moved is then read at the wrong offsets with no size mismatch to
 // catch it -- garbage positions and normals, no compile error, no Status, no
 // validation message. The siblings track `main` unpinned, so a broken pairing
 // arrives on an ordinary upstream commit; this is what turns it into a build
 // failure naming the field that moved.
 namespace {
-using RVertex = vr::mesh::Vertex;
-using GVertex = vg::assets::Vertex;
-static_assert(sizeof(RVertex) == sizeof(GVertex),
-              "recon and gfx vertex layouts have diverged: size");
-static_assert(offsetof(RVertex, position) == offsetof(GVertex, position),
-              "recon and gfx vertex layouts have diverged: position");
-static_assert(offsetof(RVertex, normal) == offsetof(GVertex, normal),
-              "recon and gfx vertex layouts have diverged: normal");
-static_assert(offsetof(RVertex, tangent) == offsetof(GVertex, tangent),
-              "recon and gfx vertex layouts have diverged: tangent");
-static_assert(offsetof(RVertex, uv0) == offsetof(GVertex, uv0),
-              "recon and gfx vertex layouts have diverged: uv0");
-static_assert(offsetof(RVertex, color) == offsetof(GVertex, color),
-              "recon and gfx vertex layouts have diverged: color");
-static_assert(std::is_standard_layout<RVertex>::value &&
-                  std::is_standard_layout<GVertex>::value,
+using GridVertex = vgrid::mesh::Vertex;
+using GfxVertex = vg::assets::Vertex;
+static_assert(sizeof(GridVertex) == sizeof(GfxVertex),
+              "grid and gfx vertex layouts have diverged: size");
+static_assert(offsetof(GridVertex, position) == offsetof(GfxVertex, position),
+              "grid and gfx vertex layouts have diverged: position");
+static_assert(offsetof(GridVertex, normal) == offsetof(GfxVertex, normal),
+              "grid and gfx vertex layouts have diverged: normal");
+static_assert(offsetof(GridVertex, tangent) == offsetof(GfxVertex, tangent),
+              "grid and gfx vertex layouts have diverged: tangent");
+static_assert(offsetof(GridVertex, uv0) == offsetof(GfxVertex, uv0),
+              "grid and gfx vertex layouts have diverged: uv0");
+static_assert(offsetof(GridVertex, color) == offsetof(GfxVertex, color),
+              "grid and gfx vertex layouts have diverged: color");
+static_assert(std::is_standard_layout<GridVertex>::value &&
+                  std::is_standard_layout<GfxVertex>::value,
               "offsetof above requires standard-layout vertex types");
 }  // namespace
 
@@ -156,10 +161,10 @@ namespace {
 // Allocator refuses new device memory past a heap's budget. MoltenVK 1.4.2
 // reports this value as the unified heap's budget on iOS 16+, against
 // `currentAllocatedSize` as its usage (read off the linked libMoltenVK.a), so
-// recon's and gfx's allocations fail as over-budget when Metal's total would
-// cross it -- a `vkc::Status` on the stage that asked, not a jetsam. Read from
-// Metal rather than from the allocators' HeapStats all the same: the same
-// number, without needing a device to exist.
+// the compute libraries' and gfx's allocations fail as over-budget when Metal's
+// total would cross it -- a `vkc::Status` on the stage that asked, not a
+// jetsam. Read from Metal rather than from the allocators' HeapStats all the
+// same: the same number, without needing a device to exist.
 //
 // Cached: iOS has one GPU and this value does not move, so the device is
 // created once rather than at the polling rate. `recommendedMaxWorkingSetSize`
@@ -284,17 +289,33 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // linked MoltenVK does not.
   shared_config.instance.extensions = {VK_KHR_SURFACE_EXTENSION_NAME,
                                        VK_EXT_METAL_SURFACE_EXTENSION_NAME};
-  // Object names and command labels in Debug only. recon labels its kernel
-  // dispatches, and MoltenVK turns each label into a Metal debug group and
-  // each name into a Metal label, captured or not. An Xcode GPU capture is
+  // Object names and command labels in Debug only. The libraries label their
+  // kernel dispatches, and MoltenVK turns each label into a Metal debug group
+  // and each name into a Metal label, captured or not. An Xcode GPU capture is
   // what reads them -- worth it while developing, not in a Release build,
   // which the app's own bootstrap never enabled them in.
 #ifdef NDEBUG
   shared_config.instance.request_debug_utils = false;
 #endif
-  // Neither library is consulted about the other: each states its needs, and
-  // the shared device satisfies the union. gfx presents; recon computes.
-  shared_config.compute = vr::device_requirements();
+  // No library is consulted about another: each states its needs, and the
+  // shared device satisfies the union. gfx presents; sensor, grid and recon
+  // compute, and sensor's list carries the optional extensions its picture
+  // importer takes where offered.
+  vkc::Result<vkc::DeviceRequirements> compute_requirements =
+      []() -> vkc::Result<vkc::DeviceRequirements> {
+    vkc::Result<vkc::DeviceRequirements> fusion =
+        vkc::merge(vgrid::device_requirements(), vr::device_requirements());
+    if (!fusion) {
+      return fusion;
+    }
+    return vkc::merge(fusion.value(), sensor::device_requirements());
+  }();
+  if (!compute_requirements) {
+    app::set_error(error, compute_requirements.status(),
+                   "compute device requirements");
+    return nil;
+  }
+  shared_config.compute = compute_requirements.value();
   shared_config.graphics = vg::device_requirements();
   shared_config.graphics.needs_present = true;
   shared_config.make_surface =
@@ -360,31 +381,31 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->app = std::move(app).value();
 
-  // recon adopts the same device. Nothing consumes it until fusion lands, but
-  // adopting now is the point of this slice -- and a mismatch between what the
-  // bootstrap enabled and what recon requires must fail at bring-up, where the
+  // The compute libraries adopt the same device. A mismatch between what the
+  // bootstrap enabled and what they require must fail at bring-up, where the
   // message is actionable, rather than at the first dispatch.
-  vkc::Result<vkc::Device> recon_device = vkc::Device::adopt(
-      _impl->shared->compute_payload(), vr::device_requirements());
-  if (!recon_device) {
-    app::set_error(error, recon_device.status(), "recon Device::adopt");
+  vkc::Result<vkc::Device> compute_device = vkc::Device::adopt(
+      _impl->shared->compute_payload(), compute_requirements.value());
+  if (!compute_device) {
+    app::set_error(error, compute_device.status(), "compute Device::adopt");
     return nil;
   }
-  _impl->recon_device.emplace(std::move(recon_device).value());
+  _impl->compute_device.emplace(std::move(compute_device).value());
 
-  // recon allocates its volume, mesh arena and staging buffers from its own
-  // VMA allocator on the shared device -- separate accounting from gfx's, one
-  // device underneath.
-  vkc::Result<vkc::Allocator> recon_allocator = vkc::Allocator::create(
-      _impl->shared->instance().handle(), *_impl->recon_device);
-  if (!recon_allocator) {
+  // The volume, mesh arena, staging buffers and imported pictures come from
+  // their own VMA allocator on the shared device -- separate accounting from
+  // gfx's, one device underneath.
+  vkc::Result<vkc::Allocator> compute_allocator = vkc::Allocator::create(
+      _impl->shared->instance().handle(), *_impl->compute_device);
+  if (!compute_allocator) {
     // Its own Status, unflattened: an allocator failure on a user's phone is
     // out-of-memory or a VkResult, and reporting it as "unsupported" would read
     // as a capability the driver lacks.
-    app::set_error(error, recon_allocator.status(), "recon Allocator::create");
+    app::set_error(error, compute_allocator.status(),
+                   "compute Allocator::create");
     return nil;
   }
-  _impl->recon_allocator.emplace(std::move(recon_allocator).value());
+  _impl->compute_allocator.emplace(std::move(compute_allocator).value());
 
   VkDevice device = _impl->app.device().handle();
   vkc::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
@@ -424,7 +445,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 
   // The renderer's hybrid path: it samples the projective-texturing atlas where
   // a triangle carries a real uv0, and falls back to the per-vertex colour the
-  // TSDF fused elsewhere. That is exactly what recon's mesh emits.
+  // TSDF fused elsewhere. That is exactly what grid's mesh carries once recon
+  // has textured it.
   vkc::Result<vg::pipelines::HybridMeshPipeline> mesh_pipeline =
       vg::pipelines::HybridMeshPipeline::create(
           _impl->app.device(), _impl->app.allocator(),
@@ -496,16 +518,16 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // than merely unlikely.
   fusion_config.mesh_slots = app::RendererImpl::kMeshSlots;
   // Both families, always. Under the two-families plan a phone actually gets,
-  // recon writes these buffers on one and gfx reads them on the other, and an
-  // EXCLUSIVE buffer read by a family that does not own it is undefined with no
-  // error. recon collapses the pair to EXCLUSIVE wherever they are the same
-  // family, so this needs no branch on the plan.
+  // grid and sensor write these buffers and images on one and gfx reads them on
+  // the other, and an EXCLUSIVE buffer read by a family that does not own it is
+  // undefined with no error. Both collapse the pair to EXCLUSIVE wherever they
+  // are the same family, so this needs no branch on the plan.
   fusion_config.queue_families[0] = _impl->shared->compute_family();
   fusion_config.queue_families[1] = _impl->shared->graphics_family();
   fusion_config.queue_family_count = 2;
 
   const vkc::Status fusion_started = _impl->fusion.start(
-      *_impl->recon_device, *_impl->recon_allocator, fusion_config);
+      *_impl->compute_device, *_impl->compute_allocator, fusion_config);
   if (!fusion_started) {
     // Likewise: Fusion::start commits the volume, so its usual failure is an
     // OutOfMemory that must reach Swift as one.
@@ -563,7 +585,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     fresh = _impl->fusion.take_mesh(_impl->uploaded_version);
   }
   if (fresh) {
-    const vr::mesh::DeviceMesh& m = fresh->mesh;
+    const vgrid::mesh::DeviceMesh& m = fresh->mesh;
     // Every generation take_mesh hands over becomes this renderer's to release,
     // drawn or not -- recorded before the test below so the release logic can
     // still retire one it refuses to draw.
@@ -575,7 +597,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // rather than a count of anything.
     _impl->uploaded_version = fresh->version;
 
-    // Verified, not assumed. recon reports the usage *and the sharing mode* its
+    // Verified, not assumed. grid reports the usage *and the sharing mode* its
     // buffers were actually created with precisely because Vulkan cannot be
     // asked, and binding one that lacks a usage bit is a validation-layer-only
     // diagnostic -- undefined behaviour in the shipping configuration, which is
@@ -587,7 +609,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // least a diagnostic -- and on Apple, where Metal has no queue-ownership
     // concept, it is undefined in the way that appears to work. Checked only
     // when the families actually differ, which is what the queue plan decides
-    // at bring-up and what -initWithLayer: passes to Fusion::start; recon
+    // at bring-up and what -initWithLayer: passes to Fusion::start; grid
     // collapses the pair to EXCLUSIVE wherever they are the same family, and
     // that is correct rather than a failure.
     const bool cross_family =
@@ -601,7 +623,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
         (m.indirect_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
     if (bindable) {
       // A slot per frame in flight, holding the *generation* rather than the
-      // geometry: the buffers are recon's, and this only has to remember which
+      // geometry: the buffers are grid's, and this only has to remember which
       // one to release once this frame's fence has signalled.
       _impl->mesh_slot = (_impl->mesh_slot + 1) % app::RendererImpl::kMeshSlots;
       _impl->mesh_slots[_impl->mesh_slot] = m;
@@ -643,7 +665,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
       // Deliberately *not* released here. release_through is a monotonic
       // high-water mark, so handing it this generation would retire every older
       // one with it -- including the generation this very frame goes on to
-      // draw, since have_mesh and mesh_slot still name it. recon would then be
+      // draw, since have_mesh and mesh_slot still name it. grid would then be
       // free to claim that slot, and a grow frees its buffers outright, under a
       // live draw. The ordinary in-flight logic below retires it instead, which
       // by construction never releases past something still being read.
@@ -651,7 +673,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
       // Latched, because this cannot heal: the usage bits come from two
       // constants in Fusion::start and the sharing mode from the queue plan, so
       // a mesh that is unusable once is unusable every time. Collecting the
-      // ones that follow would only walk recon's ring to exhaustion, one
+      // ones that follow would only walk grid's ring to exhaustion, one
       // undrawable generation at a time, and bury the reason under a count.
       _impl->mesh_unusable = true;
       ++_impl->mesh_upload_failures;
@@ -659,7 +681,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
           sharing_ok
               ? "mesh is not bindable as geometry (usage bits or handles "
                 "missing)"
-              : "mesh buffers are VK_SHARING_MODE_EXCLUSIVE but recon and gfx "
+              : "mesh buffers are VK_SHARING_MODE_EXCLUSIVE but grid and gfx "
                 "are on different queue families; binding them would be "
                 "undefined";
     }
@@ -676,12 +698,12 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // the turntable from -- and the user can reach for the screen before the
   // first mesh ever arrives.
   _impl->camera_to_world = _impl->fusion.last_pose();
-  // Back to the OpenGL camera convention. recon's pose is CV (+Z forward, +Y
+  // Back to the OpenGL camera convention. sensor's pose is CV (+Z forward, +Y
   // down) because that is what its projection wants, but glm::perspective maps
   // -Z forward -- so feeding it the CV pose directly puts the entire scene
   // *behind* the camera and renders nothing but backfaces. cv_from_gl_camera is
   // an involution, so applying it again is the conversion back.
-  glm::mat4 device_pose = vr::sensor::cv_from_gl_camera(_impl->camera_to_world);
+  glm::mat4 device_pose = sensor::cv_from_gl_camera(_impl->camera_to_world);
   // ...and then round to the viewport. ARKit fixes the camera basis to the
   // *sensor*: +X along the long axis of the device, +Y along the short axis,
   // +Z out of the screen (ARCamera.transform). That frame does not turn when
@@ -721,12 +743,12 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // --- Retire the generations no frame in flight is reading any more --------
   //
   // Outside the draw branch, and that placement is the correction rather than a
-  // tidy-up: every release the consumer owes recon used to sit inside
+  // tidy-up: every release the consumer owes grid used to sit inside
   // `if (draw_mesh)`, so setting the public `drawMesh` property to NO stopped
   // all of them permanently. The renderer went on collecting meshes --
   // take_mesh runs regardless, and marking one taken is exactly what stops
   // fusion reusing its slot -- released nothing, and after kMeshSlots extracts
-  // recon refused every one that followed. Turning drawing back on could not
+  // grid refused every one that followed. Turning drawing back on could not
   // recover it either: the renderer only ever released what it drew, and by
   // then it could no longer obtain anything to draw.
   //
@@ -740,8 +762,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // take_mesh yields a *new* mesh, so at 60 Hz with a remesh every few fused
   // frames the same generation is drawn many frames running. Two frames in
   // flight then both hold it, begin_frame has waited on only the older one's
-  // fence, and releasing on that fence hands recon a slot the newer frame is
-  // still reading. recon is then free to pick it -- and a grow *frees* its
+  // fence, and releasing on that fence hands grid a slot the newer frame is
+  // still reading. grid is then free to pick it -- and a grow *frees* its
   // buffers outright, so the in-flight draw reads a destroyed VkBuffer. That
   // is a GPU fault surfacing as VK_ERROR_DEVICE_LOST out of the next
   // vkWaitForFences, and it needs the arena to actually grow, which is why it
@@ -791,7 +813,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // exactly the comparison that would find the use-after-free described above.
   //
   // The same placement mistake as the release logic thirty lines up, which sat
-  // inside this branch until it stopped recon reusing anything at all.
+  // inside this branch until it stopped grid reusing anything at all.
   //
   // The narrow accessor, not stats(): this runs every frame, and FusionStats
   // carries a std::string whose copy would malloc inside the mutex the fuse
@@ -813,10 +835,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   trace.extract_ms = fused.extract_ms;
 
   if (draw_mesh) {
-    // recon's buffers, named rather than copied. LiveMesh owns nothing and
+    // grid's buffers, named rather than copied. LiveMesh owns nothing and
     // reads the index count GPU-side out of the indirect command, so the count
     // never crosses the CPU either.
-    const vr::mesh::DeviceMesh& live_src = _impl->mesh_slots[_impl->mesh_slot];
+    const vgrid::mesh::DeviceMesh& live_src =
+        _impl->mesh_slots[_impl->mesh_slot];
     vg::pipelines::LiveMesh live;
     live.vertices = live_src.vertices;
     live.indices = live_src.indices;
@@ -1087,7 +1110,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   };
   VolumetricGaugeThresholds out;
   // The one pair that is not a constant on this side: its critical tier is the
-  // allocate guard and its warn tier is recon's, so it is derived from both.
+  // allocate guard and its warn tier is grid's, so it is derived from both.
   out.occupancy =
       pair(app::occupancy_thresholds(app::Fusion::grow_threshold()));
   out.arenaFill = pair(app::kArenaFillThresholds);
@@ -1216,9 +1239,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   if (_impl->app.valid()) {
     (void)_impl->app.wait_idle();
   }
-  // gfx idles only the queues it was assigned, and recon's Device exposes no
-  // wait at all -- so on a two-family plan recon's queue is one nobody else
-  // would ever drain. The bootstrap owns them both and waits on both.
+  // gfx idles only the queues it was assigned, and the compute Device exposes
+  // no wait at all -- so on a two-family plan the compute queue is one nobody
+  // else would ever drain. The bootstrap owns them both and waits on both.
   if (_impl->shared) {
     _impl->shared->wait_idle();
   }
@@ -1244,7 +1267,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (BOOL)sharesOneDevice {
-  if (!_impl->shared || !_impl->app.valid() || !_impl->recon_device) {
+  if (!_impl->shared || !_impl->app.valid() || !_impl->compute_device) {
     return NO;
   }
   const VkDevice bootstrap = _impl->shared->device();
@@ -1257,9 +1280,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // went through `adopt` -- a library that quietly created a device of its own
   // is the divergence this can actually catch.
   return _impl->app.device().handle() == bootstrap &&
-         _impl->recon_device->handle() == bootstrap &&
+         _impl->compute_device->handle() == bootstrap &&
          !_impl->app.device().owns_device() &&
-         !_impl->recon_device->owns_device();
+         !_impl->compute_device->owns_device();
 }
 
 - (uint64_t)framesPresented {

@@ -19,17 +19,16 @@
 
 #include "FailureHandling.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/camera_params.hpp"
-#include "volumetric_kit/recon/core/color_space.hpp"
-#include "volumetric_kit/recon/sensor/camera_conventions.hpp"
-#include "volumetric_kit/recon/sensor/chroma_location.hpp"
-#include "volumetric_kit/recon/sensor/color_conventions.hpp"
-#include "volumetric_kit/recon/sensor/yuv_image.hpp"
+#include "volumetric_kit/sensor/camera_conventions.hpp"
+#include "volumetric_kit/sensor/chroma_location.hpp"
+#include "volumetric_kit/sensor/color_conventions.hpp"
+#include "volumetric_kit/sensor/frame/camera_params.hpp"
+#include "volumetric_kit/sensor/frame/color_space.hpp"
+#include "volumetric_kit/sensor/yuv_image.hpp"
 
 namespace vkc = volumetric_kit::core;
 
-namespace vr = volumetric_kit::recon;
-namespace sensor = volumetric_kit::recon::sensor;
+namespace sensor = volumetric_kit::sensor;
 namespace app = volumetric_kit::ios_app;
 
 namespace {
@@ -121,12 +120,12 @@ struct FrameBuffers {
   /// so it is let go as soon as the frame is superseded.
   RetainedPixels picture;
   /// How @ref picture codes R'G'B'; see `CapturedFrame::picture_coding`.
-  vr::sensor::YuvImage picture_coding{};
-  vr::DepthCameraParams depth_camera{};
-  vr::ColorCameraParams color_camera{};
+  sensor::YuvImage picture_coding{};
+  sensor::DepthCameraParams depth_camera{};
+  sensor::ColorCameraParams color_camera{};
   /// What the frame carries once staged: always canonical, because
   /// `convert_color` brings a non-canonical source across before publishing.
-  vr::ColorEncoding color_encoding{};
+  sensor::ColorEncoding color_encoding{};
   /// What the buffer declared, for the read-out -- kept as the strings rather
   /// than as a `ColorEncoding`, because a tag this driver cannot represent has
   /// no enumerator to name it and is exactly the case worth showing. Retained
@@ -270,12 +269,12 @@ std::optional<float> copy_depth(CVPixelBufferRef depth_buffer,
 /// and iOS ones routinely do.
 struct SourceColor {
   const vImage_YpCbCrToARGBMatrix* matrix;
-  /// The same matrix, as recon describes a picture's coding.
-  vr::sensor::VideoColorMatrix video_matrix;
+  /// The same matrix, as sensor describes a picture's coding.
+  sensor::VideoColorMatrix video_matrix;
   const char* matrix_name;
   const char* transfer_name;
   const char* primaries_name;
-  vr::ColorEncoding encoding;
+  sensor::ColorEncoding encoding;
   /// `false` when an attachment named something this driver cannot represent,
   /// so the frame's colour must be dropped rather than declared.
   bool understood;
@@ -284,7 +283,7 @@ struct SourceColor {
   /// published: its frame is not textured, rather than textured against a
   /// keyframe that renders white. vImage's conversion does not read the
   /// siting, so the colour still is published.
-  std::optional<vr::sensor::ChromaLocation> chroma_location;
+  std::optional<sensor::ChromaLocation> chroma_location;
 };
 
 /// Read @p image's colour attachments rather than assuming them.
@@ -312,15 +311,15 @@ SourceColor source_color(CVPixelBufferRef image) {
   // up that way on screen. An ARKit buffer is tagged in practice, making this
   // nearly dead code; a silently different guess in nearly dead code is exactly
   // the kind of thing that surfaces once, years later, on one device.
-  // An untagged chroma siting is taken as left, recon's default for a picture.
+  // An untagged chroma siting is taken as left, sensor's default for a picture.
   SourceColor out{kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
-                  vr::sensor::VideoColorMatrix::Bt709,
+                  sensor::VideoColorMatrix::Bt709,
                   "BT.709 (assumed)",
                   "sRGB (assumed)",
                   "BT.709 (assumed)",
-                  vr::ColorEncoding{},
+                  sensor::ColorEncoding{},
                   true,
-                  vr::sensor::ChromaLocation::Left};
+                  sensor::ChromaLocation::Left};
 
   const auto matches = [](CFTypeRef value, CFStringRef expected) {
     return value != nullptr && CFGetTypeID(value) == CFStringGetTypeID() &&
@@ -335,7 +334,7 @@ SourceColor source_color(CVPixelBufferRef image) {
   if (CFTypeRef matrix = attachment(kCVImageBufferYCbCrMatrixKey)) {
     if (matches(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
       out.matrix = kvImage_YpCbCrToARGBMatrix_ITU_R_601_4;
-      out.video_matrix = vr::sensor::VideoColorMatrix::Bt601;
+      out.video_matrix = sensor::VideoColorMatrix::Bt601;
       out.matrix_name = "BT.601";
     } else if (matches(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)) {
       out.matrix_name = "BT.709";
@@ -357,10 +356,10 @@ SourceColor source_color(CVPixelBufferRef image) {
     if (matches(primaries, kCVImageBufferColorPrimaries_ITU_R_709_2)) {
       out.primaries_name = "BT.709";
     } else if (matches(primaries, kCVImageBufferColorPrimaries_P3_D65)) {
-      out.encoding.primaries = vr::ColorEncoding::Primaries::DisplayP3;
+      out.encoding.primaries = sensor::ColorEncoding::Primaries::DisplayP3;
       out.primaries_name = "Display P3";
     } else if (matches(primaries, kCVImageBufferColorPrimaries_ITU_R_2020)) {
-      out.encoding.primaries = vr::ColorEncoding::Primaries::Bt2020;
+      out.encoding.primaries = sensor::ColorEncoding::Primaries::Bt2020;
       out.primaries_name = "BT.2020";
     } else {
       // SMPTE-C, EBU 3213, P22, DCI-P3: `Primaries` has no enumerator for any
@@ -373,23 +372,23 @@ SourceColor source_color(CVPixelBufferRef image) {
   }
 
   if (CFTypeRef transfer = attachment(kCVImageBufferTransferFunctionKey)) {
-    // BT.709 and sRGB are both canonical, and recon accepts them as one: they
+    // BT.709 and sRGB are both canonical, and sensor accepts them as one: they
     // differ by a couple of codes in the toe, a bounded and stated error.
     if (matches(transfer, kCVImageBufferTransferFunction_ITU_R_709_2)) {
-      out.encoding.transfer = vr::ColorEncoding::Transfer::Bt709;
+      out.encoding.transfer = sensor::ColorEncoding::Transfer::Bt709;
       out.transfer_name = "BT.709";
     } else if (matches(transfer, kCVImageBufferTransferFunction_sRGB)) {
-      out.encoding.transfer = vr::ColorEncoding::Transfer::Srgb;
+      out.encoding.transfer = sensor::ColorEncoding::Transfer::Srgb;
       out.transfer_name = "sRGB";
     } else if (matches(transfer, kCVImageBufferTransferFunction_Linear)) {
-      out.encoding.transfer = vr::ColorEncoding::Transfer::Linear;
+      out.encoding.transfer = sensor::ColorEncoding::Transfer::Linear;
       out.transfer_name = "linear";
     } else if (matches(transfer,
                        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) {
       // Declared rather than refused here, so that `to_canonical` stays the one
       // place deciding what a transfer can become; it reports PQ as unsupported
       // rather than tone-mapping it into something quietly wrong.
-      out.encoding.transfer = vr::ColorEncoding::Transfer::Bt2020Pq;
+      out.encoding.transfer = sensor::ColorEncoding::Transfer::Bt2020Pq;
       out.transfer_name = "BT.2020 PQ";
     } else if (matches(transfer,
                        kCVImageBufferTransferFunction_ITU_R_2100_HLG)) {
@@ -413,9 +412,9 @@ SourceColor source_color(CVPixelBufferRef image) {
   // two the renderer samples (see `bind_keyframe`); any other means no picture.
   if (CFTypeRef siting = attachment(kCVImageBufferChromaLocationTopFieldKey)) {
     if (matches(siting, kCVImageBufferChromaLocation_Left)) {
-      out.chroma_location = vr::sensor::ChromaLocation::Left;
+      out.chroma_location = sensor::ChromaLocation::Left;
     } else if (matches(siting, kCVImageBufferChromaLocation_Center)) {
-      out.chroma_location = vr::sensor::ChromaLocation::Center;
+      out.chroma_location = sensor::ChromaLocation::Center;
     } else {
       out.chroma_location = std::nullopt;
     }
@@ -496,14 +495,14 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   // colour is set, but a stale non-canonical declaration surviving next to a
   // null colour pointer is the kind of thing that stays harmless only until a
   // consumer checks the declaration first.
-  out.color_encoding = vr::ColorEncoding{};
+  out.color_encoding = sensor::ColorEncoding{};
   out.color_matrix = "(none)";
   out.color_transfer = "(none)";
   out.color_primaries = "(none)";
   out.color_converted = false;
   out.color_refused = false;
   out.picture.reset();
-  out.picture_coding = vr::sensor::YuvImage{};
+  out.picture_coding = sensor::YuvImage{};
 
   if (CVPixelBufferGetPlaneCount(image) < 2) {
     return false;
@@ -610,16 +609,16 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
   // the fast path free of a function that would touch 11 MB to change nothing
   // but the alpha byte vImage already wrote as 255.
   out.color_encoding = source.encoding;
-  if (vr::is_canonical(out.color_encoding)) {
+  if (sensor::is_canonical(out.color_encoding)) {
     // The picture itself, for the keyframes the renderer samples where the
     // camera left them. Only here: a non-canonical picture would be sampled as
     // though it were canonical, since a renderer applies the matrix and the
     // range but no transfer or primaries conversion.
     if (source.chroma_location) {
       out.picture = RetainedPixels(image);
-      const vr::sensor::YcbcrWeights weights =
-          vr::sensor::ycbcr_weights(source.video_matrix);
-      out.picture_coding.layout = vr::sensor::YuvLayout::Nv12;
+      const sensor::YcbcrWeights weights =
+          sensor::ycbcr_weights(source.video_matrix);
+      out.picture_coding.layout = sensor::YuvLayout::Nv12;
       out.picture_coding.kr = weights.kr;
       out.picture_coding.kb = weights.kb;
       out.picture_coding.full_range = true;  // '420f', checked above
@@ -652,7 +651,7 @@ bool convert_color(CVPixelBufferRef image, std::size_t expected_width,
     out.color_refused = true;
     return false;
   }
-  out.color_encoding = vr::ColorEncoding{};
+  out.color_encoding = sensor::ColorEncoding{};
   out.color_converted = true;
   return true;
 }
@@ -735,7 +734,7 @@ class ARKitCapture final : public app::FrameSource {
     staged_ = true;
     ++stats_.frames_submitted;
 
-    const vr::DepthCameraParams& cam = back_.depth_camera;
+    const sensor::DepthCameraParams& cam = back_.depth_camera;
     stats_.depth_width = cam.width;
     stats_.depth_height = cam.height;
     stats_.color_width = back_.has_color ? back_.color_camera.width : 0;
@@ -852,12 +851,12 @@ class ARKitCapture final : public app::FrameSource {
         // camera is described directly by them; the depth camera is *derived*
         // from it, because sceneDepth is registered to colour -- one physical
         // camera, so the two share a pose and differ only by an image-size
-        // scale. Letting recon do that derivation is the point: it is the
+        // scale. Letting sensor do that derivation is the point: it is the
         // arithmetic its host tests pin.
         const simd_float3x3 k = frame.camera.intrinsics;
         const CGSize image_size = frame.camera.imageResolution;
 
-        vr::ColorCameraParams color{};
+        sensor::ColorCameraParams color{};
         color.fx = k.columns[0][0];
         color.fy = k.columns[1][1];
         color.cx = k.columns[2][0];
@@ -865,18 +864,19 @@ class ARKitCapture final : public app::FrameSource {
         color.width = static_cast<std::uint32_t>(image_size.width);
         color.height = static_cast<std::uint32_t>(image_size.height);
 
-        // ARKit's camera looks down -Z with +Y up; recon projects +Z forward
-        // with +Y down. cv_from_gl_camera is the conversion, and getting it
-        // wrong smears the reconstruction rather than raising anything.
+        // ARKit's camera looks down -Z with +Y up; sensor's cameras project +Z
+        // forward with +Y down. cv_from_gl_camera is the conversion, and
+        // getting it wrong smears the reconstruction rather than raising
+        // anything.
         const simd_float4x4 t = frame.camera.transform;
-        vr::Mat4f arkit_pose(1.0f);
+        sensor::Mat4f arkit_pose(1.0f);
         for (int c = 0; c < 4; ++c) {
-          arkit_pose[c] = vr::Vec4f(t.columns[c][0], t.columns[c][1],
-                                    t.columns[c][2], t.columns[c][3]);
+          arkit_pose[c] = sensor::Vec4f(t.columns[c][0], t.columns[c][1],
+                                        t.columns[c][2], t.columns[c][3]);
         }
         color.cam_to_world = sensor::cv_from_gl_camera(arkit_pose);
 
-        vkc::Result<vr::DepthCameraParams> derived =
+        vkc::Result<sensor::DepthCameraParams> derived =
             sensor::depth_from_registered_color(
                 color,
                 static_cast<std::uint32_t>(

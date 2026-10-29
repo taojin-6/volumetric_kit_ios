@@ -3,8 +3,9 @@
 
 # compute_smoke: the on-device de-risk gate.
 #
-# Runs volumetric_kit_recon's compute path against MoltenVK on a real iOS GPU
-# and shows the result. This is the family's standing "prove the path before
+# Runs the family's compute path -- volumetric_kit_grid's volume and Marching
+# Cubes, volumetric_kit_recon's TSDF fusion -- against MoltenVK on a real iOS
+# GPU and shows the result. This is the family's standing "prove the path before
 # building on it" rule applied to iOS -- the app that has to pass before an
 # ARKit capture tier is worth writing.
 
@@ -28,15 +29,16 @@ vr_embed_shaders(${VI_APP_NAME} SYMBOL_PREFIX "vi_" SHADERS
 
 target_include_directories(${VI_APP_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-# Every recon tier the smoke exercises. recon_core comes in transitively, but
-# the stages name volume/tsdf/mesh directly, so link them directly -- and the
-# core's vulkan tier, whose Instance, Device and Allocator the stages create.
-# That tier also links MoltenVK's system frameworks, which include the UIKit and
-# Foundation this shell uses, so the app names none of its own.
+# Every tier the smoke exercises: grid's volume and mesh, recon's tsdf. Their
+# own cores come in transitively, but the stages name these directly, so link
+# them directly -- and the core's vulkan tier, whose Instance, Device and
+# Allocator the stages create. That tier also links MoltenVK's system
+# frameworks, which include the UIKit and Foundation this shell uses, so the app
+# names none of its own.
 target_link_libraries(
   ${VI_APP_NAME}
-  PRIVATE volumetric_kit::core_vulkan volumetric_kit::recon_volume
-          volumetric_kit::recon_tsdf volumetric_kit::recon_mesh)
+  PRIVATE volumetric_kit::core_vulkan volumetric_kit::grid_volume
+          volumetric_kit::grid_mesh volumetric_kit::recon_tsdf)
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)

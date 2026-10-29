@@ -6,8 +6,8 @@
 /// @file RendererErrors.hpp
 /// @brief Reducing a library `Status` to the `NSError` Swift sees.
 ///
-/// recon and gfx return one `Status`, volumetric_kit_core's, so one overload
-/// of each function here serves both.
+/// The libraries return one `Status`, volumetric_kit_core's, so one overload
+/// of each function here serves them all.
 ///
 /// Why the *domain* is the NSError code, and the VkResult rides in the user
 /// info instead, is argued on @ref VolumetricRendererError in

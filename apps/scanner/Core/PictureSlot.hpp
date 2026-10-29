@@ -8,7 +8,7 @@
 ///        samples change hands.
 ///
 /// Pure, so the renderer's keyframe ring (Bridge/AtlasRing.hpp) can be tested
-/// on the host: the bridge instantiates it with recon's imported camera
+/// on the host: the bridge instantiates it with sensor's imported camera
 /// picture and binds through gfx's texture set; a test binds through stubs.
 
 #include <optional>

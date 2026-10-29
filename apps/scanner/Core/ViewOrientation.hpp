@@ -6,7 +6,8 @@
 /// @file ViewOrientation.hpp
 /// @brief The turn from ARKit's sensor basis to the interface's viewport.
 ///
-/// Pure math, deliberately: no Vulkan, no recon, no Objective-C, no UIKit. The
+/// Pure math, deliberately: no Vulkan, no sibling library, no Objective-C, no
+/// UIKit. The
 /// Objective-C `VolumetricViewOrientation` mirrors @ref ViewOrientation value
 /// for value and `VolumetricRenderer.mm` static_asserts the two agree, so this
 /// header is reachable from a host test while the enum Swift sees stays in the
@@ -105,9 +106,9 @@ inline constexpr ViewOrientation kSensorBasisOrientation =
 /// Which frame this acts in matters as much as the angle, so it is stated here
 /// rather than left to the call site: the caller applies this after
 /// `cv_from_gl_camera`, where +Z points out of the screen at the viewer and a
-/// positive angle turns the basis counterclockwise on screen. recon's own poses
-/// are CV (+Z along the view direction), and the identical rule applied to one
-/// of those comes out with the opposite sign.
+/// positive angle turns the basis counterclockwise on screen. sensor's own
+/// poses are CV (+Z along the view direction), and the identical rule applied
+/// to one of those comes out with the opposite sign.
 float viewport_turn(ViewOrientation orientation) noexcept;
 
 }  // namespace volumetric_kit::ios_app

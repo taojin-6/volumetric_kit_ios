@@ -142,7 +142,7 @@ NS_ASSUME_NONNULL_END
     _extractStale = stats.extract_stale ? YES : NO;
 
     // No extract residual here. `max(0, extract_ms - extract.total_ms())` was
-    // computed on this line and published as its own figure, but recon already
+    // computed on this line and published as its own figure, but Fusion already
     // pushes that exact expression as the `"  ..other"` stage row -- so the
     // panel drew it as a bar and then listed it again underneath a heading
     // reading "not in the bars above". One measurement, one publication: the
@@ -186,14 +186,14 @@ namespace {
 // A row's value: measured rather than truncated, and never nil.
 //
 // Both halves were bugs. The longest value on this read-out is the error row,
-// which carries `FusionStats::last_error`, a recon or driver message of no
+// which carries `FusionStats::last_error`, a library or driver message of no
 // fixed length, and a fixed 256 byte buffer cut it with the return value
 // discarded. A cut lands wherever the limit falls, including mid-UTF-8 in a
-// driver or recon message, and `stringWithUTF8String:` answers **nil** for the
-// result -- which `[nil copy]` then stores in a `nonnull` property, so the trap
-// surfaces in Swift at the first read rather than here. `to_ns_string` is this
-// file's own answer to that second half and simply was not being used; see its
-// comment.
+// driver or library message, and `stringWithUTF8String:` answers **nil** for
+// the result -- which `[nil copy]` then stores in a `nonnull` property, so the
+// trap surfaces in Swift at the first read rather than here. `to_ns_string` is
+// this file's own answer to that second half and simply was not being used; see
+// its comment.
 NSString* fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
 NSString* fmt(const char* format, ...) {
   // Sized for the common row, which is far shorter than this; the heap path is
@@ -467,11 +467,12 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
       out += "   (device timing retired after a fence failure -- host only for "
              "the rest of this run)\n";
     }
-    // The fuse thread's keyframe import, which sits outside recon's spans,
-    // outside `extract_ms` and outside `texture_ms` -- so a reader summing the
-    // column above under-counts the frame by exactly this. The panel draws it
-    // under the bars as "not in the bars above"; this is that heading's text
-    // rendering, and it reached the panel but not the transcript.
+    // The fuse thread's keyframe import, which sits outside the libraries'
+    // spans, outside `extract_ms` and outside `texture_ms` -- so a reader
+    // summing the column above under-counts the frame by exactly this. The
+    // panel draws it under the bars as "not in the bars above"; this is that
+    // heading's text rendering, and it reached the panel but not the
+    // transcript.
     //
     // The same threshold the panel uses, so an import too small to be worth a
     // line is absent from both rather than from one.
@@ -760,7 +761,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // Both appear **only when `s.stage_count == 0`**, which is the whole of what
   // makes them right rather than a second account of the same scan.
   //
-  // With `FusionConfig::measure_stages` on -- the default -- recon publishes
+  // With `FusionConfig::measure_stages` on -- the default -- Fusion publishes
   // all of this as stage rows: `extract` and the six `"  .."` phases it
   // decomposes into, `..other` included. Publishing a section as well drew and
   // printed every one of those figures twice, and the residual worst of all:
@@ -828,7 +829,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
           {"meshing", s.extract.dispatch_ms},
           {"read", s.extract.readback_ms},
           // The residual, printed rather than left implicit: these phases do
-          // not sum to extract_ms and never did. recon's spans open after the
+          // not sum to extract_ms and never did. grid's spans open after the
           // slot claim and close before the O(active_blocks) teardown of the
           // neighbour table, so the gap grows with the scan -- the one
           // direction in which an unlabelled remainder would be misread as
@@ -866,7 +867,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     // whose next remesh skips, and freezes for the session under a persistent
     // extract failure while the map doubles beneath it.
     if (s.occupancy_known) {
-      // Derived from the guard and from recon's threshold rather than read from
+      // Derived from the guard and from grid's threshold rather than read from
       // a pair of literals -- see `occupancy_thresholds`. This row and the
       // headline meter are both on screen at once, drawn from this measurement,
       // so the two numbers deciding their colour have to be the two numbers

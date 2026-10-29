@@ -48,15 +48,16 @@
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/device_mesh.hpp"
+#include "volumetric_kit/grid/mesh/device_mesh.hpp"
+#include "volumetric_kit/sensor/frame/vector_types.hpp"
 
 namespace volumetric_kit::ios_app {
 
 namespace vkc = volumetric_kit::core;
 
 namespace vg = volumetric_kit::gfx;
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
+namespace sensor = volumetric_kit::sensor;
 
 // Everything C++ lives here so the header stays Objective-C only and Swift
 // never sees a move-only type.
@@ -70,7 +71,7 @@ namespace vr = volumetric_kit::recon;
 //      each hold a texture set with a uniform from `app.allocator()`, must be
 //      declared *after* `app` to be destroyed *before* it. Those two, and the
 //      pipelines and shaders above them -- not `mesh_slots`, which is borrowed
-//      views of recon's buffers and allocates nothing here, so its position is
+//      views of grid's buffers and allocates nothing here, so its position is
 //      unconstrained either way.
 //   2. gfx warns that resources destroyed while the frame loop still has frames
 //      in flight referencing them is VUID-vkDestroyPipeline-pipeline-00765 and
@@ -87,15 +88,16 @@ struct RendererImpl {
   // Declared first, destroyed last: everything below borrows the VkDevice this
   // owns and destroys nothing, so it has to outlive all of them.
   std::unique_ptr<vkc::SharedDevice> shared;
-  // recon's view of the same VkDevice -- what the volume, the integrator and
-  // marching cubes below all allocate and dispatch on. Adopted at bring-up
-  // rather than lazily, so a mismatch between what the bootstrap enabled and
-  // what recon requires fails where the message is actionable.
-  // optional, not a plain member: recon's Device is create-or-adopt only and
+  // The compute libraries' view of the same VkDevice -- what the volume, the
+  // integrator, marching cubes, the texturer and the picture importer all
+  // allocate and dispatch on. Adopted at bring-up rather than lazily, so a
+  // mismatch between what the bootstrap enabled and what sensor, grid and recon
+  // require fails where the message is actionable.
+  // optional, not a plain member: the core's Device is create-or-adopt only and
   // has no public default constructor -- which is the invariant working, not an
   // inconvenience. There is no such thing as an empty one to default-construct.
-  std::optional<volumetric_kit::core::Device> recon_device;
-  std::optional<volumetric_kit::core::Allocator> recon_allocator;
+  std::optional<volumetric_kit::core::Device> compute_device;
+  std::optional<volumetric_kit::core::Allocator> compute_allocator;
 
   // --- Reconstruction ------------------------------------------------------
   Fusion fusion;
@@ -142,7 +144,7 @@ struct RendererImpl {
   std::uint64_t memory_warning_footprint_bytes = 0;
   // The pose the newest mesh was fused at; the camera follows the scan until
   // the user's fingers take it over.
-  vr::Mat4f camera_to_world{1.0f};
+  sensor::Mat4f camera_to_world{1.0f};
   OrbitCamera camera;
   /// Which way up the interface is. The pure-C++ enum, not the Objective-C
   /// mirror Swift sees: that one lives in VolumetricRenderer.h and would drag
@@ -183,7 +185,7 @@ struct RendererImpl {
   // be reading it. The literal 3 held only because gfx's WindowedAppConfig
   // happens to default frames_in_flight to 2 -- a value in another repo that
   // nothing here set or read.
-  // +1, which is both what recon's `slot_count` prescribes ("the consumer's
+  // +1, which is both what grid's `slot_count` prescribes ("the consumer's
   // frames in flight plus one") and what the ring now needs. The extra slot was
   // buying headroom around two ordering faults on the producing side, since
   // fixed in Fusion::remesh: the consumer's release was applied *after* the
@@ -212,9 +214,9 @@ struct RendererImpl {
   static_assert(kMeshSlots == kRingSlots,
                 "the atlas ring is indexed by mesh_slot, so it must be exactly "
                 "as deep as the mesh ring");
-  // The meshes in flight -- borrowed views of recon's buffers, not storage.
+  // The meshes in flight -- borrowed views of grid's buffers, not storage.
   // Copying one is copying a few handles.
-  vr::mesh::DeviceMesh mesh_slots[kMeshSlots];
+  vgrid::mesh::DeviceMesh mesh_slots[kMeshSlots];
   // The generation each in-flight frame drew. Read as a *set*: what may be
   // released is everything older than the oldest entry, not the entry belonging
   // to the frame that just retired -- one generation is normally drawn by
@@ -230,14 +232,14 @@ struct RendererImpl {
   /// holding its camera picture until the slot is rebound.
   ///
   /// Declared here, after `app`, because its slots own gfx texture sets: rule 1
-  /// of the teardown note above. The pictures are images recon imported on
-  /// `recon_device`, which is declared before both and outlives them.
+  /// of the teardown note above. The pictures are images sensor imported on
+  /// `compute_device`, which is declared before both and outlives them.
   AtlasRing atlas;
   // The newest generation take_mesh has handed over, drawn or not. What the
   // release logic falls back to when *no* frame is holding a generation: the
   // per-frame minimum says nothing then, and without this the generations taken
   // while drawing was off were never released at all -- `drawMesh = NO`
-  // exhausted recon's ring within kMeshSlots extracts and turning drawing back
+  // exhausted grid's ring within kMeshSlots extracts and turning drawing back
   // on could not recover, because the renderer only released what it drew and
   // could no longer obtain anything to draw.
   std::uint64_t newest_taken_generation = 0;
@@ -246,7 +248,7 @@ struct RendererImpl {
   // constants in Fusion::start and the sharing mode from the queue plan, so a
   // mesh that is unusable once is unusable every time. Latching stops the
   // renderer collecting meshes it cannot draw -- which at 60 Hz was a storm of
-  // failure counts, and which would otherwise walk recon's ring to exhaustion
+  // failure counts, and which would otherwise walk grid's ring to exhaustion
   // one uncollectable generation at a time.
   bool mesh_unusable = false;
   // Diagnostic only: what the last few frames drew, dumped when a device loss
@@ -255,13 +257,13 @@ struct RendererImpl {
 
   ~RendererImpl() {
     // Before anything else, and before any member is destroyed: the fuse thread
-    // polls `capture` and submits recon work on the shared queue, so it has to
-    // be stopped while everything it touches is still alive. A joinable
+    // polls `capture` and submits compute work on the shared queue, so it has
+    // to be stopped while everything it touches is still alive. A joinable
     // std::thread reaching a member destructor would be std::terminate.
     stop_fusing();
-    // Then drain. gfx idles only the queues it was assigned and recon's Device
-    // exposes no wait at all, so the bootstrap -- which owns both -- is what
-    // makes this cover the whole device.
+    // Then drain. gfx idles only the queues it was assigned and the compute
+    // Device exposes no wait at all, so the bootstrap -- which owns both -- is
+    // what makes this cover the whole device.
     if (app.valid()) {
       (void)app.wait_idle();
     }
