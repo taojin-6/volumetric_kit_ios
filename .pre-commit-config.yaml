@@ -35,6 +35,10 @@ repos:
     hooks:
       - id: cmake-format
         additional_dependencies: [cmakelang, pyyaml]
+        # cmakelang 0.6.13 cannot start on Python 3.15 (re.Scanner refuses its
+        # capturing groups), which a Homebrew pre-commit now runs on. CI's lint
+        # job sets up the same version.
+        language_version: python3.14
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1-1
