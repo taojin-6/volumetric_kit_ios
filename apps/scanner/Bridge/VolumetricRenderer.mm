@@ -353,8 +353,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   config.swapchain.preferred_present_mode = VK_PRESENT_MODE_FIFO_KHR;
   // A depth attachment, which the triangle did not need but a reconstruction
   // does: without it near geometry does not occlude far, and the mesh renders
-  // as whichever triangle happened to be emitted last. The swapchain owns one
-  // per image, so it is depth-safe at any frames-in-flight count.
+  // as whichever triangle happened to be emitted last. The swapchain renders
+  // at gfx's 4x MSAA into one transient colour and depth set that every frame
+  // reuses in queue order, so it is depth-safe at any frames-in-flight count.
   config.swapchain.depth_format = VK_FORMAT_D32_SFLOAT;
   // Set rather than left at gfx's default: RendererImpl::kMeshSlots is sized
   // against this number, and a default that changed in the other repo would
