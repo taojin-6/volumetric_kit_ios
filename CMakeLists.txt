@@ -204,7 +204,7 @@ vkc_require_sibling(volumetric_kit::recon 0.1.0 TARGETS
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG 403b8f31989472ccae318c618ea652a6461c9cc7) # gfx #164
+  GIT_TAG df3a0de4184f6b989faa8d8ffbe0a338e00642a5) # gfx #168
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)
