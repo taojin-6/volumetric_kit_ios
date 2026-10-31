@@ -112,9 +112,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 2120e6294e3c7ead8bb168d757f940b21d21267c) # core #70 (0.30.0)
+  GIT_TAG c52a86ab8fcfd11fb6afbfeaf0ae9ef2209b18b2) # core #76 (0.35.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.30.0)
+vkc_require_core(0.35.0)
 
 # --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs the siblings and MoltenVK, none of which a
