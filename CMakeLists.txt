@@ -112,9 +112,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG c52a86ab8fcfd11fb6afbfeaf0ae9ef2209b18b2) # core #76 (0.35.0)
+  GIT_TAG e1adf08203b6eb5956ebaa48f511a9a73996009b) # core #86 (0.40.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.35.0)
+vkc_require_core(0.40.0)
 
 # --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs the siblings and MoltenVK, none of which a
@@ -171,10 +171,10 @@ find_package(glm CONFIG REQUIRED)
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG 1fc39c0cab3f77fb3613a5277287d2e25052ca8c) # sensor #2 (0.1.1)
+  GIT_TAG aa7d9402ae6726a84995c7bc52f936298d0d36d1) # sensor #27 (0.20.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
-  volumetric_kit::sensor 0.1.1 TARGETS volumetric_kit::sensor_interface
+  volumetric_kit::sensor 0.20.0 TARGETS volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple)
 
 # grid: the sparse voxel block grid and Marching Cubes, whose DeviceMesh gfx
@@ -182,16 +182,16 @@ vkc_require_sibling(
 FetchContent_Declare(
   volumetric_kit_grid
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_grid.git
-  GIT_TAG 2d11f3fca463071d82127479699c6024bf7a841b) # grid #5 (0.2.1)
+  GIT_TAG 20bd1c13f07215ad1feffbe4d0ecc06bc9ff9583) # grid #15 (0.8.0)
 FetchContent_MakeAvailable(volumetric_kit_grid)
-vkc_require_sibling(volumetric_kit::grid 0.2.1 TARGETS
+vkc_require_sibling(volumetric_kit::grid 0.8.0 TARGETS
                     volumetric_kit::grid_volume volumetric_kit::grid_mesh)
 
 # recon: TSDF fusion and the projective texturer.
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 06376d7f818f1f75b8ae392f79ad9727697fb77c) # recon #312 (0.1.0)
+  GIT_TAG 83dd202d0c08fb5f4fa95da54f6611bb3c7edfc4) # recon #337 (0.1.0)
 FetchContent_MakeAvailable(volumetric_kit_recon)
 vkc_require_sibling(volumetric_kit::recon 0.1.0 TARGETS
                     volumetric_kit::recon_tsdf volumetric_kit::recon_texture)
@@ -204,7 +204,7 @@ vkc_require_sibling(volumetric_kit::recon 0.1.0 TARGETS
 FetchContent_Declare(
   volumetric_kit_gfx
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_gfx.git
-  GIT_TAG df3a0de4184f6b989faa8d8ffbe0a338e00642a5) # gfx #168
+  GIT_TAG ffc1a17a3d14aeb546e5484067dbf0160e76c60c) # gfx #173
 set(VG_WITH_GLFW
     OFF
     CACHE BOOL "" FORCE)
