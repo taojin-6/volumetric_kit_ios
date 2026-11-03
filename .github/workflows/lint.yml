@@ -32,7 +32,7 @@ jobs:
           persist-credentials: false
       # No workflow is triggered by an event an outsider can cause, or by a
       # schedule (the core's tools/runners/README.md, "Who can trigger CI").
-      - uses: taojin-6/volumetric_kit_core/.github/actions/check-workflow-triggers@e1adf08203b6eb5956ebaa48f511a9a73996009b
+      - uses: taojin-6/volumetric_kit_core/.github/actions/check-workflow-triggers@aa0b4b2e36e4e550e8f765b4caa596c74083d830
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'

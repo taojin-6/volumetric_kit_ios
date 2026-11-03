@@ -112,9 +112,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG e1adf08203b6eb5956ebaa48f511a9a73996009b) # core #86 (0.40.0)
+  GIT_TAG aa0b4b2e36e4e550e8f765b4caa596c74083d830) # core #90 (0.44.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.40.0)
+vkc_require_core(0.44.0)
 
 # --- Host mode: pure scanner logic and configuration tests -------------------
 # Everything below this block needs the siblings and MoltenVK, none of which a
@@ -169,16 +169,15 @@ find_package(glm CONFIG REQUIRED)
 # colour conventions, YuvImage) ARKitCapture fills; sensor_apple's
 # PixelBufferImporter, which imports the camera pictures the keyframes sample;
 # and the HEVC encoder (sensor_video) with its rules (sensor_video_testing),
-# which the scanner's `-self-test hevc` runs. Pinned at sensor #34's head while
-# #34 is open; re-pinned at its merge commit before this merges.
+# which the scanner's `-self-test hevc` runs.
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG a83e13f3ae23ae3815552742924226e64b6802d2) # sensor #34's head (0.27.0)
+  GIT_TAG 32be4cc19fffbf6c1484df7e3aea0e75a94cee9b) # sensor #34 (0.29.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
   volumetric_kit::sensor
-  0.27.0
+  0.29.0
   TARGETS
   volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple
@@ -190,16 +189,16 @@ vkc_require_sibling(
 FetchContent_Declare(
   volumetric_kit_grid
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_grid.git
-  GIT_TAG 20bd1c13f07215ad1feffbe4d0ecc06bc9ff9583) # grid #15 (0.8.0)
+  GIT_TAG 17d48f30b3058a7ac9e2548ce2f11b95f659deab) # grid #18 (0.12.0)
 FetchContent_MakeAvailable(volumetric_kit_grid)
-vkc_require_sibling(volumetric_kit::grid 0.8.0 TARGETS
+vkc_require_sibling(volumetric_kit::grid 0.12.0 TARGETS
                     volumetric_kit::grid_volume volumetric_kit::grid_mesh)
 
 # recon: TSDF fusion and the projective texturer.
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 83dd202d0c08fb5f4fa95da54f6611bb3c7edfc4) # recon #337 (0.1.0)
+  GIT_TAG fc153a4739d449139a7f962474fe50a32c59f1c5) # recon #339 (0.1.0)
 FetchContent_MakeAvailable(volumetric_kit_recon)
 vkc_require_sibling(volumetric_kit::recon 0.1.0 TARGETS
                     volumetric_kit::recon_tsdf volumetric_kit::recon_texture)
