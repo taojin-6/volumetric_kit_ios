@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +24,7 @@
 #include <system_error>
 #include <vector>
 
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "MapSteps.hpp"
@@ -364,6 +366,13 @@ TEST(RgbdStreamWriter, RefusalsWriteNothing) {
   EXPECT_EQ(writer->append(camera.frame(0), &not_key.color).domain(),
             vkc::Status::Code::InvalidArgument);
   const Picture key = picture(0, true);
+  // A first frame needs a capture time too: 0 is none.
+  const std::uintmax_t header = file.size();
+  sensor::RgbdFrame untimed = camera.frame(0);
+  untimed.timestamp_ns = 0;
+  EXPECT_EQ(writer->append(untimed, &key.color).domain(),
+            vkc::Status::Code::InvalidArgument);
+  EXPECT_EQ(file.size(), header);
   ASSERT_TRUE(writer->append(camera.frame(0), &key.color).ok());
   const Picture p1 = picture(1, false);
   ASSERT_TRUE(writer->append(camera.frame(1), &p1.color).ok());
@@ -373,7 +382,10 @@ TEST(RgbdStreamWriter, RefusalsWriteNothing) {
   const auto refused = [&](const sensor::RgbdFrame& frame,
                            const app::CodedColor* color, vkc::Status::Code code,
                            const char* what) {
-    EXPECT_EQ(writer->append(frame, color).domain(), code) << what;
+    const vkc::Status status = writer->append(frame, color);
+    EXPECT_EQ(status.domain(), code) << what;
+    EXPECT_EQ(status.message().rfind("RgbdStreamWriter::append: ", 0), 0u)
+        << what << ": " << status.message();
     EXPECT_EQ(file.size(), size) << what;
   };
   sensor::RgbdFrame small = camera.frame(2);
@@ -398,6 +410,10 @@ TEST(RgbdStreamWriter, RefusalsWriteNothing) {
   earlier.timestamp_ns = camera.frame(0).timestamp_ns;
   refused(earlier, &p2.color, vkc::Status::Code::InvalidArgument,
           "a capture time before the last frame's");
+  sensor::RgbdFrame same = camera.frame(2);
+  same.timestamp_ns = camera.frame(1).timestamp_ns;
+  refused(same, &p2.color, vkc::Status::Code::InvalidArgument,
+          "the last frame's capture time");
   sensor::RgbdFrame device_only = camera.frame(2);
   device_only.depth = nullptr;
   device_only.depth_confidence = nullptr;
@@ -415,6 +431,74 @@ TEST(RgbdStreamWriter, RefusalsWriteNothing) {
   for (std::size_t r = 0; r < read.records.size(); ++r) {
     EXPECT_EQ(read.records[r].info.set, r / 2);
     EXPECT_EQ(read.records[r].info.seq, r / 2);
+  }
+}
+
+// Holds the process's file size limit at a value, its signal ignored, so a
+// write past it fails with EFBIG; restores both when it goes.
+class FileSizeLimit {
+ public:
+  explicit FileSizeLimit(rlim_t bytes) {
+    ok_ = ::getrlimit(RLIMIT_FSIZE, &old_) == 0;
+    was_ = std::signal(SIGXFSZ, SIG_IGN);
+    struct rlimit limit = old_;
+    limit.rlim_cur = bytes;
+    ok_ = ok_ && ::setrlimit(RLIMIT_FSIZE, &limit) == 0;
+  }
+  ~FileSizeLimit() {
+    (void)::setrlimit(RLIMIT_FSIZE, &old_);
+    std::signal(SIGXFSZ, was_);
+  }
+  FileSizeLimit(const FileSizeLimit&) = delete;
+  FileSizeLimit& operator=(const FileSizeLimit&) = delete;
+  bool ok() const { return ok_; }
+
+ private:
+  struct rlimit old_{};
+  void (*was_)(int) = SIG_DFL;
+  bool ok_ = false;
+};
+
+/// A depth record that fails after its colour record went out stops the
+/// writer: that append and every later one return the failure, finish
+/// returns the file's, and the file reads back unfinished, ending in the
+/// frame's colour record.
+TEST(RgbdStreamWriter, ADepthRecordFailingAfterItsColourStopsTheWriter) {
+  TempFile file("split");
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  auto writer = open_or_fail(options_for(file.path()), info);
+  ASSERT_NE(writer, nullptr);
+  const FakeRgbdSensor camera(info, kArkitNs);
+  const Picture key = picture(0, true);
+  ASSERT_TRUE(writer->append(camera.frame(0), &key.color).ok());
+
+  const Picture p1 = picture(1, false);
+  vkc::Status failed;
+  {
+    // Room for frame 1's colour record, not for its depth record.
+    const FileSizeLimit limit(file.size() + 1024);
+    ASSERT_TRUE(limit.ok());
+    failed = writer->append(camera.frame(1), &p1.color);
+  }
+  EXPECT_EQ(failed.domain(), vkc::Status::Code::IoError);
+  EXPECT_NE(failed.message().find("the depth record after its colour"),
+            std::string::npos)
+      << failed.message();
+  const Picture p2 = picture(2, false);
+  const vkc::Status later = writer->append(camera.frame(2), &p2.color);
+  EXPECT_EQ(later.domain(), failed.domain());
+  EXPECT_EQ(later.message(), failed.message());
+  EXPECT_EQ(writer->stats().frames, 1u);
+  EXPECT_EQ(writer->finish().domain(), vkc::Status::Code::IoError);
+
+  const ReadFile read = read_file(file.path());
+  EXPECT_FALSE(read.finished);
+  ASSERT_EQ(read.records.size(), 3u);
+  const std::uint16_t tracks[] = {0, 1, 0};
+  const std::uint64_t sets[] = {0, 0, 1};
+  for (std::size_t r = 0; r < 3; ++r) {
+    EXPECT_EQ(read.records[r].info.track, tracks[r]) << "record " << r;
+    EXPECT_EQ(read.records[r].info.set, sets[r]) << "record " << r;
   }
 }
 

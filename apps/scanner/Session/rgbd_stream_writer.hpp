@@ -118,8 +118,9 @@ class RgbdStreamWriter {
   ///         the device only is `Unsupported`), and
   ///         `Status::Code::InvalidArgument` for a null @p color in a
   ///         session with colour or one in a session without, an empty
-  ///         picture, the first picture not a key, a capture time below the
-  ///         last frame's, or a finished writer; the file's write error, or
+  ///         picture, the first picture not a key, no capture time (0) or
+  ///         one not after the last frame's, or a finished writer; the
+  ///         file's write error, or
   ///         a failure to append the depth record after the colour record,
   ///         after which the file may end inside the frame and later appends
   ///         fail.
@@ -127,7 +128,8 @@ class RgbdStreamWriter {
 
   /// @brief End the session: the file's footer. Idempotent.
   /// @return OK; the footer's write error, or the file's earlier one; a
-  ///         later call returns the first's.
+  ///         later call returns the first's. `Status::Code::OutOfMemory`
+  ///         leaves the session open, and a later call tries again.
   core::Status finish();
 
   /// @return The counts so far.

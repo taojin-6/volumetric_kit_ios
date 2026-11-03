@@ -109,6 +109,7 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
 core::Status RgbdStreamWriter::append(const sensor::RgbdFrame& frame,
                                       const CodedColor* color) try {
   constexpr const char* kApi = "append";
+  constexpr const char* kWhere = "RgbdStreamWriter::append";
   Impl& s = *impl_;
   if (s.finished) return refuse(kApi, "the session is finished");
   if (!s.split.ok()) return s.split;
@@ -126,16 +127,22 @@ core::Status RgbdStreamWriter::append(const sensor::RgbdFrame& frame,
   if (color != nullptr && s.stats.frames == 0 && !color->key) {
     return refuse(kApi, "a first picture that is not a key");
   }
-  if (s.stats.frames > 0 && frame.timestamp_ns < s.last_pts_ns) {
+  // Times strictly increase, as the frame contract's: 0 is no time.
+  if (frame.timestamp_ns == 0) return refuse(kApi, "no capture time (0)");
+  if (s.stats.frames > 0 && frame.timestamp_ns <= s.last_pts_ns) {
     return refuse(kApi, "a capture time of " +
                             std::to_string(frame.timestamp_ns) +
-                            " ns, below the last frame's " +
+                            " ns, not after the last frame's " +
                             std::to_string(s.last_pts_ns));
   }
-  VKC_ASSIGN(const wire::DepthRecord depth, wire::encode_depth(s.info, frame));
+  auto encoded = wire::encode_depth(s.info, frame);
+  if (!encoded.ok()) return encoded.status().with_context(kWhere);
+  const wire::DepthRecord depth = std::move(encoded).value();
   std::array<std::uint8_t, wire::kColorPrefixBytes> color_prefix{};
   if (color != nullptr) {
-    VKC_ASSIGN(color_prefix, wire::encode_color(s.info, frame, color->codes));
+    auto prefix = wire::encode_color(s.info, frame, color->codes);
+    if (!prefix.ok()) return prefix.status().with_context(kWhere);
+    color_prefix = prefix.value();
   }
 
   // One set, one pts, and seq = set on both tracks: a frame is written whole
@@ -152,13 +159,14 @@ core::Status RgbdStreamWriter::append(const sensor::RgbdFrame& frame,
         color_prefix.data(), color_prefix.size(), color->data, color->size);
     record.track = 0;
     record.key = color->key;
-    VKC_TRY(s.file->append(record, color_payload));
+    const core::Status colour = s.file->append(record, color_payload);
+    if (!colour.ok()) return colour.with_context(kWhere);
     record.track = s.depth_track;
     record.key = true;
     const core::Status written = s.file->append(record, depth_payload);
     if (!written.ok()) {
-      s.split = written.with_context(
-          "RgbdStreamWriter::append: the depth record after its colour");
+      s.split = written.with_context(std::string(kWhere) +
+                                     ": the depth record after its colour");
       return s.split;
     }
     s.stats.color_bytes += color_payload.size();
@@ -166,7 +174,8 @@ core::Status RgbdStreamWriter::append(const sensor::RgbdFrame& frame,
   } else {
     record.track = s.depth_track;
     record.key = true;
-    VKC_TRY(s.file->append(record, depth_payload));
+    const core::Status written = s.file->append(record, depth_payload);
+    if (!written.ok()) return written.with_context(kWhere);
   }
   s.stats.depth_bytes += depth_payload.size();
   ++s.stats.frames;
@@ -180,8 +189,11 @@ core::Status RgbdStreamWriter::append(const sensor::RgbdFrame& frame,
 core::Status RgbdStreamWriter::finish() {
   Impl& s = *impl_;
   if (s.finished) return s.finish_status;
+  core::Status done = s.file->finish();
+  // Out of memory leaves grid's writer as it was, open: a later call retries.
+  if (done.domain() == core::Status::Code::OutOfMemory) return done;
   s.finished = true;
-  s.finish_status = s.file->finish();
+  s.finish_status = std::move(done);
   return s.finish_status;
 }
 
