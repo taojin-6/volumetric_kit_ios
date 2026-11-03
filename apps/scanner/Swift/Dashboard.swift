@@ -228,6 +228,8 @@ final class DashboardModel: ObservableObject {
 
 struct DashboardView: View {
   @ObservedObject var model: DashboardModel
+  /// The live link: its entry is the first card, its state a headline chip.
+  @ObservedObject var link: LinkModel
   /// Told to UIKit rather than kept here alone: the host's height constraint
   /// has to follow, because a ScrollView has no intrinsic height and would
   /// otherwise keep its expanded size around a collapsed body.
@@ -284,6 +286,7 @@ struct DashboardView: View {
         ScrollView {
           VStack(alignment: .leading, spacing: 10) {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+              Card("Link") { LinkEntry(link: link) }
               Card("Timeline") { timeline }
               // The stage bars, built here from `stages` and from no section.
               // The bridge used to publish the same figures twice -- as bars
@@ -430,6 +433,9 @@ struct DashboardView: View {
   }
 
   @ViewBuilder private var chips: some View {
+    if let word = link.chip {
+      Chip(word, tone: Self.tone(for: link.state))
+    }
     Chip(model.trackingText, tone: model.trackingHealthy ? .good : .warn)
     Chip("\(Int(model.fps)) fps", tone: .neutral)
     if model.dropFraction > 0.2 {
@@ -728,6 +734,14 @@ struct DashboardView: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private static func tone(for link: VolumetricLinkState) -> Tone {
+    switch link {
+    case .connected: return .good
+    case .retrying, .needsLocalNetwork: return .warn
+    default: return .neutral
+    }
   }
 
   private static func color(for tone: VolumetricStatTone) -> Color {

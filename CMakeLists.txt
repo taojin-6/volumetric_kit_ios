@@ -107,7 +107,9 @@ include(FetchContent)
 # takes the Vulkan SDK from Homebrew, an iOS one the core's iOS module (its
 # cmake/vkc_ios.cmake), which links MoltenVK's static library from MoltenVK_ROOT
 # and answers every find_package(glm) -- the siblings' and this file's -- with
-# the host's glm headers as a header-only target.
+# the host's glm headers as a header-only target. The net tier (core_net),
+# always built, checks the on-screen address and dials the live link's reader;
+# 0.44.0 brings its port and host:port parser.
 set(VKC_WITH_CONFIG ON)
 set(VKC_WITH_VULKAN
     ON
@@ -115,9 +117,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 2163debc075bd7bfcd3738f8273821096cc6bece) # core #89 (0.43.0)
+  GIT_TAG aa0b4b2e36e4e550e8f765b4caa596c74083d830) # core #90 (0.44.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.43.0)
+vkc_require_core(0.44.0)
 
 # glm, found here so that the imported glm::glm is visible to vi_core and to the
 # siblings below: an imported target belongs to the directory that found it and
@@ -163,15 +165,21 @@ vkc_require_sibling(
   volumetric_kit::sensor_wire)
 
 # grid: the sparse voxel block grid and Marching Cubes, whose DeviceMesh gfx
-# draws in place, and the .vrst container (grid_stream) vi_session writes.
+# draws in place, and the .vrst container (grid_stream) vi_session writes and
+# serves to the reader it dials (grid_networking).
 FetchContent_Declare(
   volumetric_kit_grid
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_grid.git
   GIT_TAG 17d48f30b3058a7ac9e2548ce2f11b95f659deab) # grid #18 (0.12.0)
 FetchContent_MakeAvailable(volumetric_kit_grid)
 vkc_require_sibling(
-  volumetric_kit::grid 0.12.0 TARGETS volumetric_kit::grid_volume
-  volumetric_kit::grid_mesh volumetric_kit::grid_stream)
+  volumetric_kit::grid
+  0.12.0
+  TARGETS
+  volumetric_kit::grid_volume
+  volumetric_kit::grid_mesh
+  volumetric_kit::grid_stream
+  volumetric_kit::grid_networking)
 
 # --- Host mode: pure scanner logic, the session writer, configuration tests --
 # vi_core is plain C++ over glm; vi_session is host code on sensor's and grid's

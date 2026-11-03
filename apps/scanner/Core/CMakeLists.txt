@@ -21,6 +21,7 @@ add_library(
   AllocationStop.cpp
   FailureHandling.cpp
   GrowthPolicy.cpp
+  LinkState.cpp
   MapSteps.cpp
   MemoryBudget.cpp
   OrbitCamera.cpp
