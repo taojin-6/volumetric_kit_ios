@@ -215,14 +215,18 @@ final class ScannerViewController: UIViewController {
 
   /// `-minutes N`'s end, for a measurement run that needs no one to stop it:
   /// the loop winds down as it does on backgrounding -- the fuse thread prints
-  /// the run's last console line as it ends, then the camera stops -- and the
-  /// app exits.
+  /// the stop's console line as it ends, then the camera stops -- and the app
+  /// exits.
   private func endTimedRun() {
     runEnded = true
     print("scanner: the \(launch.minutes)-minute run is over; stopping")
     stopDisplayLink()
     isCapturing = false
     renderer?.beginStopFusion()
+    // A suspend's teardown still in its `stopFusion` owns the stop, and its
+    // completion exits: a second `stopFusion` from here would join the one
+    // fuse thread from two threads at once, which terminates the app.
+    guard !teardownInFlight else { return }
     let renderer = self.renderer
     DispatchQueue.global(qos: .userInitiated).async {
       renderer?.stopFusion()
@@ -350,6 +354,12 @@ final class ScannerViewController: UIViewController {
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.teardownInFlight = false
+        // A `-minutes N` run that ended during this teardown left its exit
+        // here; see endTimedRun.
+        if self.runEnded {
+          fflush(stdout)
+          exit(0)
+        }
         // Reconciled rather than assumed: the app may have been foregrounded,
         // or the view re-appeared, while the drain was running. `resume` is
         // precondition-checked, so this is a no-op whenever it should not run.

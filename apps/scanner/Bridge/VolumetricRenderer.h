@@ -624,9 +624,11 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///        ARKit's session and lets the camera go.
 ///
 /// The camera stops after the join, never before: the thread polls it. The
-/// thread prints the run's last console line as it ends.
+/// thread prints the stop's console line ("sa stop") as it ends.
 ///
-/// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
+/// From one thread at a time: two calls at once would join the one fuse
+/// thread twice, which terminates the app. Idempotent otherwise, and safe on
+/// a renderer that never started. `-dealloc` calls it,
 /// so a dropped renderer cannot leave the thread running — but call it
 /// explicitly when leaving the screen, because until it returns the thread is
 /// still submitting compute work on the shared queue.
