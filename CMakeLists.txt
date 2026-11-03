@@ -115,9 +115,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 2163debc075bd7bfcd3738f8273821096cc6bece) # core #89 (0.43.0)
+  GIT_TAG aa0b4b2e36e4e550e8f765b4caa596c74083d830) # core #90 (0.44.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.43.0)
+vkc_require_core(0.44.0)
 
 # glm, found here so that the imported glm::glm is visible to vi_core and to the
 # siblings below: an imported target belongs to the directory that found it and
