@@ -44,6 +44,11 @@ jobs:
       # installs and upgrades them.
       - name: Check dependencies
         run: |
+          # Without brew every formula would look missing.
+          command -v brew >/dev/null || {
+            echo "::error::brew is not on this runner's PATH"
+            exit 1
+          }
           missing=""
           for pkg in cmake glm molten-vk vulkan-headers vulkan-loader shaderc; do
             brew list --formula "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"

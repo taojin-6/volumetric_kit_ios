@@ -96,7 +96,7 @@ the bundled configuration test build and run on the host:
 
 ```sh
 brew install glm molten-vk vulkan-headers vulkan-loader shaderc  # once
-cmake -S . -B build-host -DVI_HOST_TESTS=ON
+cmake -S . -B build-host -DVI_HOST_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-host --parallel
 ctest --test-dir build-host --output-on-failure
 ```
