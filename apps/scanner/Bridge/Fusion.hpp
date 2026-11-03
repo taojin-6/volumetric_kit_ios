@@ -4,13 +4,14 @@
 #pragma once
 
 /// @file Fusion.hpp
-/// @brief The reconstruction spine, driven off captured ARKit frames.
+/// @brief The reconstruction spine, driven off the camera's frames.
 ///
-/// Owns the per-scan state — grid's sparse block grid and marching cubes,
-/// recon's TSDF integrator and projective texturer — and turns polled
-/// `CapturedFrame`s into a host mesh the renderer draws. The desktop
-/// `fuse_viewer` is the reference; this is that loop with ARKit in place of a
-/// Replica sequence.
+/// Owns the per-scan state — sensor's frame prep, grid's sparse block grid and
+/// marching cubes, recon's TSDF integrator and projective texturer — and turns
+/// the `sensor::RgbdFrame`s `ArkitSensor` hands out into a mesh the renderer
+/// draws. Each frame goes to the GPU once: `GpuFramePrep` gates its depth on
+/// its confidence and converts its picture there, and the fusion tiers read the
+/// prepared buffers in place, as recon's `fuse_frame` does.
 ///
 /// @warning **No cross-library GPU wait.** iOS gives one queue in the family,
 ///          so the compute libraries and gfx submit through one mutex — and
@@ -36,7 +37,6 @@
 // the device, and this header cannot be reached from a host build: it pulls in
 // all of the compute libraries.
 #include "AllocationStop.hpp"
-#include "CapturedFrame.hpp"
 // @ref kSurveyEveryFrames and the staleness rules the read-out shares with the
 // fuse loop, and @ref plan_growth / @ref guard_allocation -- the two decisions
 // `fuse` makes about the block table. All pure, all on the far side of the same
@@ -53,8 +53,9 @@
 #include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/texture/projective_texturer.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
-#include "volumetric_kit/sensor/apple/pixel_buffer_importer.hpp"
 #include "volumetric_kit/sensor/frame/vector_types.hpp"
+#include "volumetric_kit/sensor/prep/gpu_frame_prep.hpp"
+#include "volumetric_kit/sensor/rgbd_frame.hpp"
 #include "volumetric_kit/sensor/yuv_image.hpp"
 
 namespace volumetric_kit::ios_app {
@@ -207,9 +208,10 @@ struct FusionConfig {
   /// not a defect -- a persistent textured reconstruction needs the
   /// multi-keyframe atlas, which is a later slice.
   ///
-  /// Gated at the call site on the frame's picture having been imported, not
-  /// on this flag alone: a frame without one would otherwise get real `uv0`
-  /// addressing a keyframe the renderer never has. See @ref Fusion::remesh.
+  /// Gated at the call site on the frame carrying a picture the renderer can
+  /// sample, not on this flag alone: a frame without one would otherwise get
+  /// real `uv0` addressing a keyframe the renderer never has. See
+  /// @ref Fusion::remesh.
   ///
   /// @warning **This flag being on does not mean the pass runs.** recon's
   ///          `ProjectiveTexturer::texture` refuses a mesh whose vertices are
@@ -289,12 +291,12 @@ struct FusionConfig {
   /// higher is not free -- see grid's `slot_count`.
   std::uint32_t mesh_slots = 2;
 
-  /// @brief The queue families that will touch the mesh buffers and the
-  ///        keyframes' plane images; the compute device's own family among
-  ///        them.
+  /// @brief The queue families that will touch the mesh buffers; the compute
+  ///        device's own family among them. The keyframes' plane images are
+  ///        the camera's, shared by `ArkitSensor::Options` with the same two.
   ///
-  /// Both of them, unconditionally -- grid and sensor reduce the pair to its
-  /// distinct entries and pick EXCLUSIVE where they turn out to be one family.
+  /// Both of them, unconditionally -- grid reduces the pair to its distinct
+  /// entries and picks EXCLUSIVE where they turn out to be one family.
   /// Under the two-family queue plan a phone actually gets, they differ, and a
   /// mesh created EXCLUSIVE would be read by a family that does not own it:
   /// silently undefined, not an error.
@@ -328,15 +330,16 @@ enum class TextureState : std::uint8_t {
   Pending,
   /// On, and the last remesh ran the pass to completion.
   Ran,
-  /// Skipped because the frame carried no colour, or no camera picture to
-  /// sample as captured -- `convert_color` refuses an unsupported pixel
-  /// format, HLG and PQ, and publishes no picture for colour it had to bring
-  /// to the canonical encoding, so this is reachable on real hardware rather
-  /// than only at session start. Not a fault: the mesh renders as fused voxel
-  /// colour, which is what such a frame should look like.
+  /// Skipped because the frame carried no picture the renderer samples as
+  /// captured: none, one whose colour is not canonical (Display P3, whose
+  /// colour @ref Fusion::fuse drops, since the frame prep takes canonical
+  /// colour alone), or one with its chroma sited other than left or centre.
+  /// `ArkitSensor` refuses the frames whose tags it cannot name, so this is
+  /// reachable on real hardware only through those. Not a fault: the mesh
+  /// renders as fused voxel colour, which is what such a frame should look
+  /// like.
   NoColor,
-  /// The pass, or the import of the picture it textures from, was attempted
-  /// and refused or failed; the reason is in
+  /// The pass was attempted and refused or failed; the reason is in
   /// @ref FusionStats::last_error. Distinct from @ref NoColor because this one
   /// *is* a fault -- and it is the state a build against a recon that still
   /// refuses shared-vertex meshes sits in permanently, which otherwise looks
@@ -490,6 +493,11 @@ struct FusionStats {
   /// only total, and each row has a device half beside it.
   float allocate_ms = 0.0f;
   float integrate_ms = 0.0f;
+  /// The host span around `GpuFramePrep::prepare`, measured on every fused
+  /// frame as the two above are: the frame's depth and picture to the device
+  /// buffers the allocate and the integrate read. Its `"frame prep"` row, when
+  /// rows are measured, carries the same span with its device half.
+  float prep_ms = 0.0f;
   float extract_ms = 0.0f;
   /// The host span around `ProjectiveTexturer::texture`, or 0 when the pass did
   /// not run. **Read it with @ref texture_state, never alone**: 0.0 here means
@@ -515,22 +523,23 @@ struct FusionStats {
   /// at one surface and watch where texturing stops -- has nothing to correlate
   /// the watching against.
   float occlusion_threshold = 0.0f;
-  /// The host span around the keyframe import the fuse thread makes per
-  /// textured remesh, in ms.
+  /// The host span around the camera poll that took this fused frame, in ms:
+  /// `ArkitSensor::poll`, which imports the frame's picture as two plane images
+  /// on the fuse thread.
   ///
   /// Measured because it is otherwise invisible: it sits outside the libraries'
   /// stage spans, outside @ref extract_ms and outside @ref texture_ms. Usually
   /// a lookup, since the importer keeps each camera surface's images; the first
-  /// picture on a surface makes them and waits on one submit. Zero on a remesh
-  /// that imported nothing.
-  float keyframe_import_ms = 0.0f;
+  /// picture on a surface makes them and waits on one submit.
+  float poll_ms = 0.0f;
 
   /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
   ///        @ref stages_truncated, not grown into.
   ///
   /// Sixteen because the published set is the WHOLE pipeline, not just what
-  /// reports through StageMetrics: allocate, resize and integrate and their
-  /// breakdowns come from the tiers, and extract plus its phases are appended
+  /// reports through StageMetrics: frame prep, allocate, resize and integrate
+  /// and their breakdowns come from the tiers, and extract plus its phases are
+  /// appended
   /// from @ref extract so the end-to-end sequence is one list rather than two a
   /// reader has to rejoin.
   static constexpr std::size_t kMaxStages = 16;
@@ -548,8 +557,9 @@ struct FusionStats {
   /// inside that critical section -- the reason @ref FusionTraceStats exists at
   /// all.
   ///
-  /// Five rows on a healthy frame come from the tiers -- `allocate`, `resize`,
-  /// `integrate`, its `"  ..active set"` breakdown, and `texture` when @ref
+  /// Six rows on a healthy frame come from the tiers -- `frame prep`,
+  /// `allocate`, `resize`, `integrate`, its `"  ..active set"` breakdown, and
+  /// `texture` when @ref
   /// FusionConfig::texture is on. **The extract is appended to them rather than
   /// reported through them:** `MarchingCubes::extract_device` reports through
   /// `mesh::ExtractTimings`, a richer per-phase struct this app holds whole in
@@ -914,7 +924,20 @@ struct FusionTraceStats {
   float ms_since_fuse = 0.0f;
 };
 
-/// @brief Fuses captured frames into a volume and extracts a drawable mesh.
+/// @brief The host spans of one fused frame's three blocking steps, in ms:
+///        what the frame cost the fuse thread before any remesh.
+struct FuseTimes {
+  float prep_ms = 0.0f;       ///< @ref FusionStats::prep_ms.
+  float allocate_ms = 0.0f;   ///< @ref FusionStats::allocate_ms.
+  float integrate_ms = 0.0f;  ///< @ref FusionStats::integrate_ms.
+  /// @return The three together: the frame from its poll to fused.
+  float fuse_ms() const noexcept {
+    return prep_ms + allocate_ms + integrate_ms;
+  }
+};
+
+/// @brief Fuses the camera's frames into a volume and extracts a drawable
+///        mesh.
 ///
 /// Single-threaded from the caller's side: one thread calls @ref fuse, another
 /// reads @ref take_mesh. The mesh is published under a lock and versioned, so
@@ -926,11 +949,12 @@ class Fusion {
   Fusion(const Fusion&) = delete;
   Fusion& operator=(const Fusion&) = delete;
 
-  /// @brief Build the grid and the compute pipelines on the shared device.
+  /// @brief Build the frame prep, the grid and the compute pipelines on the
+  ///        shared device.
   ///
-  /// With @ref FusionConfig::texture on, also the keyframe importer, so a
-  /// device that cannot import camera pictures fails here rather than every
-  /// remesh.
+  /// The frame prep's depth outlier filter is off and its depth offset 0, so
+  /// the depth fused is the camera's, gated at its own confidence floor: what
+  /// the scanner fused before the prep moved to the GPU.
   /// @param device     The compute libraries' adopted view of the shared
   ///                   `VkDevice`.
   /// @param allocator  Their allocator on that device.
@@ -938,12 +962,25 @@ class Fusion {
   vkc::Status start(vkc::Device& device, vkc::Allocator& allocator,
                     const FusionConfig& config);
 
-  /// @brief Fuse one captured frame, and remesh if the cadence says so.
+  /// @brief Fuse one camera frame, and remesh if the cadence says so.
+  ///
+  /// The frame goes to the device once: `GpuFramePrep::prepare` gates its
+  /// depth at the frame's confidence floor and converts its picture to
+  /// R'G'B', and the allocate, the integrate and the texture pass read those
+  /// buffers in place. The keyframe a remesh publishes is the frame's own
+  /// picture, `frame.color`, as the camera imported it. A picture whose colour
+  /// is not canonical (Display P3) is dropped and the frame fuses its depth
+  /// alone, since the prep converts canonical colour only.
   ///
   /// A failing stage is recorded in @ref stats and skipped rather than
   /// propagated: a single dropped frame should not end a scan the user is in
   /// the middle of.
-  void fuse(const CapturedFrame& frame);
+  /// @param frame    A frame from `ArkitSensor::poll`, its depth on the host.
+  /// @param poll_ms  The host span of the poll that took it
+  ///                 (@ref FusionStats::poll_ms).
+  /// @return The frame's spans when it fused; none when the cadence skipped
+  ///         it or a stage failed before it fused.
+  std::optional<FuseTimes> fuse(const sensor::RgbdFrame& frame, float poll_ms);
 
   /// @return The camera-to-world pose of the most recently fused frame.
   ///
@@ -989,12 +1026,13 @@ class Fusion {
     /// and drawing one against a later frame's picture samples the wrong place
     /// everywhere it was textured.
     ///
-    /// The images hold the camera's pixel buffer, so the picture stays as long
-    /// as the consumer holds this; @ref take_mesh hands it over and keeps no
-    /// copy. The capture's writer has finished with it, so sampling it waits on
-    /// nothing.
+    /// It is the frame's own picture (`RgbdFrame::color`), as `ArkitSensor`
+    /// imported it at its poll. The images hold the camera's pixel buffer, so
+    /// the picture stays as long as the consumer holds this; @ref take_mesh
+    /// hands it over and keeps no copy. The camera has finished writing it, so
+    /// sampling it waits on nothing.
     ///
-    /// No planes whenever the import or the texture pass did not succeed: a
+    /// No planes whenever the texture pass did not run or succeed: a
     /// refusal leaves `uv0` at the sentinel, so no coordinate points at a
     /// keyframe the consumer never has, and @ref FusionStats::texture_state
     /// says which happened.
@@ -1126,11 +1164,23 @@ class Fusion {
   ///                 the rows comparable. The extract is *not* measured into it
   ///                 -- it reports through `mesh::ExtractTimings`; see @ref
   ///                 FusionStats::stages.
-  void remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics);
+  /// @param frame     The frame just fused, whose picture is the keyframe.
+  /// @param prepared  Its prepared form, whose depth the texture pass tests
+  ///                  visibility against.
+  /// @param color     Whether @p frame's picture is one the renderer samples
+  ///                  (@ref TextureState::NoColor otherwise).
+  void remesh(const sensor::RgbdFrame& frame,
+              const sensor::DeviceFrame& prepared, bool color,
+              vkc::StageMetrics* metrics);
 
   FusionConfig config_{};
   // The libraries' per-scan state is create-only (no default constructor),
   // which is why these are optional rather than plain members.
+  //
+  // The frame prep: each frame's depth and picture to the device buffers the
+  // tiers below read. Its outputs come back to it once the frame that holds
+  // them is fused and textured.
+  std::optional<sensor::GpuFramePrep> prep_;
   std::optional<vgrid::volume::VoxelBlockGrid> grid_;
   std::optional<vr::tsdf::TsdfIntegrator> integrator_;
   std::optional<vgrid::mesh::MarchingCubes> marching_cubes_;
@@ -1162,10 +1212,6 @@ class Fusion {
   // one frame in the steady state.
   std::uint64_t published_generation_ = 0;
   bool published_taken_ = true;
-  /// Imports each textured frame's camera picture as two plane images,
-  /// shared with the renderer's queue family. Made in @ref start when
-  /// texturing is on, and used on the fuse thread alone.
-  std::optional<sensor::PixelBufferImporter> importer_;
   /// The keyframe the published mesh indexes into, until @ref take_mesh hands
   /// it over; no planes when the last remesh did not texture. Guarded by
   /// @ref mutex_ with the mesh it belongs to -- see @ref Published::keyframe.

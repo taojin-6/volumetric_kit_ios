@@ -4,6 +4,7 @@
 #import "VolumetricLink.h"
 
 #import "BridgeStrings.hpp"
+#import "VolumetricRenderer.h"
 
 #include <stdlib.h>
 
@@ -11,7 +12,6 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 
 #include "LinkState.hpp"
@@ -57,26 +57,6 @@ std::string utf8(NSString* text) {
   return bytes != nullptr ? std::string(bytes) : std::string();
 }
 
-// ARKit's depth camera as the capture last converted it: tracked, on the
-// host's clock, its depth alone. None before the first converted frame.
-std::optional<sensor::SensorInfo> arkit_depth_of(
-    const VolumetricCaptureStats& s) {
-  if (s.frames_submitted == 0 || s.depth_width == 0 || s.depth_height == 0) {
-    return std::nullopt;
-  }
-  sensor::camera::CameraModel depth;
-  depth.size = {s.depth_width, s.depth_height};
-  depth.intrinsics = {s.depth_fx, s.depth_fy, s.depth_cx, s.depth_cy};
-  sensor::SensorInfo info;
-  info.id = "arkit";
-  info.model = "ARKit scene depth";
-  info.depth = depth;
-  info.clock = sensor::ClockDomain::Host;
-  info.pose = sensor::PoseSource::Tracked;
-  info.fps = 60;
-  return info;
-}
-
 }  // namespace
 
 @implementation VolumetricLink {
@@ -94,7 +74,7 @@ std::optional<sensor::SensorInfo> arkit_depth_of(
 
 - (BOOL)connectToAddress:(NSString*)address
                     port:(NSString*)port
-                 capture:(VolumetricCapture*)capture
+                renderer:(nullable VolumetricRenderer*)renderer
                    error:(NSError* _Nullable*)error {
   vkc::Result<app::DialTarget> target =
       app::parse_dial_entry(utf8(address), utf8(port));
@@ -107,12 +87,17 @@ std::optional<sensor::SensorInfo> arkit_depth_of(
     return YES;
   }
   if (!_writer) {
-    const std::optional<sensor::SensorInfo> info =
-        arkit_depth_of(capture.stats);
-    if (!info) {
-      set_error(error, vkc::Status::invalid_argument(
-                           "the camera has no depth frame yet; connect once "
-                           "the scan shows frames"));
+    // The camera as it opened, fixed for the renderer's life.
+    const auto* info = static_cast<const sensor::SensorInfo*>(
+        renderer != nil ? [renderer sensorInfoHandle] : nullptr);
+    if (info == nullptr) {
+      set_error(error,
+                vkc::Status::invalid_argument(
+                    renderer == nil
+                        ? "the scanner is still starting; connect once it "
+                          "shows frames"
+                        : "the camera did not open, so there is no session "
+                          "to send"));
       return NO;
     }
     app::RgbdStreamOptions options;

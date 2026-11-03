@@ -32,6 +32,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(
   vi_core_tests
   allocation_stop_test.cpp
+  capture_report_test.cpp
   freshness_test.cpp
   growth_policy_test.cpp
   keyframe_binding_test.cpp

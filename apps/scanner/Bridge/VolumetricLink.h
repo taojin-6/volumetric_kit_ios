@@ -12,10 +12,11 @@
 /// first connect and kept until the link goes, so a reconnect, here or to
 /// another address, is the same session.
 ///
-/// **It sends the session alone, with no frames,** until the scanner reads
-/// ARKit through sensor's `IRgbdSensor`, whose `SensorInfo` then opens it.
-/// Until then it describes the sensor from the capture's last converted
-/// frame: ARKit's depth camera, tracked, on the host's clock, depth alone.
+/// The session describes the camera as it opened (`ArkitSensor::info()`,
+/// through the renderer): its depth camera and picture, tracked, on the
+/// host's clock. **It sends the session alone, with no frames, and no
+/// pictures (`RgbdStreamOptions::color` off)** until the scanner hands the
+/// camera's frames to the writer.
 ///
 /// @warning Main thread only. Releasing the link ends its session there,
 ///          which waits for the dial under way and the reader's last records
@@ -24,7 +25,7 @@
 
 #import <Foundation/Foundation.h>
 
-#import "ARKitCapture.h"
+@class VolumetricRenderer;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -69,15 +70,15 @@ typedef struct {
 /// @brief Dial the reader the entry names, from now on: the address field
 ///        (a numeric IPv4 address, or one with ":port") and the port field
 ///        (empty for @ref defaultPort). An empty address disconnects.
-/// @param capture  The capture whose depth camera the session describes, at
-///                 the first connect.
+/// @param renderer  The renderer whose camera the session describes, at the
+///                  first connect; nil while it is still coming up.
 /// @return `YES`; `NO` with @p error for an entry the core's checks refuse,
-///         its description the core's sentence for the screen, a capture
-///         with no converted frame yet at the first connect, or a session
+///         its description the core's sentence for the screen, no renderer
+///         or a camera that did not open at the first connect, or a session
 ///         that could not start. The last target is kept on a refusal.
 - (BOOL)connectToAddress:(NSString*)address
                     port:(NSString*)port
-                 capture:(VolumetricCapture*)capture
+                renderer:(nullable VolumetricRenderer*)renderer
                    error:(NSError* _Nullable*)error;
 
 /// @brief Stop dialling, and let a connected reader go.

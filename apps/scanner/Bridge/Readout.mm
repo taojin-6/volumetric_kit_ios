@@ -147,7 +147,7 @@ NS_ASSUME_NONNULL_END
     // panel drew it as a bar and then listed it again underneath a heading
     // reading "not in the bars above". One measurement, one publication: the
     // bar. See Fusion.mm's push_stage("  ..other", ...).
-    _keyframeImportMs = stats.keyframe_import_ms;
+    _pollMs = stats.poll_ms;
     _framesFused = stats.frames_fused;
     _msSinceStages = stats.ms_since_stages;
     // Published beside `ms_since_stages` because it is the only thing that one
@@ -467,19 +467,17 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
       out += "   (device timing retired after a fence failure -- host only for "
              "the rest of this run)\n";
     }
-    // The fuse thread's keyframe import, which sits outside the libraries'
-    // spans, outside `extract_ms` and outside `texture_ms` -- so a reader
-    // summing the column above under-counts the frame by exactly this. The
-    // panel draws it under the bars as "not in the bars above"; this is that
-    // heading's text rendering, and it reached the panel but not the
-    // transcript.
+    // The fuse thread's camera poll, which imports the frame's picture and
+    // sits outside the libraries' spans, outside `extract_ms` and outside
+    // `texture_ms` -- so a reader summing the column above under-counts the
+    // frame by exactly this. The panel draws it under the bars as "not in the
+    // bars above"; this is that heading's text rendering.
     //
-    // The same threshold the panel uses, so an import too small to be worth a
+    // The same threshold the panel uses, so a poll too small to be worth a
     // line is absent from both rather than from one.
-    if (s.keyframe_import_ms > 0.005f) {
+    if (s.poll_ms > 0.005f) {
       out += "   not in the rows above\n";
-      out += sfmt("   %-18s%6.2f ms cpu\n", "keyframe import",
-                  s.keyframe_import_ms);
+      out += sfmt("   %-18s%6.2f ms cpu\n", "camera poll", s.poll_ms);
     }
   } else {
     // Which of the two, because they want different responses and an empty
@@ -775,7 +773,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // `ExtractTimings` is filled by `remesh` either way; only the stage publish
   // is behind the flag.
   if (s.stage_count == 0) {
-    // Two host spans measured on every fused frame regardless of the switch.
+    // Three host spans measured on every fused frame regardless of the switch.
     // Their own section rather than rows beside the extract phases below,
     // because they are a different cadence: these are this frame's, and
     // everything in `s.extract` is the last *successful remesh's*. Putting two
@@ -783,6 +781,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     // Block table card was rewritten to stop making.
     if (s.frames_fused > 0) {
       NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+      add(r, @"frame prep", fmt("%.2f ms", s.prep_ms));
       add(r, @"allocate", fmt("%.2f ms", s.allocate_ms));
       add(r, @"integrate", fmt("%.2f ms", s.integrate_ms));
       [out addObject:make_section(@"Fuse timing", r)];

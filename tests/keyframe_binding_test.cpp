@@ -179,6 +179,25 @@ TEST(KeyframeBinding, KeyframeWithoutPlanesBindsWhiteQuietly) {
   }
 }
 
+// What Fusion asks before it textures a mesh from a picture: exactly the
+// keyframes the slot would offer the set rather than bind white for.
+TEST(KeyframeBinding, SampledIsWhatTheSlotWouldOffer) {
+  EXPECT_TRUE(app::keyframe_sampled(make_keyframe(ChromaLocation::Left)));
+  EXPECT_TRUE(app::keyframe_sampled(make_keyframe(ChromaLocation::Center)));
+  for (const ChromaLocation location :
+       {ChromaLocation::TopLeft, ChromaLocation::Top,
+        ChromaLocation::BottomLeft, ChromaLocation::Bottom}) {
+    EXPECT_FALSE(app::keyframe_sampled(make_keyframe(location)));
+  }
+  Keyframe luma_only = make_keyframe();
+  luma_only.image[1].reset();
+  Keyframe chroma_only = make_keyframe();
+  chroma_only.image[0].reset();
+  for (const Keyframe& planeless : {Keyframe{}, luma_only, chroma_only}) {
+    EXPECT_FALSE(app::keyframe_sampled(planeless));
+  }
+}
+
 TEST(KeyframeBinding, SetRefusalFallsBackToWhite) {
   Slot slot;
   FakeSet set;

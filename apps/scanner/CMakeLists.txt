@@ -35,15 +35,16 @@ function(vi_add_scanner_bridge bridge_target)
     ${ARGN}
     Bridge/VolumetricRenderer.mm
     Bridge/AllocationStopDisplay.mm
-    Bridge/ARKitCapture.mm
     Bridge/AtlasRing.cpp
     Bridge/BridgeStrings.mm
     Bridge/FrameTrace.cpp
+    Bridge/FuseLoop.cpp
     Bridge/Fusion.mm
     Bridge/HevcSelfTest.cpp
     Bridge/MemoryQuery.cpp
     Bridge/Readout.mm
     Bridge/RendererErrors.mm
+    Bridge/ScannerLaunch.mm
     Bridge/ScannerSelfTest.mm
     Bridge/VolumetricLink.mm)
 
@@ -121,10 +122,13 @@ function(vi_add_scanner_bridge bridge_target)
   target_include_directories(${bridge_target}
                              PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Bridge")
 
-  # sensor_interface carries the camera and colour conversions ARKitCapture
-  # applies, and sensor_apple imports the camera pictures the keyframes sample.
-  # grid_volume and grid_mesh hold the block grid and Marching Cubes; recon_tsdf
-  # and recon_texture fuse and texture on them.
+  # sensor_arkit is the camera: ArkitSensor owns the ARSession and hands out
+  # sensor_interface's RgbdFrames, each picture imported where ARKit left it,
+  # and it carries ARKit's frameworks itself. sensor_prep's GpuFramePrep turns
+  # each frame into the device buffers fusion reads; sensor_apple reads a
+  # picture's own buffer and tags back for the read-out. grid_volume and
+  # grid_mesh hold the block grid and Marching Cubes; recon_tsdf and
+  # recon_texture fuse and texture on them.
   #
   # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
   # holds an OrbitCamera by value and hands MemoryBudget across the seam. The
@@ -139,6 +143,8 @@ function(vi_add_scanner_bridge bridge_target)
            volumetric_kit::gfx_core
            volumetric_kit::sensor_interface
            volumetric_kit::sensor_apple
+           volumetric_kit::sensor_arkit
+           volumetric_kit::sensor_prep
            volumetric_kit::grid_volume
            volumetric_kit::grid_mesh
            volumetric_kit::recon_texture
@@ -161,7 +167,6 @@ vi_add_scanner_bridge(scanner_bridge)
 add_executable(
   ${VI_APP_NAME} MACOSX_BUNDLE
   Swift/AppDelegate.swift
-  Swift/ARSessionController.swift
   Swift/CameraGestureController.swift
   Swift/Dashboard.swift
   Swift/LinkPanel.swift
@@ -176,14 +181,11 @@ set_source_files_properties(config/scanner.json
                             PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 
-# The core's vulkan tier links MoltenVK's system frameworks, UIKit and
-# QuartzCore among them, so the app names only those beyond them, all for
-# ARKitCapture: ARKit supplies the posed depth/colour frames, CoreVideo their
-# pixel buffers, and Accelerate's vImage does the YCbCr -> RGB conversion, which
-# at 1920x1440 would dominate the capture path as a scalar loop.
-target_link_libraries(
-  ${VI_APP_NAME} PRIVATE "-framework ARKit" "-framework CoreVideo"
-                         "-framework Accelerate")
+# No framework is named here: the core's vulkan tier links MoltenVK's system
+# frameworks (UIKit and QuartzCore among them), and sensor_arkit links ARKit,
+# AVFoundation and CoreVideo for the camera. The picture's Y'CbCr -> R'G'B' runs
+# on the GPU (sensor_prep), so Accelerate's vImage is gone with the host
+# conversion it did.
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
