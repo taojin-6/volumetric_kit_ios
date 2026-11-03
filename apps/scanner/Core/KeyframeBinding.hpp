@@ -18,6 +18,37 @@
 
 namespace volumetric_kit::ios_app {
 
+/// @return Whether a ring slot's set samples chroma sited at @p location: left
+///         or centre, which gfx's picture names; no other.
+/// @tparam Location  sensor's `ChromaLocation`.
+template <typename Location>
+bool chroma_sampled(Location location) {
+  // Every location named, so one added upstream stops the bridge's compile
+  // (-Werror=switch) rather than rendering white.
+  switch (location) {
+    case Location::Left:
+    case Location::Center:
+      return true;
+    case Location::TopLeft:
+    case Location::Top:
+    case Location::BottomLeft:
+    case Location::Bottom:
+      return false;
+  }
+  return false;
+}
+
+/// @return Whether @p keyframe is one a ring slot samples, short of the set's
+///         own refusal: both planes, its chroma sited left or centre
+///         (@ref chroma_sampled). Fusion textures a mesh from a picture only
+///         when this holds, so a textured mesh never draws against white.
+/// @tparam Keyframe  sensor's `YuvImage`, as @ref rebind_keyframe takes it.
+template <typename Keyframe>
+bool keyframe_sampled(const Keyframe& keyframe) {
+  return keyframe.image[0] != nullptr && keyframe.image[1] != nullptr &&
+         chroma_sampled(keyframe.chroma_location);
+}
+
 /// @brief Points @p slot at @p keyframe through @p bind, or at white through
 ///        @p bind_white when the keyframe has no planes, its chroma is sited
 ///        other than left or centre, or @p bind refuses it.
@@ -49,28 +80,12 @@ const char* rebind_keyframe(PictureSlot<Keyframe>& slot, Keyframe keyframe,
       std::move(picture),
       [&](const Keyframe& k) {
         Planes planes;
-        bool sited = false;
-        // Every location named, so one added upstream stops the bridge's
-        // compile (-Werror=switch) rather than rendering white.
-        switch (k.chroma_location) {
-          case Location::Left:
-            planes.coding.chroma_siting = Siting::Left;
-            sited = true;
-            break;
-          case Location::Center:
-            planes.coding.chroma_siting = Siting::Center;
-            sited = true;
-            break;
-          case Location::TopLeft:
-          case Location::Top:
-          case Location::BottomLeft:
-          case Location::Bottom:
-            break;
-        }
-        if (!sited) {
+        if (!chroma_sampled(k.chroma_location)) {
           refusal = "keyframe: its chroma siting is neither left nor centre";
           return false;
         }
+        planes.coding.chroma_siting =
+            k.chroma_location == Location::Left ? Siting::Left : Siting::Center;
         planes.luma = k.image[0].get();
         planes.chroma = k.image[1].get();
         planes.extent = {k.width, k.height};

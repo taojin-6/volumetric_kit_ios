@@ -31,14 +31,16 @@
 #include "ViewOrientation.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 
-#include "CapturedFrame.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/image.hpp"
@@ -49,9 +51,52 @@
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
 #include "volumetric_kit/grid/mesh/device_mesh.hpp"
+#include "volumetric_kit/sensor/arkit/arkit_sensor.hpp"
 #include "volumetric_kit/sensor/frame/vector_types.hpp"
+#include "volumetric_kit/sensor/video/color_codes.hpp"
 
 namespace volumetric_kit::ios_app {
+
+/// @brief Wakes the fuse thread when the camera holds a frame
+///        (`ArkitSensor::set_frame_notify`), so it waits rather than polls.
+struct FrameSignal {
+  /// Called on the camera's queue as each frame is held.
+  void notify() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      ready = true;
+    }
+    wake.notify_one();
+  }
+  /// Waits until a frame was held since the last wait, or @p timeout passes,
+  /// so a stop request is seen within it.
+  void wait_for(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    wake.wait_for(lock, timeout, [this] { return ready; });
+    ready = false;
+  }
+
+  std::mutex mutex;
+  std::condition_variable wake;
+  bool ready = false;
+};
+
+/// @brief What the fuse thread learns about the camera's frames, for the
+///        read-out on the main thread.
+struct CameraReadout {
+  mutable std::mutex mutex;
+  /// The last checked picture's colour tags as H.273 codes
+  /// (`color_codes_of`); @ref codes_known false before one.
+  sensor::ColorCodes codes;
+  bool codes_known = false;
+  /// The first frame-contract rule a frame broke since the start
+  /// (`testing::RgbdContract`); empty when kept.
+  std::string breach;
+  /// Pattern frames whose depth's index is not their sequence's, and those
+  /// checked, since the start; both 0 for the camera.
+  std::uint64_t index_mismatches = 0;
+  std::uint64_t index_checked = 0;
+};
 
 namespace vkc = volumetric_kit::core;
 
@@ -99,14 +144,27 @@ struct RendererImpl {
   std::optional<volumetric_kit::core::Device> compute_device;
   std::optional<volumetric_kit::core::Allocator> compute_allocator;
 
+  // --- The camera ------------------------------------------------------------
+  // The fuse thread's wake-up. Before the camera, which calls it from its own
+  // queue for as long as it lives, so it outlives every call.
+  FrameSignal frame_signal;
+  // ARKit, or its test pattern, as sensor's `IRgbdSensor`: it owns the
+  // ARSession, withholds the frames ARKit did not track, and imports each
+  // picture on `compute_device`, shared with gfx's family. Opened at bring-up,
+  // started before the fuse thread and stopped after its join. After the
+  // compute device, which it must not outlive; before `fusion` and `atlas`,
+  // whose keyframes are its pictures, so they let them go first. Empty when it
+  // did not open, `camera_error` saying why. (`camera` is the orbit camera,
+  // below.)
+  std::optional<sensor::ArkitSensor> arkit;
+  std::string camera_error;
+  bool camera_pattern = false;  ///< `ArkitSource::Pattern`: no camera opened.
+  CameraReadout camera_readout;
+
   // --- Reconstruction ------------------------------------------------------
   Fusion fusion;
   std::thread fuse_thread;
   std::atomic<bool> fusing{false};
-  // Borrowed, not owned -- but the owning VolumetricCapture is retained by the
-  // renderer for exactly as long as this is non-null, and the thread that reads
-  // it is joined before that retain is dropped. See -startFusionWithCapture:.
-  FrameSource* capture = nullptr;
 
   // --- Render state (plain values; destruction order does not matter) -------
   std::uint64_t frames_presented = 0;
@@ -257,7 +315,7 @@ struct RendererImpl {
 
   ~RendererImpl() {
     // Before anything else, and before any member is destroyed: the fuse thread
-    // polls `capture` and submits compute work on the shared queue, so it has
+    // polls `arkit` and submits compute work on the shared queue, so it has
     // to be stopped while everything it touches is still alive. A joinable
     // std::thread reaching a member destructor would be std::terminate.
     stop_fusing();
@@ -272,12 +330,18 @@ struct RendererImpl {
     }
   }
 
+  /// Stops the fuse thread, then the camera: the thread polls the camera, so
+  /// the camera stops (and lets ARKit's camera go) only once nothing polls it.
+  /// Idempotent.
   void stop_fusing() {
     fusing.store(false);
+    frame_signal.notify();  // a thread waiting for a frame sees the flag now
     if (fuse_thread.joinable()) {
       fuse_thread.join();
     }
-    capture = nullptr;
+    if (arkit) {
+      arkit->stop();
+    }
   }
 
   RendererImpl() = default;

@@ -14,6 +14,10 @@
 #import "MemoryQuery.hpp"
 
 #include "FailureHandling.hpp"
+#include "KeyframeBinding.hpp"
+#include "volumetric_kit/sensor/chroma_location.hpp"
+#include "volumetric_kit/sensor/frame/color_space.hpp"
+#include "volumetric_kit/sensor/frame/device_frame.hpp"
 
 namespace volumetric_kit::ios_app {
 namespace {
@@ -38,6 +42,7 @@ float ms_since(Clock::time_point t0) {
 /// @ref kResizeStage is the exception -- it is this file's own row, for the
 /// grow between allocate retries that `allocate_from_depth`'s own row does not
 /// cover (`voxel_hash_map.hpp` says as much where it documents that row).
+constexpr const char* kPrepStage = "frame prep";
 constexpr const char* kAllocateStage = "allocate";
 constexpr const char* kResizeStage = "resize";
 constexpr const char* kIntegrateStage = "integrate";
@@ -257,6 +262,27 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   declined_grow_to_ = 0;
   declined_grow_bytes_ = 0;
 
+  // The frame prep first, so a device without what its kernels need refuses
+  // here rather than on every frame. Its outputs are read on the compute
+  // family alone -- the allocate, the integrate and the texture pass -- so
+  // they stay EXCLUSIVE to it; the renderer samples the camera's own picture,
+  // which the camera shares with the graphics family.
+  //
+  // The outlier filter off and the offset 0: the depth fused is ARKit's own,
+  // gated at the frame's confidence floor, as the scanner fused it when the
+  // gate ran on the host. The filter is a one-line switch here, for when a
+  // measurement on the iPad says it helps.
+  {
+    sensor::GpuFramePrepConfig prep_config;
+    prep_config.depth_outliers.enabled = false;
+    vkc::Result<sensor::GpuFramePrep> prep =
+        sensor::GpuFramePrep::create(device, allocator, prep_config);
+    if (!prep) {
+      return prep.status();
+    }
+    prep_.emplace(std::move(prep).value());
+  }
+
   vgrid::volume::VoxelGridParams grid{};
   grid.voxel_size = config.voxel_size;
   grid.block_size = kBlockEdgeVoxels;
@@ -368,26 +394,13 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   }
   texturer_.emplace(std::move(texturer).value());
 
-  // The keyframes are the camera's pictures, imported where they are and
-  // shared with the renderer's family, which samples them.
-  importer_.reset();
-  if (config.texture) {
-    vkc::Result<sensor::PixelBufferImporter> importer =
-        sensor::PixelBufferImporter::create(device, "keyframe import",
-                                            config.queue_families,
-                                            config.queue_family_count);
-    if (!importer) {
-      return importer.status();
-    }
-    importer_.emplace(std::move(importer).value());
-  }
-
   return vkc::Status();
 }
 
-void Fusion::fuse(const CapturedFrame& frame) {
+std::optional<FuseTimes> Fusion::fuse(const sensor::RgbdFrame& frame,
+                                      float poll_ms) {
   if (!valid()) {
-    return;
+    return std::nullopt;
   }
   // Liveness, stamped before any path can leave. What the read-out does with it
   // is refuse to assert a *present-tense* condition about a loop that has
@@ -404,7 +417,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // moves between consecutive frames, so fusing every one mostly re-averages
   // the same voxels to the same value.
   if (++captured_ % config_.fuse_every != 0) {
-    return;
+    return std::nullopt;
   }
 
   // One reporting window per fused frame. The tiers open their own host scopes
@@ -440,7 +453,8 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // takes the app with no message and no crash context. Every row a frame can
     // produce exists before the first scope opens, so those destructors find
     // rows rather than push_back onto them; the vector's own geometric growth
-    // (eight slots for these five) leaves headroom besides.
+    // (eight slots for these six) leaves headroom besides.
+    stages.seed(kPrepStage);
     stages.seed(kAllocateStage);
     stages.seed(kResizeStage);
     stages.seed(kIntegrateStage);
@@ -468,6 +482,41 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // blocks and a volume at its ceiling are the common case on a healthy scan,
   // and counting them made the one genuine failure impossible to see.
   bool frame_stage_failed = false;
+
+  // --- The frame to the device, once -----------------------------------------
+  //
+  // The confidence gate, the mm-to-metres step and the picture's Y'CbCr ->
+  // R'G'B' all run here, on the GPU, into buffers every tier below reads in
+  // place: nothing goes up from the host but the frame's own 256x192 depth and
+  // its confidence plane, into the prep's persistent slot. The picture is
+  // sampled where ARKit left it.
+  //
+  // Colour the prep cannot take is dropped first, not the frame: the prep
+  // converts canonical colour only and refuses the whole frame otherwise, while
+  // a frame's depth fuses whatever its picture is. ARKit with HDR off tags
+  // BT.709 primaries, so this is the Display P3 case alone, which fuses
+  // uncoloured and renders as the voxel colour the frames before it left.
+  const bool canonical_color =
+      frame.has_color() && sensor::is_canonical(frame.color_encoding);
+  sensor::RgbdFrame depth_only;
+  if (frame.has_color() && !canonical_color) {
+    depth_only = frame;
+    depth_only.color = sensor::YuvImage{};
+    depth_only.color_encoding = sensor::ColorEncoding{};
+  }
+  const sensor::RgbdFrame& to_prepare =
+      frame.has_color() && !canonical_color ? depth_only : frame;
+  const auto t_prep = Clock::now();
+  vkc::Result<sensor::DeviceFrame> prepared =
+      prep_->prepare(to_prepare, metrics);
+  if (!prepared) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.errors;
+    stats_.last_error = "frame prep: " + prepared.status().message();
+    return std::nullopt;
+  }
+  const float prep_ms = ms_since(t_prep);
+  const sensor::DeviceFrame& device_frame = prepared.value();
 
   // --- How full is the table, right now? -----------------------------------
   //
@@ -676,13 +725,15 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // --- Allocate the blocks this frame's depth touches ----------------------
   const auto t_alloc = Clock::now();
   vgrid::volume::AllocFailures failures;
-  // grid's own pinhole, the frame's depth camera field for field.
+  // grid's own pinhole, the prepared depth camera field for field; the depth
+  // read where the prep wrote it.
   const vgrid::volume::DepthPinhole depth_pinhole =
-      vr::tsdf::to_depth_pinhole(frame.depth_camera);
+      vr::tsdf::to_depth_pinhole(device_frame.depth_camera);
+  const vkc::Buffer& depth = *device_frame.depth;
   vkc::Result<std::uint32_t> overflow =
       table_exhausted ? vkc::Result<std::uint32_t>(0u)
-                      : grid_->map().allocate_from_depth(
-                            frame.depth, depth_pinhole, &failures, metrics);
+                      : grid_->map().allocate_from_depth(depth, depth_pinhole,
+                                                         &failures, metrics);
   // Whether this frame took no new geometry in, by either route. The guard
   // above is one of them; the reactive loop below hitting the ceiling, or
   // running out of per-frame grow budget with blocks still dropped, is the
@@ -726,7 +777,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
     stats_.allocation_stop = allocation_stop != AllocationStop::None
                                  ? allocation_stop
                                  : AllocationStop::BlocksDropped;
-    return;
+    return std::nullopt;
   }
   // The table filled. Grow and retry *while* it keeps filling: resize preserves
   // block indices, so everything already fused keeps its tsdf/weight/color at
@@ -788,7 +839,7 @@ void Fusion::fuse(const CapturedFrame& frame) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
       stats_.last_error = "resize: " + grown.message();
-      return;
+      return std::nullopt;
     }
     config_.num_buckets = grown_to;
     clear_memory_decline();
@@ -799,14 +850,14 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // reports success.
     // Accumulates into the same "allocate" row: a frame that resizes and
     // re-allocates reports what it actually cost, not just the last attempt.
-    overflow = grid_->map().allocate_from_depth(frame.depth, depth_pinhole,
-                                                &failures, metrics);
+    overflow = grid_->map().allocate_from_depth(depth, depth_pinhole, &failures,
+                                                metrics);
     if (!overflow) {
       std::lock_guard<std::mutex> lock(mutex_);
       ++stats_.errors;
       stats_.last_error =
           "allocate (after resize): " + overflow.status().message();
-      return;
+      return std::nullopt;
     }
   }
   if (grow_attempts > 0) {
@@ -862,32 +913,37 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // defaults to *canonical*, so omitting it does not say "unspecified" -- it
   // declares canonical on the frame's behalf, and a non-canonical frame would
   // then be fused through the wrong transfer curve instead of refused. Passing
-  // it is what arms recon's rejection at the one seam that can arm it: this is
-  // the only place ARKit's declaration reaches the integrator. ARKitCapture
-  // normalises or refuses today, so this is latent rather than live -- and it
-  // stays latent only until someone adds a fast path there.
+  // it is what arms recon's rejection at the one seam that can arm it. The
+  // prep hands out canonical colour alone, so this is latent rather than live.
+  //
+  // The colour is the prep's buffer, read in place, its coverage in each
+  // word's high byte: a pixel the prep dropped fuses no colour, as one outside
+  // the picture does.
   vr::tsdf::ColorFrame color{};
-  color.pixels = frame.color;
-  color.cam = frame.color_camera;
-  color.encoding = frame.color_encoding;
+  color.buffer = device_frame.color.get();
+  color.cam = device_frame.color_camera;
+  color.encoding = device_frame.color_encoding;
+  color.coverage_in_alpha = true;
   const vkc::Status fused = integrator_->integrate(
-      *grid_, frame.depth, frame.depth_camera, /*max_weight=*/5.0f,
-      vr::tsdf::IntegrationMode::Classic, frame.has_color() ? &color : nullptr,
-      metrics);
+      *grid_, depth, device_frame.depth_camera, /*max_weight=*/5.0f,
+      vr::tsdf::IntegrationMode::Classic,
+      device_frame.has_color() ? &color : nullptr, metrics);
   if (!fused) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
     stats_.last_error = "integrate: " + fused.message();
-    return;
+    return std::nullopt;
   }
   const float integrate_ms = ms_since(t_integrate);
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.frames_fused;
-    last_pose_ = frame.depth_camera.cam_to_world;
+    last_pose_ = device_frame.depth_camera.cam_to_world;
+    stats_.prep_ms = prep_ms;
     stats_.allocate_ms = allocate_ms;
     stats_.integrate_ms = integrate_ms;
+    stats_.poll_ms = poll_ms;
     // The table's own state, all four taken from after every resize this frame
     // performed, so the ratio the read-out prints has both halves at one
     // instant. `table_blocks` rather than `table_capacity` for the denominator:
@@ -953,7 +1009,11 @@ void Fusion::fuse(const CapturedFrame& frame) {
   }
 
   if (stats_.frames_fused % config_.remesh_every == 0) {
-    remesh(frame, metrics);
+    // The keyframe is the frame's own picture, when its colour fused and the
+    // renderer samples it: a picture the renderer would draw as white is
+    // left out, so its mesh keeps the voxel colour instead.
+    remesh(frame, device_frame,
+           canonical_color && keyframe_sampled(frame.color), metrics);
   }
 
   // --- Publish the stage rows -----------------------------------------------
@@ -1270,9 +1330,12 @@ void Fusion::fuse(const CapturedFrame& frame) {
     survey_epoch_ = epoch;
     survey_window_start_ = stats_.frames_fused;
   }
+  return FuseTimes{prep_ms, allocate_ms, integrate_ms};
 }
 
-void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
+void Fusion::remesh(const sensor::RgbdFrame& frame,
+                    const sensor::DeviceFrame& prepared, bool color,
+                    vkc::StageMetrics* metrics) {
   // --- Hand the consumer's release to grid, on this thread ------------------
   //
   // `MarchingCubes::release_through` is not atomic, and its header makes
@@ -1359,49 +1422,33 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // on -- distinct from whether it was attempted. See there.
   bool textured_ok = false;
 
-  // --- Import the keyframe this mesh's uv0 will index into ------------------
+  // --- The keyframe this mesh's uv0 will index into ------------------------
   //
-  // The camera picture itself: its two planes become images where the camera
-  // left them, held by those images, so neither this thread nor the renderer
-  // copies a pixel. Imported before texturing and gating it: a frame with no
-  // picture -- `convert_color` drops an unsupported pixel format, an HLG or PQ
-  // transfer, a primaries set with no enumerator, and publishes no picture for
-  // colour it had to convert -- or one the import refuses still fuses its
-  // depth and still reaches here, and texturing it would write real `uv0`
-  // addressing a keyframe the renderer never has. Skipping leaves every `uv0`
-  // at marching cubes' sentinel, so the frame renders as fused voxel colour.
-  //
-  // Outside the publish mutex: `mutex_` is the lock the main thread takes
-  // several times per rendered frame, and the first picture on a camera
-  // surface waits on a submit.
-  sensor::YuvImage keyframe = frame.picture_coding;
-  float keyframe_import_ms = 0.0f;
-  bool imported = false;
-  if (config_.texture && frame.picture != nullptr && importer_) {
-    const auto t_import = Clock::now();
-    const vkc::Status got =
-        importer_->import(frame.picture, frame.color_camera.width,
-                          frame.color_camera.height, keyframe);
-    keyframe_import_ms = ms_since(t_import);
-    imported = got.ok();
-    if (!imported) {
-      texture_state = TextureState::Failed;
-      std::lock_guard<std::mutex> lock(mutex_);
-      ++stats_.errors;
-      // The importer names itself ("keyframe import: ...").
-      stats_.last_error = got.message();
-    }
-  }
-  const bool do_texture = imported;
-  if (do_texture) {
+  // The camera picture itself, as the camera imported it at its poll: its two
+  // planes are images where ARKit left them, held by those images, so neither
+  // this thread nor the renderer copies a pixel. Only a picture the renderer
+  // samples is textured from (@p color): texturing any other would write real
+  // `uv0` addressing a keyframe the renderer draws as white. Skipping leaves
+  // every `uv0` at marching cubes' sentinel, so the frame renders as fused
+  // voxel colour.
+  sensor::YuvImage keyframe = frame.color;
+  if (config_.texture && color) {
     const auto t_texture = Clock::now();
     // The window reaches this tier too. `fuse` seeds the row when this flag is
     // on, so the table keeps its shape across the frames between remeshes --
     // and across a remesh that returns early above, which is the ordinary
     // steady state rather than a fault.
+    //
+    // ARKit's depth is registered to its picture, so the view is the depth
+    // camera alone, read where the prep wrote it: `uv0` is the vertex's depth
+    // pixel as a fraction of the map, the same fraction of the picture
+    // (`depth_from_registered_color`'s rescale). No colour camera is named,
+    // since the two are one.
+    vr::texture::TextureView view;
+    view.cam = prepared.depth_camera;
+    view.depth_buffer = prepared.depth;
     const vkc::Status textured =
-        texturer_->texture(device_mesh.value(), frame.depth, frame.depth_camera,
-                           threshold, metrics);
+        texturer_->texture(device_mesh.value(), view, threshold, metrics);
     textured_ok = textured.ok();
     texture_state = textured_ok ? TextureState::Ran : TextureState::Failed;
     if (!textured) {
@@ -1475,7 +1522,6 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // of textured vertices is not derivable at this tier.
   stats_.texture_state = texture_state;
   stats_.occlusion_threshold = threshold;
-  stats_.keyframe_import_ms = keyframe_import_ms;
 }
 
 std::optional<Fusion::Published> Fusion::take_mesh(

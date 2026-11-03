@@ -19,6 +19,7 @@
 add_library(
   vi_core STATIC
   AllocationStop.cpp
+  CaptureReport.cpp
   FailureHandling.cpp
   GrowthPolicy.cpp
   LinkState.cpp

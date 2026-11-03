@@ -55,7 +55,7 @@ parenthesised code) or in Xcode → Settings → Accounts.
 | Sibling | What the apps take from it |
 | --- | --- |
 | `volumetric_kit_core` | the shared device, `Status`, the scenario parser, and the address checks and dial the live link uses (`core_net`) |
-| `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), the `PixelBufferImporter` the keyframes use (`sensor_apple`), the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`), and the frames' wire form the session writer writes (`sensor_wire`) |
+| `volumetric_kit_sensor` | the camera, `ArkitSensor`, which owns the ARSession and hands out `RgbdFrame`s (`sensor_arkit`, `sensor_interface`); the GPU pass that prepares each frame for fusion (`sensor_prep`); a picture's own buffer and tags (`sensor_apple`); the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`); and the frames' wire form the session writer writes (`sensor_wire`) |
 | `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`), the `.vrst` container (`grid_stream`), and the server that serves it live (`grid_networking`) |
 | `volumetric_kit_recon` | TSDF fusion and the projective texturer (`recon_tsdf`, `recon_texture`) |
 | `volumetric_kit_gfx` | the renderer |
@@ -204,6 +204,30 @@ passed, 1 failed, 2 for an unknown test name, so `--console` returns about 20 s
 after the last line. `Core/SelfTest.hpp` decides what the report says and
 whether it passed, and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
+### `-source pattern` and `-minutes N`
+
+Launched with `-source pattern`, the scanner scans sensor's test pattern
+(`ArkitSource::Pattern`) instead of the camera, which never opens: each
+frame's index coded in its depth and its picture, at the camera's sizes and
+rate, through the same queue, frame prep and fusion. `-source camera` is the
+default. `-minutes N` (1 to 1440) stops the scan after N minutes, prints the
+run's last line, and exits. An argument it cannot read is refused, and then no
+camera opens at all.
+
+```sh
+xcrun devicectl device process launch --console --device <id> \
+  io.taojin.volumetrickit.scanner -- -source pattern -minutes 2
+```
+
+Every 10 s, and at the stop, the fuse thread prints one `sa` line of counts,
+times, states and colour codes, never a pixel, a depth value, a pose or a
+path: the camera's tracking and counters (`SensorStats`, `ArkitStatus`),
+frames fused, poll and fuse (prep + allocate + integrate) milliseconds at p50
+and p95 over the window, the picture's H.273 colour codes, sensor's frame
+contract (`testing::RgbdContract`), and for the pattern how many frames
+carried their own index. `Core/CaptureReport.hpp` reads the arguments and
+writes the line, and is host-tested.
+
 ## Development
 
 ```sh
@@ -315,8 +339,8 @@ after a reader that refuses the session; Connect dials at once. A refused
 entry shows the core's reason under the fields. The session
 opens at the first connect and lasts while the app runs, so a reconnect, to
 the same reader or another, is the same session. This build sends the session
-alone: it describes ARKit's depth camera as the capture last converted it, and
-no frames go out until the scanner reads ARKit through sensor's `IRgbdSensor`.
+alone: it describes the camera as `ArkitSensor` opened it
+(`SensorInfo`), and no frames go out yet.
 
 #### The shared device
 
@@ -387,14 +411,21 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 - **Device only, arm64.** MoltenVK's iOS release ships no simulator slice, and
   ARKit scene depth needs LiDAR hardware anyway.
 - **iOS 26.0 or newer** (`cmake/ios.toolchain.cmake`).
-- **LiDAR required** for the ARKit slice: iPhone 12 Pro and later Pro models,
-  iPad Pro 2020 and later. Guard with
-  `ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`.
+- **LiDAR required** for the camera: iPhone 12 Pro and later Pro models, iPad
+  Pro 2020 and later. `ArkitSensor::open` refuses a device without scene depth
+  (`Unsupported`), and the read-out says so.
+- **The camera is sensor's `ArkitSensor`.** It owns the ARSession, withholds
+  frames ARKit did not track normally, resumes after an interruption in the
+  same world, and hands out `RgbdFrame`s: depth as millimetres with ARKit's
+  confidence beside it, and the picture imported where ARKit left it. Fusion
+  sends each frame through sensor's `GpuFramePrep` (the confidence gate at
+  medium, the picture's Y'CbCr → R'G'B', both on the GPU) and recon's and
+  grid's device overloads read the prepared buffers in place; nothing is
+  converted on the CPU.
 - **The scanner's keyframes are ARKit's own pictures.** Each mesh slot samples
-  the `capturedImage` its mesh was textured from where ARKit left it, imported
-  by sensor's `PixelBufferImporter`, so the ring holds up to three of ARKit's
-  pixel buffers beyond the frames being captured and fused. Fusion still
-  converts each frame's colour on the CPU.
+  the picture its mesh was textured from, the frame's own `RgbdFrame::color`,
+  so the ring holds up to three of ARKit's pixel buffers beyond the frames
+  being captured and fused.
 - **Local Network access.** The live link's first connect to a local address
   raises iOS's Local Network prompt (`NSLocalNetworkUsageDescription`); until
   it is allowed, every connect fails with "No route to host".
@@ -411,16 +442,10 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 1. ✅ **`compute_smoke`** — the compute path on device.
 2. ✅ **`scanner` bring-up** — gfx rendering to a `CAMetalLayer` surface via
    `VK_EXT_metal_surface`, proving the render path and the Swift/Obj-C++ build.
-3. **ARKit capture** — an `ICameraCapture` source in recon's `sensor` tier
-   feeding `sceneDepth` (256×192 float metres), `capturedImage` (YCbCr 420, needs
-   conversion), and `camera.transform`. ARKit is +Y up / −Z forward while
-   sensor's cameras project +Z forward, so poses convert as
-   `T_world_cv = T_world_arkit · diag(1, −1, −1, 1)`. Depth and colour have
-   different resolutions, which sensor already models as separate
-   `DepthCameraParams` and `ColorCameraParams`. ARKit's depth is *registered* to
-   the colour camera, so the two share a pose and differ only in intrinsics
-   scale — which avoids the unregistered-camera caveats recon's integrator
-   documents.
+3. ✅ **ARKit capture** — sensor's `ArkitSensor`, an `IRgbdSensor`: ARKit's
+   depth (256×192, millimetres and confidence), its picture where ARKit left
+   it, and its pose in sensor's camera axes. ARKit's depth is *registered* to
+   its picture, so the two share a pose and differ only in intrinsics scale.
 4. **Live fusion** — fuse and render live in `scanner`: ARKit frames feed recon
    on a background thread while the render thread draws the growing mesh, the
    `fuse_viewer` model. Then one shared `VkDevice`, the core's `SharedDevice`,

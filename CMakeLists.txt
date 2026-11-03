@@ -143,23 +143,26 @@ find_package(glm CONFIG REQUIRED)
 # and examples default to "am I top level?" -- OFF for a fetched copy -- so only
 # its library tiers build.
 
-# sensor: the camera contract (camera parameters, colour encoding, camera and
-# colour conventions, YuvImage) ARKitCapture fills; sensor_apple's
-# PixelBufferImporter, which imports the camera pictures the keyframes sample;
-# the HEVC encoder (sensor_video) with its rules (sensor_video_testing), which
-# the scanner's `-self-test hevc` runs; and the frames' wire form (sensor_wire),
+# sensor: the camera itself (sensor_arkit's ArkitSensor, an IRgbdSensor that
+# owns the ARSession and imports each picture where ARKit left it) and the GPU
+# pass that turns its frames into what fusion reads (sensor_prep's
+# GpuFramePrep); the frame contract they share (sensor_interface); the HEVC
+# encoder (sensor_video) with its rules (sensor_video_testing), which the
+# scanner's `-self-test hevc` runs; and the frames' wire form (sensor_wire),
 # which vi_session writes.
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG 32be4cc19fffbf6c1484df7e3aea0e75a94cee9b) # sensor #34 (0.29.0)
+  GIT_TAG d59dbb1f6c3a69da45c8a5a1f0997cdef50779a3) # sensor #45 (0.40.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
   volumetric_kit::sensor
-  0.29.0
+  0.40.0
   TARGETS
   volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple
+  volumetric_kit::sensor_arkit
+  volumetric_kit::sensor_prep
   volumetric_kit::sensor_video
   volumetric_kit::sensor_video_testing
   volumetric_kit::sensor_wire)

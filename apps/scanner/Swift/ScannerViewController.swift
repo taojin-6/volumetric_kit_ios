@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-import ARKit
 import SwiftUI
 import UIKit
 
 /// Drives the renderer from a `CADisplayLink` and shows what it reports.
 ///
 /// Swift owns the view, the display link, and the lifecycle; it never touches
-/// Vulkan. Everything below `VolumetricRenderer` is C++ on the other side of the
-/// Objective-C++ bridge. When the ARSession lands it joins *this* layer — Swift
-/// configures it and hands frames across the same seam.
+/// Vulkan or ARKit. Everything below `VolumetricRenderer` is C++ on the other
+/// side of the Objective-C++ bridge, the camera included: sensor's
+/// `ArkitSensor` owns the ARSession, and the renderer owns the sensor.
 final class ScannerViewController: UIViewController {
   private var metalView: MetalView!
   private var renderer: VolumetricRenderer?
-  private let arSession = ARSessionController()
+  /// What the launch asks of the camera: `-source camera|pattern` and
+  /// `-minutes N`.
+  private let launch = ScannerLaunch(arguments: ProcessInfo.processInfo.arguments)
   private var displayLink: CADisplayLink?
   /// What the dashboard draws. Populated in `updateStatus`, at the display
   /// cadence -- the *history* it charts is sampled per fused frame on the
   /// fusion thread, which is a different rate on purpose (see DashboardModel).
   private let dashboard = DashboardModel()
-  /// The live link the dashboard's entry drives. It describes the capture's
-  /// depth camera at its first connect, and lives as long as this controller,
-  /// so a reconnect is the same session.
-  private lazy var link = LinkModel(capture: arSession.capture)
+  /// The live link the dashboard's entry drives. It describes the renderer's
+  /// camera at its first connect, and lives as long as this controller, so a
+  /// reconnect is the same session.
+  private let link = LinkModel()
   private var dashboardHost: UIHostingController<DashboardView>?
   /// When the view appeared, for the dashboard's elapsed clock. Wall clock
   /// rather than a fused-frame count: it is how long the person has been
@@ -38,8 +39,8 @@ final class ScannerViewController: UIViewController {
   private var cameraGestures: CameraGestureController?
 
   /// Whether the capture + fuse + draw loop is running, so a resume cannot
-  /// start a second ARSession or a second fuse thread and a suspend cannot
-  /// wind the same one down twice.
+  /// start the camera or a fuse thread twice and a suspend cannot wind the
+  /// same one down twice.
   private var isCapturing = false
   /// On screen and foregrounded are tracked separately because only one of them
   /// has a view callback. `viewDidDisappear` does **not** fire on backgrounding,
@@ -59,10 +60,13 @@ final class ScannerViewController: UIViewController {
   /// a `VK_ERROR_DEVICE_LOST` does not heal, and resuming onto the lost device
   /// would only spin the fuse thread against it.
   private var renderFailed = false
+  /// Set once a `-minutes N` run is over: the loop never starts again, and the
+  /// app exits once it has wound down.
+  private var runEnded = false
 
   /// Everything that must hold before the loop may run.
   private var isRunnable: Bool {
-    isOnScreen && !isBackgrounded && !renderFailed
+    isOnScreen && !isBackgrounded && !renderFailed && !runEnded
   }
 
   private var lastFPSUpdate = CFAbsoluteTimeGetCurrent()
@@ -194,6 +198,38 @@ final class ScannerViewController: UIViewController {
     // Activated by the view's own onAppear, so the stored expanded/collapsed
     // choice decides it rather than this defaulting to one of them.
     expandedHeight?.isActive = false
+
+    // The launch's camera arguments, said once on the console: a refused one
+    // opens no camera, and a bounded run says when it ends.
+    if !launch.refusal.isEmpty {
+      print("scanner: launch refused: \(launch.refusal)")
+    }
+    if launch.minutes > 0 {
+      let minutes = launch.minutes
+      DispatchQueue.main.asyncAfter(deadline: .now() + Double(minutes) * 60) {
+        [weak self] in
+        self?.endTimedRun()
+      }
+    }
+  }
+
+  /// `-minutes N`'s end, for a measurement run that needs no one to stop it:
+  /// the loop winds down as it does on backgrounding -- the fuse thread prints
+  /// the run's last console line as it ends, then the camera stops -- and the
+  /// app exits.
+  private func endTimedRun() {
+    runEnded = true
+    print("scanner: the \(launch.minutes)-minute run is over; stopping")
+    stopDisplayLink()
+    isCapturing = false
+    renderer?.beginStopFusion()
+    let renderer = self.renderer
+    DispatchQueue.global(qos: .userInitiated).async {
+      renderer?.stopFusion()
+      renderer?.waitIdle()
+      fflush(stdout)
+      exit(0)
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -259,10 +295,9 @@ final class ScannerViewController: UIViewController {
     // not turn with the interface, so the renderer has to be told which way the
     // viewport is facing or the scan renders on its side.
     renderer.viewOrientation = currentViewOrientation()
-    arSession.start()
-    // Fusion pulls from the capture bridge on its own thread; the render loop
-    // only ever picks up whatever mesh it has published.
-    renderer.startFusion(with: arSession.capture)
+    // The camera starts, then fusion pulls from it on its own thread; the
+    // render loop only ever picks up whatever mesh it has published.
+    renderer.startFusion()
     startDisplayLink()
   }
 
@@ -286,8 +321,11 @@ final class ScannerViewController: UIViewController {
   /// user reaches for the home gesture.
   ///
   /// Everything that stops new work *starting* still happens before this
-  /// returns — the display link, ARKit, and the fuse thread's flag — so nothing
-  /// is submitting by the time the app is backgrounded. Only the waiting moves.
+  /// returns — the display link and the fuse thread's flag — so nothing is
+  /// submitting by the time the app is backgrounded. Only the waiting moves,
+  /// and the camera's stop with it: it follows the join, since the thread
+  /// polls the camera, and iOS interrupts ARKit's camera on backgrounding in
+  /// any case.
   private func suspend() {
     guard isCapturing else { return }
     isCapturing = false
@@ -296,13 +334,12 @@ final class ScannerViewController: UIViewController {
     // drain below empties, so a fuse thread still running would enqueue behind
     // the teardown -- and waitIdle does not stop it: it waits on the queues and
     // never touches the thread. Until stopFusion returns, the thread is also
-    // still dereferencing the capture handle.
+    // still polling the camera.
     //
     // This half only clears the flag the loop tests between iterations, which
     // is what makes it safe to call on the main thread. The join that turns it
-    // into a guarantee is below.
+    // into a guarantee is below, and the camera stops after it.
     renderer?.beginStopFusion()
-    arSession.pause()
     guard let renderer else { return }
     teardownInFlight = true
     // `renderer` is captured strongly, deliberately: the drain must not race a
@@ -407,6 +444,7 @@ final class ScannerViewController: UIViewController {
 
     bringUpInFlight = true
     let layer = metalView.metalLayer
+    let source = launch.source
     // The layer itself crosses to another thread, where MoltenVK reads and sets
     // properties on it for the length of the swapchain build -- so the main
     // thread stops touching it until bring-up hands it back. Snapshotting
@@ -420,7 +458,9 @@ final class ScannerViewController: UIViewController {
     // MoltenVK shader cache, plus a 48 MB zero-filled host-visible commit. On
     // first launch after install that is seconds, and seconds of blocked main
     // thread through launch is a 0x8badf00d watchdog kill. The smoke app moves
-    // the same class of work off-main for the same reason.
+    // the same class of work off-main for the same reason. The camera opens
+    // last, and its first open waits for the user's answer to the camera
+    // prompt and then for ARKit's first frame with depth.
     DispatchQueue.global(qos: .userInitiated).async {
       let outcome = Result {
         guard let url = Bundle.main.url(forResource: "scanner", withExtension: "json") else {
@@ -428,7 +468,8 @@ final class ScannerViewController: UIViewController {
             domain: "ScannerConfiguration", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "Missing bundled scanner.json"])
         }
-        return try VolumetricRenderer(layer: layer, configurationPath: url.path)
+        return try VolumetricRenderer(
+          layer: layer, configurationPath: url.path, source: source)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
@@ -453,6 +494,7 @@ final class ScannerViewController: UIViewController {
   private func adopt(_ brought: VolumetricRenderer) {
     renderer = brought
     cameraGestures?.renderer = brought
+    link.renderer = brought
     // Cleared, because bring-up has a documented retry path: a first layout
     // reporting a zero dimension fails, `onDrawableSizeChange` tries again, and
     // the second attempt succeeds. Nothing used to clear this, so the banner
@@ -541,7 +583,7 @@ final class ScannerViewController: UIViewController {
       // Indented under a heading, which is the one arrangement the panel does
       // not share: it has a card title and a table, and needs neither.
       blocks.append(
-        "ARKit capture\n"
+        "camera\n"
           + counters.map { "  " + $0 }.joined(separator: "\n"))
     }
     return blocks.joined(separator: "\n\n")
@@ -578,11 +620,9 @@ final class ScannerViewController: UIViewController {
       suspend()
       return
     }
-    // No poll here. The bridge's `FrameSource` is single-consumer ("poll from
-    // one thread"), and its CapturedFrame is a non-owning view valid only until
-    // the next poll -- so the bring-up placeholder that polled once per rendered
-    // frame is now a second consumer racing the fuse thread for the same
-    // buffers, and every frame it won was a frame fusion never saw.
+    // No poll here. The camera is polled from one thread, the fuse thread, and
+    // every frame a second consumer won would be a frame fusion never saw. The
+    // read-out reads its status and counters, which any thread may.
     updateStatus(renderer)
   }
 
@@ -616,15 +656,10 @@ final class ScannerViewController: UIViewController {
       : String(
         format: "manual  %.2f m from pivot  (double-tap to follow)",
         renderer.cameraDistance)
-    // Read ONCE, here, and used for both the panel and the transcript.
-    //
-    // `ARSessionController.tracking` takes its lock per access and ARKit writes
-    // at 60 Hz on sessionQueue, so reading it for the label and again for the
-    // tone could straddle an update and render "limited (relocalizing)" in the
-    // healthy green -- exactly what TrackingReport is a value type to prevent,
-    // and its doc says so.
-    let tracking = arSession.tracking
-    let s = arSession.capture.stats
+    // Read ONCE, here, and used for both the panel and the transcript: the
+    // camera's state and counters as one value, so the label and its tone
+    // cannot straddle an update and render "relocalizing" in the healthy green.
+    let cam = renderer.cameraStatus
     // Read ONCE, here, and used for both the panel and the transcript -- the
     // same rule the two lines above follow, applied to the read-out.
     //
@@ -675,62 +710,52 @@ final class ScannerViewController: UIViewController {
     var sessionLines: [String] = []
     var counterLines: [String] = []
 
-    if let reason = arSession.unsupportedReason {
-      sessionLines.append("ARKit: \(reason)")
+    if !cam.opened {
+      // The reason the camera did not open -- no LiDAR, the camera not
+      // allowed, no depth in time -- in the camera's own words, and the
+      // launch's refusal where that was the reason.
+      sessionLines.append("camera: \(cam.openError)")
+      if !launch.refusal.isEmpty {
+        sessionLines.append("launch: \(launch.refusal)")
+      }
     } else {
-      if let failure = arSession.sessionError {
-        // Alongside the counters, not instead of them: a session can fail and
-        // recover, and replacing the read-out meant a single transient
-        // interruption hid capture for the rest of the run.
-        sessionLines.append("ARKit session failed: \(failure)")
+      if !cam.sessionError.isEmpty {
+        // Alongside the counters, not instead of them, so a failure does not
+        // hide what the camera did before it.
+        sessionLines.append("ARKit session failed: \(cam.sessionError)")
       }
       // Ahead of the counters, because it is the answer to "why is the frame
       // count rising and nothing appearing": frames arriving while ARKit does
       // not trust its own pose are withheld from fusion on purpose.
-      let withheld =
-        tracking.framesWithheld > 0
-        ? "  (\(tracking.framesWithheld) withheld)" : ""
-      sessionLines.append("tracking  \(tracking.description)\(withheld)")
+      let withheld = cam.withheld > 0 ? "  (\(cam.withheld) withheld)" : ""
+      let interrupted = cam.interrupted ? ", interrupted" : ""
+      sessionLines.append("tracking  \(cam.tracking)\(interrupted)\(withheld)")
 
-      // Formatted up front rather than inside the literal: a `\`-continuation
-      // inside a \(...) interpolation is not something the Swift parser accepts.
-      let kept = String(format: "%.0f%%", s.confidence_kept * 100)
-      let intrinsics = String(
-        format: "fx %.1f  cx %.1f  cy %.1f", s.depth_fx, s.depth_cx, s.depth_cy)
-      // What the buffer declared, not what we assumed. The matrix is separate
-      // from the transfer and primaries -- it reconstructs chroma, they
-      // describe the result -- so all three are shown rather than collapsed.
-      //
-      // `(refused)` means the buffer named an encoding the driver cannot
-      // represent, so it dropped this frame's colour rather than fusing it
-      // through a curve it had guessed at. The three names still show what was
-      // read, which is the whole point: the alternative is colour quietly going
-      // missing with nothing on screen saying why.
-      let encoding = String(
-        format: "%@ matrix -> %@ / %@%@",
-        String(cString: s.color_matrix), String(cString: s.color_transfer),
-        String(cString: s.color_primaries),
-        s.color_declaration_refused
-          ? "  (refused)" : (s.color_was_canonical ? "" : "  (converted)"))
-      let position = String(
-        format: "%.2f, %.2f, %.2f", s.position_x, s.position_y, s.position_z)
-      // Colour split out from the total: the combined figure cannot answer a
-      // question about either half, which is how a 35% win in the colour path
-      // once read as a small loss.
-      let convert = String(
-        format: "%.1f ms  (colour %.2f)", s.convert_ms, s.color_convert_ms)
+      // `failed` is the withheld, the refused and the pictures that did not
+      // import; `missed` is ARKit's own skipped periods, which no count of
+      // frames shows.
       let counts =
-        "\(s.frames_submitted) in / \(s.frames_polled) polled"
-        + " / \(s.frames_dropped) dropped / \(s.frames_rejected) rejected"
+        "\(cam.received) in / \(cam.delivered) out / \(cam.dropped) dropped"
+        + " / \(cam.failed) failed (\(cam.refused) refused)"
+        + " / \(cam.missed) missed"
       counterLines = [
+        "source    \(cam.pattern ? "test pattern (no camera)" : cam.model)",
         "frames    \(counts)",
-        "depth     \(s.depth_width) x \(s.depth_height)  (\(kept) confident)",
-        "colour    \(s.color_width) x \(s.color_height)",
-        "encoding  \(encoding)",
-        "intrinsic \(intrinsics)",
-        "position  \(position) m",
-        "convert   \(convert)",
+        "depth     \(cam.depthWidth) x \(cam.depthHeight)  (confidence medium and up)",
+        "colour    \(cam.colorWidth) x \(cam.colorHeight)",
+        // What the picture's own tags say, as H.273 code points: the stream's
+        // colour, read rather than assumed.
+        "codes     \(cam.colorCodes)",
+        "contract  \(cam.contractBreach.isEmpty ? "kept" : cam.contractBreach)",
       ]
+      if !cam.lastRefusal.isEmpty {
+        counterLines.append("refused   \(cam.lastRefusal)")
+      }
+      if cam.pattern {
+        let kept = cam.indexChecked - cam.indexMismatches
+        counterLines.append(
+          "index     \(kept) of \(cam.indexChecked) frames carry their own")
+      }
     }
 
     let captureLines = sessionLines + counterLines
@@ -753,13 +778,13 @@ final class ScannerViewController: UIViewController {
     dashboard.scanning = isCapturing && !renderFailed
     dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
     dashboard.fps = fps
-    dashboard.trackingText = tracking.description
-    // "normal" is ARKit's own word for a usable pose; anything else -- limited,
+    dashboard.trackingText = cam.opened ? cam.tracking : "no camera"
+    // Normal is the one tracking whose frames go out; anything else -- limited,
     // initializing, relocalizing -- means frames are being withheld from
     // fusion, which is exactly when this chip should stop being quiet.
-    dashboard.trackingHealthy = tracking.description == "normal"
-    dashboard.framesIn = Int(s.frames_submitted)
-    dashboard.framesDropped = Int(s.frames_dropped)
+    dashboard.trackingHealthy = cam.trackingNormal
+    dashboard.framesIn = Int(cam.received)
+    dashboard.framesDropped = Int(cam.dropped)
     // Both ceilings, not one. The earlier note here picked the working set on
     // the grounds that the jetsam ceiling sits above installed RAM and so
     // reports headroom that does not exist -- true, and an argument for drawing
@@ -780,7 +805,7 @@ final class ScannerViewController: UIViewController {
     // What the bars do not cover, and how far they can be trusted. The age is
     // two figures because it is a comparison: `msSinceStages` alone cannot tell
     // a stalled pipeline from a paused camera.
-    dashboard.keyframeImportMs = snapshot.keyframeImportMs
+    dashboard.pollMs = snapshot.pollMs
     dashboard.framesFused = snapshot.framesFused
     dashboard.msSinceStages = snapshot.msSinceStages
     dashboard.msSinceFuse = snapshot.msSinceFuse

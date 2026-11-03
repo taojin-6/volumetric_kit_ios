@@ -9,15 +9,11 @@
 
 #import <Metal/Metal.h>
 
-// The definition, which the header above deliberately does not carry: this is
-// the one unit that sends `VolumetricCapture` a message (-captureHandle) rather
-// than just naming the pointer type.
-#import "ARKitCapture.h"
-
 #import "AllocationStop.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
 #import "FrameTrace.hpp"
+#import "FuseLoop.hpp"
 #import "Fusion.hpp"
 // `occupancy_thresholds` and the constants behind it. Named rather than left
 // to Fusion.hpp's copy, on this file's own rule about transitive includes.
@@ -77,6 +73,8 @@
 #include "volumetric_kit/gfx/pipelines/gpu_mesh.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
+#include "volumetric_kit/sensor/arkit/arkit_sensor.hpp"
+#include "volumetric_kit/sensor/rgbd_sensor.hpp"
 // vkc::StageRow, named directly by -initWithRow: and by the read-out's row
 // loop. Reached transitively through Fusion.hpp today, which is the pattern the
 // <cstdio> note above records going wrong: pruning that header's includes, or
@@ -248,21 +246,89 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   return in;
 }
 
+/// @return @p codes as the read-out names them.
+std::string color_codes_text(const sensor::ColorCodes& codes) {
+  return "matrix " + std::to_string(codes.matrix) + "  transfer " +
+         std::to_string(codes.transfer) + "  primaries " +
+         std::to_string(codes.primaries) + "  " +
+         (codes.full_range ? "full" : "limited") + "  chroma " +
+         std::to_string(codes.chroma_location);
+}
+
 }  // namespace
+
+@interface VolumetricCameraStatus ()
+- (instancetype)initWithImpl:(const app::RendererImpl&)impl;
+@end
+
+@implementation VolumetricCameraStatus
+
+- (instancetype)initWithImpl:(const app::RendererImpl&)impl {
+  self = [super init];
+  if (self == nil) {
+    return nil;
+  }
+  _pattern = impl.camera_pattern ? YES : NO;
+  _openError = app::to_ns_string(impl.camera_error);
+  _model = @"";
+  _tracking = @"";
+  _sessionError = @"";
+  _lastRefusal = @"";
+  _colorCodes = @"-";
+  _contractBreach = @"";
+  if (!impl.arkit) {
+    return self;
+  }
+  // Each of these takes the camera's own lock, so the three are read in one
+  // breath rather than across the fuse thread's next frame.
+  const sensor::ArkitSensor& camera = *impl.arkit;
+  const sensor::SensorInfo& info = camera.info();
+  const sensor::ArkitStatus status = camera.status();
+  const sensor::SensorStats stats = camera.stats();
+  _opened = YES;
+  _model = app::to_ns_string(info.model);
+  _tracking = app::to_ns_string(sensor::to_string(status.tracking));
+  _trackingNormal = status.tracking == sensor::ArkitTracking::Normal ? YES : NO;
+  _interrupted = status.interrupted ? YES : NO;
+  _sessionError = app::to_ns_string(status.session_error);
+  _lastRefusal = app::to_ns_string(status.last_refusal);
+  _received = stats.received;
+  _delivered = stats.delivered;
+  _dropped = stats.dropped;
+  _failed = stats.failed;
+  _withheld = status.withheld;
+  _refused = status.refused;
+  _missed = status.missed;
+  if (info.depth) {
+    _depthWidth = info.depth->size.width;
+    _depthHeight = info.depth->size.height;
+  }
+  if (info.color) {
+    _colorWidth = info.color->size.width;
+    _colorHeight = info.color->size.height;
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl.camera_readout.mutex);
+    const app::CameraReadout& o = impl.camera_readout;
+    if (o.codes_known) {
+      _colorCodes = app::to_ns_string(color_codes_text(o.codes));
+    }
+    _contractBreach = app::to_ns_string(o.breach);
+    _indexChecked = o.index_checked;
+    _indexMismatches = o.index_mismatches;
+  }
+  return self;
+}
+
+@end
 
 @implementation VolumetricRenderer {
   std::unique_ptr<app::RendererImpl> _impl;
-  // Retained, not borrowed. The fuse thread dereferences the raw
-  // FrameSource* this object owns, and the two are siblings on the view
-  // controller with no specified destruction order -- so "must outlive the
-  // renderer" as a header sentence is not a mechanism. Held from
-  // -startFusionWithCapture: until the join in -stopFusion, which is the exact
-  // window in which the pointer is read.
-  VolumetricCapture* _capture;
 }
 
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
+                                source:(VolumetricCameraSource)source
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
@@ -534,6 +600,51 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // OutOfMemory that must reach Swift as one.
     app::set_error(error, fusion_started, "Fusion::start");
     return nil;
+  }
+
+  // --- The camera, last ------------------------------------------------------
+  // Last, so nothing above leaves ARKit's session running when it fails. On
+  // the compute device, which prepares the pictures, and shared with gfx's
+  // family, which samples them as keyframes: both families, always, as the
+  // mesh's, since the importer collapses the pair where they are one.
+  //
+  // Opening runs the session and waits for its first frame with depth, whose
+  // cameras the sensor's are -- and, the first time the app asks, for the
+  // user's answer to the camera prompt. This whole method runs off the main
+  // thread already. A camera that does not open fails nothing: the read-out
+  // says why, and nothing fuses.
+  _impl->camera_pattern = source == VolumetricCameraSourcePattern;
+  if (source == VolumetricCameraSourceNone) {
+    _impl->camera_error =
+        "no camera opened: the launch's arguments were refused";
+  } else {
+    sensor::ArkitSensor::Options camera;
+    camera.source = _impl->camera_pattern ? sensor::ArkitSource::Pattern
+                                          : sensor::ArkitSource::Camera;
+    // ARKit's medium and high: its low-confidence samples are frequently
+    // metres wrong at depth discontinuities, and a TSDF carves free space
+    // along every ray it believes. The floor the scanner has always fused at;
+    // the frame prep applies it on the GPU.
+    camera.min_confidence = 1;
+    camera.device = &*_impl->compute_device;
+    camera.color_queue_families[0] = _impl->shared->compute_family();
+    camera.color_queue_families[1] = _impl->shared->graphics_family();
+    camera.color_queue_family_count = 2;
+    vkc::Result<sensor::ArkitSensor> opened = sensor::ArkitSensor::open(camera);
+    if (opened) {
+      _impl->arkit.emplace(std::move(opened).value());
+      // The fuse thread waits on this rather than polling at a fixed rate.
+      // The impl outlives the camera, which calls it from its own queue, and
+      // the signal is declared before it, so it outlives every call.
+      app::RendererImpl* impl = _impl.get();
+      const vkc::Status notified = _impl->arkit->set_frame_notify(
+          [impl] { impl->frame_signal.notify(); });
+      if (!notified) {
+        _impl->fusion.note_error(notified.message(), "camera notify: ");
+      }
+    } else {
+      _impl->camera_error = opened.status().message();
+    }
   }
 
   return self;
@@ -943,23 +1054,29 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
 }
 
 - (void)dealloc {
-  // Explicit, and in this order: the fuse thread must be joined before the
-  // capture it polls is released, and both before ~RendererImpl drains the
-  // queues and unwinds Vulkan. ARC releases the ivars after this returns and
-  // says nothing about their order relative to each other.
+  // Explicit, and in this order: the fuse thread is joined, then the camera it
+  // polls stops, and both before ~RendererImpl drains the queues and unwinds
+  // Vulkan.
   [self stopFusion];
 }
 
-- (void)startFusionWithCapture:(VolumetricCapture*)capture {
+- (void)startFusion {
   // A stop request can clear the flag before the old thread finishes. Do not
-  // replace its retained capture until stopFusion has joined it.
+  // start the camera again until stopFusion has joined it.
   if (_impl->fusing.load() || _impl->fuse_thread.joinable()) {
     return;
   }
-  // Retained for the life of the thread below, which reads the pointer this
-  // unwraps on every iteration.
-  _capture = capture;
-  _impl->capture = static_cast<app::FrameSource*>([capture captureHandle]);
+  // No camera, nothing to fuse: the read-out already says why it did not open.
+  if (!_impl->arkit) {
+    return;
+  }
+  // Before the thread, which polls it: frames go out from here, the counters
+  // and sequences from 0. A session that failed stays failed.
+  const vkc::Status camera_started = _impl->arkit->start();
+  if (!camera_started) {
+    _impl->fusion.note_error(camera_started.message(), "camera start: ");
+    return;
+  }
 
   // The impl pointer, deliberately, and not `self`: this TU is compiled
   // -fobjc-arc, so a by-copy capture of `self` would be __strong and the retain
@@ -971,58 +1088,39 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   app::RendererImpl* impl = _impl.get();
   const bool started = app::start_worker(
       impl->fusing, impl->fuse_thread,
-      [impl] {
-        return std::thread([impl] {
-          while (impl->fusing.load()) {
-            // Keep the boundary inside the loop: one failed poll/fuse is
-            // reported and skipped without ending the scan. Reporting must
-            // itself remain safe when host allocation is failing.
-            const bool completed = app::contain_frame_failure(
-                [impl] {
-                  vkc::Result<std::optional<app::CapturedFrame>> got =
-                      impl->capture->poll();
-                  if (!got || !got.value()) {
-                    // Nothing new: sleep briefly rather than spin. ARKit
-                    // delivers at 60 Hz and this loop is otherwise free to burn
-                    // a core doing nothing.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    return;
-                  }
-                  impl->fusion.fuse(*got.value());
-                },
-                [impl](std::string_view message) noexcept {
-                  impl->fusion.note_error(message, "fuse thread: ");
-                });
-            if (!completed)
-              std::this_thread::sleep_for(std::chrono::milliseconds(2));
-          }
-        });
-      },
+      [impl] { return std::thread([impl] { app::run_fuse_loop(*impl); }); },
       [impl](std::string_view message) noexcept {
         impl->fusion.note_error(message, "fuse thread startup: ");
       });
   if (!started) {
-    // Thread construction failed; no worker can still borrow this capture.
-    impl->capture = nullptr;
-    _capture = nil;
+    // Thread construction failed: nothing polls the camera, so it stops again.
+    impl->arkit->stop();
   }
 }
 
 - (void)beginStopFusion {
   if (_impl) {
-    // The flag only. `capture` stays valid and the thread stays joinable --
-    // -stopFusion is still what makes either of those untrue.
+    // The flag only, and a nudge to a thread waiting for a frame. The thread
+    // stays joinable and the camera started -- -stopFusion is still what
+    // makes either of those untrue.
     _impl->fusing.store(false);
+    _impl->frame_signal.notify();
   }
 }
 
 - (void)stopFusion {
   if (_impl) {
+    // The join, then the camera's stop: see RendererImpl::stop_fusing.
     _impl->stop_fusing();
   }
-  // After the join, never before: the thread dereferences the capture handle
-  // this retain keeps alive.
-  _capture = nil;
+}
+
+- (VolumetricCameraStatus*)cameraStatus {
+  return [[VolumetricCameraStatus alloc] initWithImpl:*_impl];
+}
+
+- (const void*)sensorInfoHandle {
+  return _impl->arkit ? &_impl->arkit->info() : nullptr;
 }
 
 // Written out rather than left to auto-synthesis. A `@property` with no

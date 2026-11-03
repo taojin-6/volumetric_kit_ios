@@ -20,12 +20,12 @@ final class LinkModel: ObservableObject {
   @Published private(set) var entryError: String?
 
   private let link = VolumetricLink()
-  private let capture: VolumetricCapture
+  /// Whose camera the session describes, at the first connect: set once the
+  /// renderer is up, nil before.
+  weak var renderer: VolumetricRenderer?
   private var timer: Timer?
 
-  /// - Parameter capture: Whose depth camera the session describes.
-  init(capture: VolumetricCapture) {
-    self.capture = capture
+  init() {
     // In the common modes, so it also runs while a scroll view is tracking.
     let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
       self?.refresh()
@@ -38,7 +38,7 @@ final class LinkModel: ObservableObject {
 
   func connect(address: String, port: String) {
     do {
-      try link.connect(toAddress: address, port: port, capture: capture)
+      try link.connect(toAddress: address, port: port, renderer: renderer)
       entryError = nil
     } catch {
       entryError = error.localizedDescription

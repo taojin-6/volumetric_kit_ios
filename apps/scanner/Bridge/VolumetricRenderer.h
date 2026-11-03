@@ -17,22 +17,10 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/CAMetalLayer.h>
 
-/// Forward-declared rather than imported. `VolumetricCapture` appears in this
-/// header exactly once -- the pointer parameter of @ref startFusionWithCapture:
-/// -- and a pointer parameter needs no definition.
-///
-/// Importing ARKitCapture.h here pulled `<ARKit/ARKit.h>` into every
-/// translation unit that includes this one, which is most of the bridge -- and
-/// the ones paying most for it had no business knowing ARKit exists.
-/// RendererErrors.mm turns a library `Status` into an `NSError`;
-/// AllocationStopDisplay.mm turns a stopped scan into a sentence. Neither
-/// mentions a capture. They were 289k and 262k preprocessed lines; they are
-/// 108k and 80k now, and the target is 4.20s -> 3.29s.
-///
-/// Swift is unaffected: Scanner-Bridging-Header.h imports ARKitCapture.h in its
-/// own right, which is what puts `VolumetricCapture` in front of Swift, and it
-/// always did -- this header was never the reason that worked.
-@class VolumetricCapture;
+// `VolumetricCameraSource`. No ARKit reaches this header: the camera is
+// sensor's `ArkitSensor`, behind the renderer, and its header names no ARKit
+// type either.
+#import "ScannerLaunch.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -282,8 +270,8 @@ typedef struct {
 /// measurement. Giving the bar two tiers fixed the shape and left both sides
 /// still holding their own literals; this is what removes the second copy.
 ///
-/// A plain C struct, like @ref VolumetricCaptureStats, so Swift reads the
-/// fields directly with no bridging object per tick.
+/// A plain C struct, so Swift reads the fields directly with no bridging
+/// object per tick.
 typedef struct {
   /// Block-table occupancy, for the headline meter.
   VolumetricToneThresholds occupancy;
@@ -424,15 +412,16 @@ typedef struct {
 /// than this frame.
 @property(nonatomic, readonly) BOOL extractStale;
 
-/// The fuse thread's per-textured-remesh keyframe import, which sits inside no
-/// stage row and no other total. Zero when nothing was imported.
+/// The fuse thread's camera poll for the last fused frame, which imports its
+/// picture (`ArkitSensor::poll`) and sits inside no stage row and no other
+/// total.
 ///
 /// The extract's unaccounted remainder is deliberately **not** here beside it.
 /// It looks like the same kind of figure and is not: Fusion publishes it as the
 /// `"  ..other"` stage row, so it is already one of the bars, and a second copy
 /// on the snapshot only ever produced a panel that drew it twice and then said
 /// it was in neither bar. This one really is outside every span there is.
-@property(nonatomic, readonly) double keyframeImportMs;
+@property(nonatomic, readonly) double pollMs;
 /// Fused frames so far, as the panel's own answer to "has anything completed
 /// yet".
 ///
@@ -504,6 +493,60 @@ typedef struct {
 /// @}
 @end
 
+/// @brief The camera now: sensor's `ArkitSensor`, its session's state and its
+///        counters, read in one go for the read-out.
+///
+/// The counters are the camera's since its last start (`SensorStats`,
+/// `ArkitStatus`). No field carries a pixel, a depth value, a pose or a path.
+@interface VolumetricCameraStatus : NSObject
+/// Whether the camera opened at bring-up. When not, @ref openError says why
+/// (no LiDAR, the camera not allowed, no depth in time, a refused launch) and
+/// every other field is its default.
+@property(nonatomic, readonly) BOOL opened;
+/// Why the camera did not open; empty when it did.
+@property(nonatomic, readonly, copy) NSString* openError;
+/// The test pattern (`-source pattern`): no camera is open.
+@property(nonatomic, readonly) BOOL pattern;
+/// What the sensor is (`SensorInfo::model`): "ARKit, " and the device's model.
+@property(nonatomic, readonly, copy) NSString* model;
+/// ARKit's tracking at the last frame, named (`ArkitTracking`).
+@property(nonatomic, readonly, copy) NSString* tracking;
+/// Whether that is normal tracking, the one whose frames go out.
+@property(nonatomic, readonly) BOOL trackingNormal;
+/// ARKit has stopped the camera for a while; no frames until it ends.
+@property(nonatomic, readonly) BOOL interrupted;
+/// ARKit's failure, which ended the session; empty for none.
+@property(nonatomic, readonly, copy) NSString* sessionError;
+/// Why the last frame was refused; empty for none.
+@property(nonatomic, readonly, copy) NSString* lastRefusal;
+/// `SensorStats`: frames the camera produced, handed out, let go unseen, and
+/// could not hand out.
+@property(nonatomic, readonly) uint64_t received;
+@property(nonatomic, readonly) uint64_t delivered;
+@property(nonatomic, readonly) uint64_t dropped;
+@property(nonatomic, readonly) uint64_t failed;
+/// `ArkitStatus`, the two parts of @ref failed and ARKit's own skipped
+/// periods.
+@property(nonatomic, readonly) uint64_t withheld;
+@property(nonatomic, readonly) uint64_t refused;
+@property(nonatomic, readonly) uint64_t missed;
+/// The cameras' sizes, from when the camera opened.
+@property(nonatomic, readonly) uint32_t depthWidth;
+@property(nonatomic, readonly) uint32_t depthHeight;
+@property(nonatomic, readonly) uint32_t colorWidth;
+@property(nonatomic, readonly) uint32_t colorHeight;
+/// The last read picture's colour tags as H.273 code points, e.g.
+/// "matrix 6  transfer 1  primaries 1  full  chroma 0"; "-" before one.
+@property(nonatomic, readonly, copy) NSString* colorCodes;
+/// The first frame-contract rule a frame broke since the start, as of the
+/// last console line; empty when kept.
+@property(nonatomic, readonly, copy) NSString* contractBreach;
+/// The pattern's frames checked for the index their depth carries, and
+/// those that did not carry their own; 0 for the camera.
+@property(nonatomic, readonly) uint64_t indexChecked;
+@property(nonatomic, readonly) uint64_t indexMismatches;
+@end
+
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
 ///
 /// Construction runs the whole chain — instance → surface (from the layer) →
@@ -518,16 +561,25 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///               `drawableSize` must already be set in **pixels**.
 /// @param configurationPath Path to a shared JSON scenario. Core validates it
 ///                          before any GPU resources are created.
+/// @param source  The camera: sensor's `ArkitSensor` is opened on the compute
+///                device, its pictures shared with gfx's family, as the last
+///                step. Opening runs ARKit's session and waits for its first
+///                frame with depth, and the first time the app asks, for the
+///                user's answer to the camera prompt: call this off the main
+///                thread. A camera that does not open fails nothing else:
+///                @ref cameraStatus says why and nothing fuses.
+///                `VolumetricCameraSourceNone` opens none.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
+                                source:(VolumetricCameraSource)source
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
 
-/// @brief Begin fusing from @p capture on a background thread.
+/// @brief Start the camera, then fuse its frames on a background thread.
 ///
 /// Fusion runs off the render thread so a slow remesh does not stall
 /// presentation. They still *serialize on the GPU* — iOS gives one queue, so
@@ -541,14 +593,15 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// transfer path gfx does not expose yet; until then `remesh_every` is the knob
 /// that bounds how often it is paid.
 ///
-/// @p capture is **retained** for as long as fusion runs — the fuse thread
-/// dereferences the `FrameSource` it owns, and a bare "must outlive the
-/// renderer" is not something the caller can honour when the two are siblings
-/// with no specified destruction order.
+/// The camera is the renderer's own, so nothing outside it is borrowed. Its
+/// counters and sequences start again from 0, and ARKit's world is kept
+/// across a stop and a start: frames are withheld until ARKit has found it
+/// again. A camera that did not open, or that will not start, starts nothing;
+/// @ref cameraStatus and the read-out's errors say why.
 ///
 /// Call @ref stopFusion before tearing the renderer down, or on leaving the
 /// screen; a second call while fusion is already running does nothing.
-- (void)startFusionWithCapture:(VolumetricCapture*)capture;
+- (void)startFusion;
 
 /// @brief Ask the fuse thread to stop, without waiting for it.
 ///
@@ -564,10 +617,14 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// the main thread, and blocking it for that long is a watchdog kill.
 ///
 /// This is not a substitute for @ref stopFusion: until that returns, the thread
-/// is still running and still dereferencing the capture handle.
+/// is still running and still polling the camera.
 - (void)beginStopFusion;
 
-/// @brief Stop the fuse thread, join it, and release the capture.
+/// @brief Stop the fuse thread, join it, then stop the camera, which pauses
+///        ARKit's session and lets the camera go.
+///
+/// The camera stops after the join, never before: the thread polls it. The
+/// thread prints the run's last console line as it ends.
 ///
 /// Idempotent, and safe on a renderer that never started. `-dealloc` calls it,
 /// so a dropped renderer cannot leave the thread running — but call it
@@ -577,6 +634,17 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// **Blocks** for as long as the iteration in progress takes; see
 /// @ref beginStopFusion for the non-blocking half and why the two are split.
 - (void)stopFusion;
+
+/// The camera now: its session's state and counters. Read on the main thread
+/// at the read-out's rate; each read is a new object.
+@property(nonatomic, readonly) VolumetricCameraStatus* cameraStatus;
+
+/// @return The camera's `volumetric_kit::sensor::SensorInfo`
+///         (sensor/rgbd_sensor.hpp), fixed from when it opened, as an opaque
+///         pointer valid for the renderer's life; null when the camera did
+///         not open. For the bridge's C++ (the live link's session) alone.
+- (const void* _Nullable)
+    sensorInfoHandle NS_SWIFT_UNAVAILABLE("C++ interop only");
 
 /// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
 /// stays reachable because when the mesh first renders wrong, being able to A/B
