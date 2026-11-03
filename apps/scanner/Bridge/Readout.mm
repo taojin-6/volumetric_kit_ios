@@ -12,11 +12,11 @@
 // it. Before these moved out of Fusion.hpp the include really was the
 // dependency; now it is a coincidence.
 #import "Freshness.hpp"
+#import "StageTiming.hpp"
 #import "StatTone.hpp"
 
 #include <os/log.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstddef>
@@ -141,12 +141,6 @@ NS_ASSUME_NONNULL_END
     _activeBlocks = stats.extract.active_blocks;
     _extractStale = stats.extract_stale ? YES : NO;
 
-    // No extract residual here. `max(0, extract_ms - extract.total_ms())` was
-    // computed on this line and published as its own figure, but Fusion already
-    // pushes that exact expression as the `"  ..other"` stage row -- so the
-    // panel drew it as a bar and then listed it again underneath a heading
-    // reading "not in the bars above". One measurement, one publication: the
-    // bar. See Fusion.mm's push_stage("  ..other", ...).
     _keyframeImportMs = stats.keyframe_import_ms;
     _framesFused = stats.frames_fused;
     _msSinceStages = stats.ms_since_stages;
@@ -159,7 +153,6 @@ NS_ASSUME_NONNULL_END
                        ? YES
                        : NO;
     _stagesTruncated = stats.stages_truncated ? YES : NO;
-    _gpuTimingRetired = stats.gpu_timing_retired ? YES : NO;
 
     _memoryFootprintBytes = budget.footprint_bytes;
     _gpuWorkingSetBytes = workingSet;
@@ -290,6 +283,42 @@ VolumetricStatTone panel_tone(double fraction, app::ToneThresholds t) {
   return static_cast<VolumetricStatTone>(app::tone_for(fraction, t));
 }
 
+// A stage row's device state, cast across the core, vi_core's mirror and the
+// Objective-C enum, so each pair is pinned value for value like the tone above:
+// a renumbering would relabel every device cell rather than fail.
+namespace vkc = volumetric_kit::core;
+template <typename A, typename B>
+constexpr bool same_value(A a, B b) {
+  return static_cast<int>(a) == static_cast<int>(b);
+}
+using app::DeviceTime;
+static_assert(same_value(vkc::DeviceTime::None, DeviceTime::None),
+              "app::DeviceTime and core::DeviceTime disagree: none");
+static_assert(same_value(vkc::DeviceTime::Measured, DeviceTime::Measured),
+              "app::DeviceTime and core::DeviceTime disagree: measured");
+static_assert(same_value(vkc::DeviceTime::NotTimed, DeviceTime::NotTimed),
+              "app::DeviceTime and core::DeviceTime disagree: not timed");
+static_assert(same_value(vkc::DeviceTime::Unavailable, DeviceTime::Unavailable),
+              "app::DeviceTime and core::DeviceTime disagree: unavailable");
+static_assert(same_value(VolumetricDeviceTimeNone, DeviceTime::None),
+              "VolumetricDeviceTime and app::DeviceTime disagree: none");
+static_assert(same_value(VolumetricDeviceTimeMeasured, DeviceTime::Measured),
+              "VolumetricDeviceTime and app::DeviceTime disagree: measured");
+static_assert(same_value(VolumetricDeviceTimeNotTimed, DeviceTime::NotTimed),
+              "VolumetricDeviceTime and app::DeviceTime disagree: not timed");
+static_assert(same_value(VolumetricDeviceTimeUnavailable,
+                         DeviceTime::Unavailable),
+              "VolumetricDeviceTime and app::DeviceTime disagree: unavailable");
+
+app::StageTiming timing_of(const vkc::StageRow& row) {
+  app::StageTiming t;
+  t.cpu_ms = row.cpu_ms;
+  t.wait_ms = row.wait_ms;
+  t.gpu_ms = row.gpu_ms;
+  t.device = static_cast<app::DeviceTime>(row.device);
+  return t;
+}
+
 }  // namespace
 
 @implementation VolumetricFrameSample
@@ -332,9 +361,14 @@ VolumetricStatTone panel_tone(double fraction, app::ToneThresholds t) {
     // own warning about a row named from somewhere else is the case this
     // covers.
     _name = app::to_ns_string(row.name != nullptr ? row.name : "");
-    _cpuMs = row.cpu_ms;
-    _gpuMs = row.gpu_ms;
-    _hasGpu = row.has_gpu ? YES : NO;
+    // The device half from `device` alone: the core deprecates `has_gpu`, and
+    // only `device` tells n/t from n/a.
+    const app::StageTiming t = timing_of(row);
+    _busyMs = app::busy_ms(t);
+    _waitMs = t.wait_ms;
+    _gpuMs = t.gpu_ms;
+    _device = static_cast<VolumetricDeviceTime>(t.device);
+    _deviceCell = app::to_ns_string(app::device_cell(t, 1).c_str());
   }
   return self;
 }
@@ -420,28 +454,32 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
   }
   // The stage grid, which is not a section: it is a per-stage host/device split
   // the panel charts rather than lists, and it has no label/value shape to
-  // borrow. Rendered here so the log still carries it.
+  // borrow. Rendered here so the log still carries it, in the panel's three
+  // cells: busy, wait (blank when none), and the device cell.
   if (stages.count > 0) {
     out += "Stages\n";
     for (VolumetricStageRow* stage in stages) {
       const char* name = stage.name.UTF8String;
-      if (stage.hasGpu) {
-        out += sfmt("   %-18s%6.2f ms cpu  %6.2f ms gpu",
-                    name != nullptr ? name : "", stage.cpuMs, stage.gpuMs);
-      } else {
-        // No device span was measured for this row. Deliberately not printed as
-        // a zero: see VolumetricStageRow, where `hasGpu` is documented as a
-        // measurement fact and explicitly not a capability report.
-        out += sfmt("   %-18s%6.2f ms cpu", name != nullptr ? name : "",
-                    stage.cpuMs);
+      app::StageTiming t;
+      t.wait_ms = stage.waitMs;
+      t.gpu_ms = stage.gpuMs;
+      t.device = static_cast<app::DeviceTime>(stage.device);
+      const std::string cell = app::device_cell(t, 2);
+      out += sfmt("   %-18s%6.2f ms busy", name != nullptr ? name : "",
+                  stage.busyMs);
+      if (stage.waitMs > 0.0) {
+        out += sfmt("  %6.2f wait", stage.waitMs);
+      } else if (!cell.empty()) {
+        out += std::string(13, ' ');
       }
+      if (!cell.empty()) out += sfmt("  %6s gpu", cell.c_str());
       out += "\n";
     }
-    // The three things a stage row cannot say, and each of which changes what
-    // the rows above mean. They are on the panel already -- `msSinceStages`,
-    // `stagesTruncated` and `gpuTimingRetired` are typed fields on the snapshot
-    // for exactly this -- and were dropped from the text, where they matter
-    // most: a device run is read from `devicectl ... --console`.
+    // The two things a stage row cannot say, and each of which changes what
+    // the rows above mean. They are on the panel already -- `msSinceStages`
+    // and `stagesTruncated` are typed fields on the snapshot for exactly this
+    // -- and were dropped from the text, where they matter most: a device run
+    // is read from `devicectl ... --console`.
     //
     // Measured *against* `ms_since_fuse` rather than a wall clock of its own,
     // because the pair is the reading. An ARKit interruption stops both, and
@@ -457,15 +495,6 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
       // rows, so a reader summing the column under-reports with nothing to
       // notice it by. See Fusion.mm, which records the flag for this.
       out += "   (more stages than this holds)\n";
-    }
-    if (s.gpu_timing_retired) {
-      // Named, because the aftermath is silent by construction: every row goes
-      // host-only, which is exactly what a device with no timestamp support
-      // looks like. One is a fault and the other is hardware, and without this
-      // line the transcript cannot tell them apart. See
-      // FusionConfig::measure_stages.
-      out += "   (device timing retired after a fence failure -- host only for "
-             "the rest of this run)\n";
     }
     // The fuse thread's keyframe import, which sits outside the libraries'
     // spans, outside `extract_ms` and outside `texture_ms` -- so a reader
@@ -753,32 +782,20 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // feeding nothing, and a title match holding them together. The bars are the
   // only rendering, so `stageRows` is the only publication.
 
-  // --- Fuse timing, and Extract phases: the stage table's stand-ins
-  // -----------
+  // --- Fuse timing, and Extract timing: the stage table's stand-ins ---------
   //
   // Both appear **only when `s.stage_count == 0`**, which is the whole of what
-  // makes them right rather than a second account of the same scan.
-  //
-  // With `FusionConfig::measure_stages` on -- the default -- Fusion publishes
-  // all of this as stage rows: `extract` and the six `"  .."` phases it
-  // decomposes into, `..other` included. Publishing a section as well drew and
-  // printed every one of those figures twice, and the residual worst of all:
-  // Dashboard.swift and this file both record `max(0, extract_ms -
-  // extract.total_ms())` as having been *removed* from the panel for exactly
-  // that double-count, whose over-count grows with `active_blocks`.
-  //
-  // With the switch off there are no stage rows at all, and these two blocks
-  // are then the only place any of it appears -- which is what keeps that
-  // switch costing the device column rather than every timing the fuse has.
-  // `ExtractTimings` is filled by `remesh` either way; only the stage publish
-  // is behind the flag.
+  // makes them right rather than a second account of the same scan. With
+  // `FusionConfig::measure_stages` on -- the default -- the tiers publish all
+  // of this as stage rows, grid's `marching cubes` and its breakdowns among
+  // them. With the switch off there are no stage rows at all, and these two
+  // blocks are the host spans the bridge times either way, so that switch costs
+  // the device column and the breakdowns rather than every timing.
   if (s.stage_count == 0) {
     // Two host spans measured on every fused frame regardless of the switch.
-    // Their own section rather than rows beside the extract phases below,
-    // because they are a different cadence: these are this frame's, and
-    // everything in `s.extract` is the last *successful remesh's*. Putting two
-    // cadences under one heading with one staleness marker is the pairing the
-    // Block table card was rewritten to stop making.
+    // Their own section rather than rows beside the extract below, because
+    // they are a different cadence: these are this frame's, and the extract is
+    // the last *successful remesh's*.
     if (s.frames_fused > 0) {
       NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
       add(r, @"allocate", fmt("%.2f ms", s.allocate_ms));
@@ -788,63 +805,21 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
 
     NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
     if (s.extract.dispatches == 0) {
-      // Named, not drawn as six zeros. `FusionStats::extract` is
-      // value-initialised until the first successful remesh, so an ungated
-      // table renders `compact 0.00 / sizing 0.00 / ...` from launch -- and for
-      // the whole session on a device whose extract never succeeds -- in which
-      // "the extract has not run" is indistinguishable from "it ran and every
-      // phase was free". That is the confusion these cells carry two decimals
-      // to avoid, and it is why `VolumetricStageRow.init` is NS_UNAVAILABLE.
-      // Every sibling state on this read-out names its condition instead: "no
-      // remesh yet", "no sample yet", "not published".
-      add(r, @"phases", @"no remesh yet");
+      // Named, not drawn as a zero: `FusionStats::extract` is value-initialised
+      // until the first successful remesh, and "the extract has not run" must
+      // not read as "it ran and was free".
+      add(r, @"extract", @"no remesh yet");
     } else {
-      // Everything below comes from the last successful remesh, so say when
-      // that is no longer this frame -- the same marker the Scene card's
-      // `extract` row carries, for the same reason and off the same flag. A
-      // breakdown frozen by a failing extract otherwise shows six crisp
-      // durations in a neutral tone from a remesh fifteen seconds ago, three
-      // cards from the row saying so.
-      const VolumetricStatTone phase_tone =
-          s.extract_stale ? VolumetricStatToneWarn : VolumetricStatToneNeutral;
-      if (s.extract_stale) {
-        add(r, @"sample",
-            fmt("stale %llu frames",
-                (unsigned long long)s.frames_since_extract),
-            phase_tone);
-      }
-      // The total these decompose, which the stage table carries as its
-      // `extract` row and which nothing else here prints.
-      add(r, @"extract", fmt("%.2f ms", s.extract_ms), phase_tone);
-      struct PhaseCell {
-        const char* label;
-        double ms;
-      };
-      const PhaseCell phases[] = {
-          {"compact", s.extract.compact_ms},
-          {"sizing", s.extract.arena_alloc_ms},
-          {"desc", s.extract.descriptor_ms},
-          {"meshing", s.extract.dispatch_ms},
-          {"read", s.extract.readback_ms},
-          // The residual, printed rather than left implicit: these phases do
-          // not sum to extract_ms and never did. grid's spans open after the
-          // slot claim and close before the O(active_blocks) teardown of the
-          // neighbour table, so the gap grows with the scan -- the one
-          // direction in which an unlabelled remainder would be misread as
-          // rounding. Not a double-count here, because the `"  ..other"` stage
-          // row that would clash with it exists only when this section does
-          // not.
-          {"other", std::max(0.0, static_cast<double>(s.extract_ms) -
-                                      s.extract.total_ms())},
-      };
-      for (const PhaseCell& cell : phases) {
-        // Two decimals because three of these sat under 0.05 ms on the measured
-        // device and at one decimal were indistinguishable from "not measured"
-        // -- including `sizing`, the phase that prices a refit.
-        add(r, to_ns_string(cell.label), fmt("%.2f ms", cell.ms), phase_tone);
-      }
+      // From the last successful remesh, so say when that is no longer this
+      // frame -- the Scene card's `extract` row's marker, off the same flag.
+      const bool stale = s.extract_stale;
+      add(r, @"extract",
+          stale ? fmt("%.2f ms  [stale %llu frames]", s.extract_ms,
+                      (unsigned long long)s.frames_since_extract)
+                : fmt("%.2f ms", s.extract_ms),
+          stale ? VolumetricStatToneWarn : VolumetricStatToneNeutral);
     }
-    [out addObject:make_section(@"Extract phases", r)];
+    [out addObject:make_section(@"Extract timing", r)];
   }
 
   // --- Block table: the hash map, and the ceiling that stops a scan ----------

@@ -40,6 +40,7 @@ add_executable(
   orbit_camera_test.cpp
   picture_slot_test.cpp
   self_test_test.cpp
+  stage_timing_test.cpp
   stat_tone_test.cpp
   view_orientation_test.cpp)
 

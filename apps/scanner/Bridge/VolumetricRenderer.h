@@ -104,6 +104,20 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
   VolumetricViewOrientationPortraitUpsideDown = 3,
 };
 
+/// @brief What a stage row's device half holds: the core's `DeviceTime`, value
+///        for value (Readout.mm static_asserts it, and vi_core's mirror).
+typedef NS_ENUM(NSInteger, VolumetricDeviceTime) {
+  /// A host-only stage, or one that returned before dispatching.
+  VolumetricDeviceTimeNone = 0,
+  /// @ref VolumetricStageRow.gpuMs is the stage's device time.
+  VolumetricDeviceTimeMeasured = 1,
+  /// Its device work ran untimed this frame (no query room, a failed batch);
+  /// the next frame may time again.
+  VolumetricDeviceTimeNotTimed = 2,
+  /// The queue cannot time, or the timer has no queries.
+  VolumetricDeviceTimeUnavailable = 3,
+};
+
 /// @brief One pipeline stage's host and device time, for the Swift side to
 ///        chart.
 ///
@@ -111,20 +125,6 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 /// property is *rendered text*, so Swift can print it and nothing else. A chart
 /// needs the numbers. Same rows, same source -- the summary is built from
 /// these.
-///
-/// @note `gpuMs` is meaningful only where `hasGpu` is set, and a reader must
-///       never distinguish the cases by inspecting `gpuMs` for a zero. But read
-///       that flag as **"a device span was measured for this row"**, which is
-///       the only thing it can mean, and *not* as a capability report. It is
-///       false for all three of: a stage that is genuinely host-only; a call
-///       that returned before dispatching anything (an empty active set, a
-///       refused argument), whose host row is still charged deliberately; and
-///       every stage on a queue family reporting no timestamps. Rendering "this
-///       device does not support GPU timestamps" off a false here is a hardware
-///       verdict drawn from a correct measurement of a stage that merely
-///       early-returned. Nothing on this object can tell the three apart --
-///       the libraries' own rule is that a caller who must know asks the
-///       device.
 @interface VolumetricStageRow : NSObject
 /// Unavailable; see @ref VolumetricStatRow.init. A zeroed row would also plot
 /// as a real stage that measured 0.00 ms, which is the one reading this file
@@ -132,20 +132,22 @@ typedef NS_ENUM(NSInteger, VolumetricViewOrientation) {
 - (instancetype)init NS_UNAVAILABLE;
 /// Stage label; a breakdown of the row above it is prefixed with spaces.
 ///
-/// @warning A breakdown's `cpuMs` and `gpuMs` are both **contained in** those
-///          of the row above it, so summing either column over every row
-///          double-counts the breakdowns.
+/// @warning A breakdown's times are all **contained in** those of the row
+///          above it, so summing a column over every row double-counts the
+///          breakdowns.
 @property(nonatomic, readonly, copy) NSString* name;
-/// Wall clock around the stage. For a compute stage this covers host
-/// record, submit, the fence stall AND device execution -- an end-to-end cost,
-/// not a host-only one.
-@property(nonatomic, readonly) double cpuMs;
+/// The host span less its wait: record, submit and host work.
+@property(nonatomic, readonly) double busyMs;
+/// The part of the host span spent blocked on the device, as a fence wait.
+/// The bar draws it after @ref busyMs; the two make the whole span.
+@property(nonatomic, readonly) double waitMs;
 /// Device time of every command recorded inside the stage, its breakdowns'
-/// included.
+/// included. Meaningful only where @ref device is Measured.
 @property(nonatomic, readonly) double gpuMs;
-/// Whether @ref gpuMs holds a real measurement -- see the note on this class,
-/// which is not the same claim as "this device can time the GPU".
-@property(nonatomic, readonly) BOOL hasGpu;
+@property(nonatomic, readonly) VolumetricDeviceTime device;
+/// The device cell as the panel prints it: @ref gpuMs to one decimal, `n/t`,
+/// `n/a`, or empty for a host-only stage (vi_core's `device_cell`).
+@property(nonatomic, readonly, copy) NSString* deviceCell;
 @end
 
 /// @brief Why a fused frame took no new geometry in, when it took none.
@@ -200,7 +202,8 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 /// Monotonic nanoseconds at which the sample was taken, from the same clock
 /// across the whole history. The only field that can show an outage.
 @property(nonatomic, readonly) uint64_t timestampNs;
-/// Summed host milliseconds, breakdown rows excluded.
+/// Summed host milliseconds, breakdown rows and the `marching cubes` row
+/// excluded: the fuse half.
 ///
 /// @warning Not host-only time, and not stackable with @ref deviceMs. The
 ///          libraries measure a compute stage as wall clock around a *blocking*
@@ -209,20 +212,19 @@ typedef NS_ENUM(NSInteger, VolumetricAllocationStop) {
 ///          two double-counts; subtracting them reports a device stall as host
 ///          overhead. Overlay them, or plot this one alone.
 @property(nonatomic, readonly) double hostMs;
-/// Summed device milliseconds, breakdown rows excluded, as for @ref hostMs.
+/// Summed device milliseconds, over the rows @ref hostMs sums.
 ///
 /// Meaningful only where @ref deviceTimingValid is set -- a device that reports
 /// no timestamps and a frame that dispatched nothing are both `0.0` here.
 @property(nonatomic, readonly) double deviceMs;
-/// Whether any stage this frame carried a real device measurement.
+/// Whether any stage @ref deviceMs sums carried a device measurement.
 @property(nonatomic, readonly) BOOL deviceTimingValid;
-/// Milliseconds the mesh extract took, when one ran on this frame.
+/// Milliseconds the mesh extract took, when one ran on this frame: the mesh
+/// half.
 ///
-/// Not included in @ref hostMs or @ref deviceMs -- the extract reports through
-/// its own timings rather than the stage rows, so neither total can see it.
-/// It is also the dominant cost in a remesh frame, and a remesh runs on every
-/// fused frame by default. A "which frame was slow" chart that omits this is
-/// missing the usual answer.
+/// Not in @ref hostMs or @ref deviceMs, which leave grid's `marching cubes`
+/// row out so the extract counts once, here. It is also the dominant cost in a
+/// remesh frame, and a remesh runs on every fused frame by default.
 @property(nonatomic, readonly) double extractMs;
 /// Block-table occupancy in `[0, 1]` at this frame.
 ///
@@ -396,8 +398,8 @@ typedef struct {
 /// Most of these are *also* in a section somewhere as text, because the gauge
 /// shows the position and the row shows the quantity and a reader acting on the
 /// number needs the second. It is not a rule, and stating it as one was wrong:
-/// @ref framesFused, @ref msSinceFuse, @ref stagesTruncated,
-/// @ref gpuTimingRetired and @ref extractStale exist precisely because the
+/// @ref framesFused, @ref msSinceFuse, @ref stagesTruncated and
+/// @ref extractStale exist precisely because the
 /// panel has to say something no row says -- and where a figure *is* in a
 /// section, the two must not be drawn on the same card twice, which is what put
 /// the same memory fraction on one card as a bar and a sentence.
@@ -426,12 +428,6 @@ typedef struct {
 
 /// The fuse thread's per-textured-remesh keyframe import, which sits inside no
 /// stage row and no other total. Zero when nothing was imported.
-///
-/// The extract's unaccounted remainder is deliberately **not** here beside it.
-/// It looks like the same kind of figure and is not: Fusion publishes it as the
-/// `"  ..other"` stage row, so it is already one of the bars, and a second copy
-/// on the snapshot only ever produced a panel that drew it twice and then said
-/// it was in neither bar. This one really is outside every span there is.
 @property(nonatomic, readonly) double keyframeImportMs;
 /// Fused frames so far, as the panel's own answer to "has anything completed
 /// yet".
@@ -471,10 +467,6 @@ typedef struct {
 /// Whether the libraries reported more stages than the snapshot could hold,
 /// making the bars an under-report rather than a short pipeline.
 @property(nonatomic, readonly) BOOL stagesTruncated;
-/// Whether device timing measured once and has since retired itself, which is a
-/// fault -- as distinct from a queue family that never reported timestamps,
-/// which is a hardware verdict. Both leave every device bar absent.
-@property(nonatomic, readonly) BOOL gpuTimingRetired;
 
 @property(nonatomic, readonly) uint64_t memoryFootprintBytes;
 @property(nonatomic, readonly) uint64_t gpuWorkingSetBytes;
@@ -703,9 +695,8 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// Empty when nothing has fused yet, and empty for the whole run when
 /// `FusionConfig::measure_stages` is off. It is **not** emptied by a frame that
 /// failed: these are the last rows measured, however long ago that was, which
-/// is why the summary carries an age beside them -- along with the two other
-/// facts a row cannot show, that the table was truncated and that device timing
-/// retired mid-run.
+/// is why the summary carries an age beside them -- along with the other fact
+/// a row cannot show, that the table was truncated.
 ///
 /// Allocated per read, which is affordable because the read-out polls at a few
 /// hertz. It would not be at frame rate; a caller sampling faster wants a POD

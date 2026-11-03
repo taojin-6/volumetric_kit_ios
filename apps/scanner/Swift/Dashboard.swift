@@ -3,13 +3,8 @@
 
 /// The live scan dashboard: everything the read-out carries, visible at once.
 ///
-/// SwiftUI rather than an ImGui overlay, and not out of preference. ImGui
-/// renders *inside* the Vulkan pass, so on a device where meshing already costs
-/// over 100 ms the overlay competes with the reconstruction for the same queue
-/// and lands in every GPU capture. SwiftUI composites on the UI layer -- the OS
-/// draws it and the compute pass pays nothing. gfx also ships only the Vulkan
-/// backend by design (the platform half is the consumer's), so ImGui here would
-/// have meant writing a UIKit input backend first.
+/// SwiftUI rather than gfx's ImGui panels: why is in the README's
+/// [Language split](../../../README.md#language-split).
 ///
 /// **Nothing is hidden behind a tap.** An earlier cut moved the timings into a
 /// sheet on the theory that a scanner is a consumer product; it is a tool, and
@@ -52,9 +47,17 @@ import SwiftUI
 struct StageBar: Identifiable {
   let id: String
   let name: String
-  let hostMs: Double
+  /// The host span is these two, end to end: its own work, then the time it
+  /// spent blocked on the device.
+  let busyMs: Double
+  let waitMs: Double
   let deviceMs: Double
-  let hasGPU: Bool
+  /// Whether `deviceMs` is a measurement; `deviceCell` says why when not.
+  let deviceMeasured: Bool
+  /// The device cell from the bridge: a time, `n/t`, `n/a`, or empty for a
+  /// host-only stage.
+  let deviceCell: String
+  var hostMs: Double { busyMs + waitMs }
   /// The libraries mark a breakdown of the row above it by indenting the label.
   var isBreakdown: Bool { name.hasPrefix(" ") }
   var trimmed: String { name.trimmingCharacters(in: .whitespaces) }
@@ -65,14 +68,10 @@ struct FrameSample: Identifiable {
   let id: UInt64
   let hostMs: Double
   let deviceMs: Double
-  /// The meshing cost, which is **not** in either figure above.
-  ///
-  /// `hostMs`/`deviceMs` are `StageMetrics` totals, and the extract does not
-  /// report there -- it reports through `ExtractTimings`. It is also the
-  /// dominant cost of a remesh frame (~132.7 ms against ~20 ms of fuse on this
-  /// device's own measurement) and `remesh_every` defaults to 1, so leaving it
-  /// out made the chart plot roughly an eighth of the frame it claimed to
-  /// show -- and hid the exact spike the ring was built to catch.
+  /// The meshing cost, which is **not** in either figure above: their
+  /// `StageMetrics` totals leave grid's `marching cubes` row out, so the
+  /// extract counts once, here. It is the dominant cost of a remesh frame
+  /// (~132.7 ms against ~20 ms of fuse on this device's own measurement).
   let extractMs: Double
   /// Whether `deviceMs` is a measurement or an absence. `total_gpu_ms` skips
   /// rows without a span, so a queue family that reports no timestamps sums to
@@ -175,11 +174,6 @@ final class DashboardModel: ObservableObject {
 
   @Published var stages: [StageBar] = []
   /// The one cost of a fused frame that no stage bar covers.
-  ///
-  /// One, not two. The extract's unaccounted remainder used to sit beside this
-  /// and did not belong: Fusion publishes it as the `"  ..other"` row, so it is
-  /// already a bar, and listing it here drew it twice and then said it was in
-  /// neither. The keyframe import really is outside every span there is.
   @Published var keyframeImportMs: Double = 0
   /// Fused frames so far. What tells an empty `stages` that no frame has
   /// completed yet from one whose measurement is switched off.
@@ -196,7 +190,6 @@ final class DashboardModel: ObservableObject {
   /// and the panel print side by side.
   @Published var stagesStale = false
   @Published var stagesTruncated = false
-  @Published var gpuTimingRetired = false
 
   @Published var history: [FrameSample] = []
   @Published var groups: [StatGroup] = []
@@ -514,7 +507,8 @@ struct DashboardView: View {
           StageRowView(stage: stage, scale: stageScale)
         }
         HStack(spacing: 10) {
-          LegendSwatch(color: .secondary, text: "host")
+          LegendSwatch(color: StageRowView.busyColor, text: "busy")
+          LegendSwatch(color: StageRowView.waitColor, text: "wait")
           LegendSwatch(color: .accentColor, text: "device")
         }
         .font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
@@ -530,14 +524,6 @@ struct DashboardView: View {
   ///
   /// The keyframe import runs on the fuse thread outside every span there is,
   /// so a reader summing the column gets a frame cost missing it entirely.
-  ///
-  /// It is the only one. `extract residual` was listed here too and was never
-  /// outside anything: Fusion publishes `max(0, extract_ms - extract.total_ms())`
-  /// as the `"  ..other"` stage row, the bridge recomputed the byte-identical
-  /// expression into a second field, and this heading then asserted the
-  /// opposite of the truth over a figure already drawn as a bar six rows up.
-  /// A reader summing the column double-counted it -- and since that term grows
-  /// with `active_blocks`, the over-count grew with the scan.
   @ViewBuilder private var outsideTheBars: some View {
     if model.keyframeImportMs > 0.005 {
       VStack(alignment: .leading, spacing: 3) {
@@ -570,7 +556,7 @@ struct DashboardView: View {
   /// the case that is a fault: frames arriving, none completing.
   @ViewBuilder private var staleness: some View {
     let stale = model.stagesStale
-    if stale || model.stagesTruncated || model.gpuTimingRetired {
+    if stale || model.stagesTruncated {
       VStack(alignment: .leading, spacing: 2) {
         if stale {
           Text(String(format: "measured %.1f s ago", model.msSinceStages / 1000))
@@ -579,11 +565,6 @@ struct DashboardView: View {
         // like a pipeline that happened to have that many stages.
         if model.stagesTruncated {
           Text("more stages than the snapshot holds — rows are missing")
-        }
-        // A fault, and distinct from a device that never reported timestamps at
-        // all. Both leave every device bar absent; only this one is a failure.
-        if model.gpuTimingRetired {
-          Text("device timing retired after a failed fence — host only")
         }
       }
       .font(.footnote)
@@ -602,7 +583,7 @@ struct DashboardView: View {
   /// section this file has not been taught about is still a section the bridge
   /// meant to publish.
   private static let sectionOrder = [
-    "Alerts", "Scene", "Fuse timing", "Extract phases", "Block table", "Dirty",
+    "Alerts", "Scene", "Fuse timing", "Extract timing", "Block table", "Dirty",
     "Memory",
   ]
 
@@ -691,7 +672,7 @@ struct DashboardView: View {
   /// One scale across the rows, so their lengths compare to each other rather
   /// than each filling its own width.
   private var stageScale: Double {
-    max(model.stages.map { max($0.hostMs, $0.deviceMs) }.max() ?? 1, 0.001)
+    max(model.stages.map { max($0.hostMs, $0.deviceMeasured ? $0.deviceMs : 0) }.max() ?? 1, 0.001)
   }
 
   /// The rows a card lists, which is every figure the bridge published for it
@@ -798,6 +779,9 @@ private struct StageRowView: View {
   let stage: StageBar
   let scale: Double
 
+  static let busyColor = Color.secondary
+  static let waitColor = Color.secondary.opacity(0.4)
+
   var body: some View {
     HStack(spacing: 7) {
       Text(stage.trimmed)
@@ -809,23 +793,32 @@ private struct StageRowView: View {
       GeometryReader { geo in
         ZStack(alignment: .leading) {
           Capsule().fill(.quaternary)
-          // Device drawn OVER host, not beside it: the device span happens
-          // inside the host span, so laying them end to end would draw a total
-          // that does not exist.
-          Capsule().fill(.secondary)
+          // The host span as busy then wait, end to end: a stage blocked on
+          // its fence draws the stall as wait, as every other panel does.
+          Capsule().fill(Self.waitColor)
             .frame(width: geo.size.width * min(stage.hostMs / scale, 1))
-          if stage.hasGPU {
+          Capsule().fill(Self.busyColor)
+            .frame(width: geo.size.width * min(stage.busyMs / scale, 1))
+          // Device drawn OVER host, thinner, not beside it: the device span
+          // happens inside the host span, so laying them end to end would draw
+          // a total that does not exist.
+          if stage.deviceMeasured {
             Capsule().fill(Color.accentColor)
-              .frame(width: geo.size.width * min(stage.deviceMs / scale, 1))
+              .frame(width: geo.size.width * min(stage.deviceMs / scale, 1), height: 3)
           }
         }
       }
       .frame(height: 7)
 
-      Text(String(format: "%.1f", stage.hostMs))
+      Text(String(format: "%.1f", stage.busyMs))
         .font(.footnote.monospacedDigit())
         .foregroundStyle(.secondary)
-        .frame(width: 44, alignment: .trailing)
+        .frame(width: 40, alignment: .trailing)
+      // gfx's stage table's device cell: a time, n/t, n/a, or blank.
+      Text(stage.deviceCell)
+        .font(.footnote.monospacedDigit())
+        .foregroundStyle(.tertiary)
+        .frame(width: 34, alignment: .trailing)
     }
   }
 }

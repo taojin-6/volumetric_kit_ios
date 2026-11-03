@@ -103,10 +103,10 @@ struct ReadoutInputs {
 NSArray<VolumetricStageRow*>* stage_rows(const FusionStats& s);
 
 /// @brief The grouped figures the panel draws: Alerts, Scene, Fuse timing,
-///        Extract phases, Block table, Dirty, Memory.
+///        Extract timing, Block table, Dirty, Memory.
 ///
 /// Alerts appears only when something has failed. `Fuse timing` and
-/// `Extract phases` appear only when `FusionConfig::measure_stages` is off:
+/// `Extract timing` appear only when `FusionConfig::measure_stages` is off:
 /// with it on, both arrive as stage rows, and a section carrying them
 /// as well would draw and print every figure twice. See where they are built.
 ///

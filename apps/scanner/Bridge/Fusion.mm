@@ -48,6 +48,13 @@ constexpr const char* kTextureStage = "texture";
 /// stage's own name. Seeded in that position so the sub-row sits directly under
 /// the row it decomposes.
 constexpr const char* kActiveSetStage = "  ..active set";
+/// grid's extract (`MarchingCubes::extract_device`): the whole call, then its
+/// breakdowns, the compaction when the map's last list no longer holds, the
+/// dispatch, and a refit's. The sample totals leave the stage out, because
+/// @ref FusionStats::extract_ms carries the extract as the chart's mesh half.
+constexpr const char* kMarchingCubesStage = "marching cubes";
+constexpr const char* kMarchingCubesBreakdowns[] = {
+    "  ..compact", "  ..dispatch", "  ..refit"};
 
 /// The active blocks stamped changed after tick @p since, and how many blocks
 /// those put back to marching cubes: a cell reads its corners at
@@ -195,11 +202,7 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   // the first frame.
   exchange_.emplace(config.consumer);
   last_fuse_ns_.store(0, std::memory_order_relaxed);
-  // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
-  // one-way latch, so a scan that carried it in would report the *next* scan's
-  // ordinary host-only first frames as a retired timer.
   last_stages_ns_.store(0, std::memory_order_relaxed);
-  gpu_timing_seen_ = false;
   active_blocks_at_frame_ = 0;
   active_blocks_measured_ = false;
   preemptive_grow_failed_at_ = 0;
@@ -405,18 +408,17 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // takes the app with no message and no crash context. Every row a frame can
     // produce exists before the first scope opens, so those destructors find
     // rows rather than push_back onto them; the vector's own geometric growth
-    // (eight slots for these five) leaves headroom besides.
+    // (sixteen slots for these nine) leaves headroom besides.
     stages.seed(kAllocateStage);
     stages.seed(kResizeStage);
     stages.seed(kIntegrateStage);
     stages.seed(kActiveSetStage);
-    // Seeded last of these and still not last in the published table: the
-    // texture pass runs inside `remesh`, *after* the extract, and the extract's
-    // rows are only appended at publish time. So this one is lifted out of
-    // first-seen order and re-appended after them -- see the publish block. The
-    // seed still has to happen here, before any scope opens, for the
-    // noexcept-destructor reason above; it is the *display* position that
-    // cannot be expressed by seeding.
+    // The extract and the texture pass run inside `remesh`, in this order, so
+    // seeding them here puts texture last, where it runs.
+    stages.seed(kMarchingCubesStage);
+    for (const char* breakdown : kMarchingCubesBreakdowns) {
+      stages.seed(breakdown);
+    }
     if (config_.texture) {
       stages.seed(kTextureStage);
     }
@@ -869,8 +871,8 @@ void Fusion::fuse(const CapturedFrame& frame) {
     stats_.growth_declined_for_memory = memory_declined_;
     stats_.growth_declined_to = declined_grow_to_;
     stats_.growth_declined_bytes = declined_grow_bytes_;
-    // How far behind this frame the published extract breakdown now is.
-    // Everything in `stats_.extract` -- the phases, the block count, the arena,
+    // How far behind this frame the published extract figures now are.
+    // Everything in `stats_.extract` -- the block count, the arena,
     // `dispatches` -- is written only by a fully-successful remesh, so without
     // this the read-out reprints an older extract's numbers as though they were
     // this frame's, with nothing on screen saying otherwise.
@@ -924,9 +926,10 @@ void Fusion::fuse(const CapturedFrame& frame) {
   // --- Publish the stage rows -----------------------------------------------
   //
   // After the remesh, not with the block above, and that order is the only one
-  // that can carry a `texture` row at all: `stages` is this function's local,
-  // remesh writes into it, and copying it out beforehand published a window
-  // whose texture row was still the zero this function seeded.
+  // that can carry the extract's and the texture pass's rows at all: `stages`
+  // is this function's local, remesh writes into it, and copying it out
+  // beforehand published a window whose rows were still the zeros this
+  // function seeded.
   //
   // Its own critical section rather than widening that one, because widening it
   // would hold the lock the main thread takes four times per rendered frame
@@ -934,33 +937,21 @@ void Fusion::fuse(const CapturedFrame& frame) {
   //
   // Only when measurement is on. `stage_count` then stays at its zero, which is
   // what the read-out branches on to fall back to `allocate_ms` /
-  // `integrate_ms`
-  // -- so an off switch costs the device column and no timing at all.
+  // `integrate_ms` / `extract_ms` -- so an off switch costs the device column
+  // and the breakdowns, not the timings.
   if (metrics != nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Copied whole rather than picked apart: every field the core adds to a row
     // arrives without a lockstep edit here, and the read-out reads the same
-    // rows the bridge publishes -- one source, not two that can disagree.
+    // rows the bridge publishes -- one source, not two that can disagree. In
+    // seed order, which is the pipeline's: the extract and texture last.
+    //
+    // No row is built here from `stats_.texture_ms`, which also covers the
+    // transient buffer setup and the fence: the same stage drawn twice with two
+    // numbers. The text summary picks one of the two -- see where it builds the
+    // table.
     stats_.stage_count = 0;
     stats_.stages_truncated = false;
-    bool any_gpu = false;
-    // Held back and re-appended after the extract below, because that is where
-    // it belongs in the pipeline and the seed order cannot put it there.
-    //
-    // `fuse` seeds its rows at the top of the frame, before any of them has
-    // run, so that the StageScope destructors find rows rather than push_back
-    // onto them -- see the seed comment for why a growth there would be
-    // std::terminate. Rows then keep first-seen order, which put `texture`
-    // fifth, above an `extract` that is only appended down here. But the
-    // texture pass runs *inside* remesh, after the extract: the published table
-    // was drawing a ~4 ms row above the ~130 ms one that precedes it, on both
-    // the text summary and the dashboard's stage bars.
-    //
-    // That order was right while texture was a no-op printing 0.0 and nobody
-    // could see it. Reordering here rather than at either read-out keeps one
-    // source: the bridge publishes the pipeline end to end, in order, and the
-    // consumers keep drawing what they are handed.
-    const vkc::StageRow* texture_row = nullptr;
     for (const vkc::StageRow& row : stages.rows()) {
       if (stats_.stage_count >= FusionStats::kMaxStages) {
         // Recorded rather than dropped in silence: a full array reads exactly
@@ -969,87 +960,8 @@ void Fusion::fuse(const CapturedFrame& frame) {
         stats_.stages_truncated = true;
         break;
       }
-      any_gpu = any_gpu || row.has_gpu;
-      // By name, not by pointer identity: the row this matches was seeded from
-      // kTextureStage here but recon's own scope is what fills it, and nothing
-      // promises the label it carries back is the same pointer.
-      if (row.name != nullptr && std::strcmp(row.name, kTextureStage) == 0) {
-        texture_row = &row;
-        continue;
-      }
       stats_.stages[stats_.stage_count++] = row;
     }
-    // A device half that was there and is not any more is a *retired* timer,
-    // not a device that never had timestamps -- and only this latch can tell
-    // those apart, because the aftermath looks identical in every row. See
-    // FusionConfig::measure_stages for what retires one and why it is
-    // permanent.
-    gpu_timing_seen_ = gpu_timing_seen_ || any_gpu;
-    stats_.gpu_timing_retired = gpu_timing_seen_ && !any_gpu;
-
-    // Extract, appended so the published stages are the pipeline end to end --
-    // one list the panel can draw, rather than two a reader has to rejoin.
-    //
-    // Here rather than beside `frames_fused`, and that is the whole of why this
-    // publish moved below the remesh: `stats_.extract*` is written by `remesh`,
-    // so appending these in the block above published the *previous* remesh's
-    // phases as this frame's, unmarked. Above, they are fresh by construction.
-    //
-    // They do not report through StageMetrics -- the libraries wired
-    // volume/tsdf/texture and left mesh's GPU column for later -- so these come
-    // from ExtractTimings and carry `has_gpu = false`. That is honest rather
-    // than unfortunate: the rows without a device half are exactly the part of
-    // the pipeline still measured on the host alone, and a reader can see
-    // which.
-    //
-    // The literals outlive any read (StageRow borrows its label), and the
-    // "  .." prefix marks a phase as a breakdown of the extract above it, which
-    // is what keeps totals from counting it twice.
-    const auto push_stage = [this](const char* name, double cpu_ms) {
-      if (stats_.stage_count >= FusionStats::kMaxStages) {
-        stats_.stages_truncated = true;
-        return;
-      }
-      stats_.stages[stats_.stage_count++] =
-          vkc::StageRow{name, cpu_ms, 0.0, false};
-    };
-    push_stage("extract", stats_.extract_ms);
-    push_stage("  ..meshing", stats_.extract.dispatch_ms);
-    push_stage("  ..compact", stats_.extract.compact_ms);
-    push_stage("  ..sizing", stats_.extract.arena_alloc_ms);
-    push_stage("  ..desc", stats_.extract.descriptor_ms);
-    push_stage("  ..readback", stats_.extract.readback_ms);
-    // The residual, published rather than left implicit -- the same six cells
-    // the text summary carries, for the reason it gives: these phases do not
-    // sum to `extract_ms` and never did. grid's spans open after the slot
-    // claim and close before the O(active_blocks) teardown of the neighbour
-    // table, so the gap grows with the scan. That is the one direction in which
-    // an unlabelled remainder is misread as rounding, and on the panel it read
-    // as a breakdown that visibly failed to add up to the row above it.
-    push_stage("  ..other",
-               std::max(0.0, static_cast<double>(stats_.extract_ms) -
-                                 stats_.extract.total_ms()));
-    // ...and texture last, which is when it runs. Copied whole rather than
-    // pushed through `push_stage`: this row is the one place in the table with
-    // a real device half, and push_stage writes `has_gpu = false` because the
-    // extract phases it was written for genuinely have none. Routing it through
-    // there would drop the gpu column on the only stage that has one.
-    if (texture_row != nullptr) {
-      if (stats_.stage_count >= FusionStats::kMaxStages) {
-        stats_.stages_truncated = true;
-      } else {
-        stats_.stages[stats_.stage_count++] = *texture_row;
-      }
-    }
-    // No *new* `texture` row is pushed here -- the one above is recon's own,
-    // moved. `fuse` seeds it at the top of the frame and the texture tier
-    // reports into it through `metrics`, with a device half this host-only span
-    // does not have. Building a second from `stats_.texture_ms` is how the same
-    // stage ends up drawn twice with two different numbers, since that span
-    // also covers the transient buffer setup and the fence: the row would be
-    // the dispatch and the line beneath it the whole call, and nobody reading a
-    // column of milliseconds can tell those apart. The text summary picks one
-    // of the two rather than printing both -- see where it builds the table.
 
     // Stamped here and only here. The rows publish on this path alone, so this
     // is what the four early returns above leave standing still -- see
@@ -1093,24 +1005,25 @@ void Fusion::fuse(const CapturedFrame& frame) {
     // that distinction, so take it from them rather than re-deriving it here
     // and getting it differently.
     //
-    // Both cover allocate, resize, integrate and texture. They do *not* cover
-    // the extract, which reports through `ExtractTimings` and not the row set,
-    // so it is carried alongside as its own figure rather than left out of the
-    // history altogether -- see `sample.extract_ms` below.
-    sample.host_ms = static_cast<float>(stages.total_cpu_ms());
-    sample.device_ms = static_cast<float>(stages.total_gpu_ms());
+    // Both cover allocate, resize, integrate and texture: the fuse half. They
+    // leave grid's `marching cubes` row out, so the extract counts once, as
+    // `sample.extract_ms` below -- the mesh half, timed whatever the switch.
+    sample.host_ms =
+        static_cast<float>(stages.total_cpu_ms(kMarchingCubesStage));
+    sample.device_ms =
+        static_cast<float>(stages.total_gpu_ms(kMarchingCubesStage));
     // Whether that device figure is a measurement or an absence. `total_gpu_ms`
-    // skips every row without a span, so a queue family that reports no
+    // skips every row not measured, so a queue family that reports no
     // timestamps sums to the same 0.0 as a frame that dispatched nothing, and
-    // only this flag separates them. Same rule the read-out follows when it
-    // prints `gpu -` instead of `0.00`.
+    // only this flag separates them -- over the rows that total counts.
     for (const vkc::StageRow& row : stages.rows()) {
-      if (row.has_gpu) {
+      if (row.device == vkc::DeviceTime::Measured &&
+          std::strcmp(row.name, kMarchingCubesStage) != 0) {
         sample.device_timing_valid = true;
         break;
       }
     }
-    // The extract, which neither total above can see. This is the figure the
+    // The extract, which neither total above counts. This is the figure the
     // ring was built for: at `remesh_every` 1 it lands on every frame, and it
     // is an order of magnitude larger than the fuse it sits beside.
     //
@@ -1249,9 +1162,11 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   }
 
   const auto t_extract = Clock::now();
+  // Its counters (active blocks, arena, passes) feed `stats_.extract`; its
+  // times are grid's stage rows in `metrics`, seeded by `fuse`.
   vgrid::mesh::ExtractTimings extract_timings{};
   vkc::Result<vgrid::mesh::DeviceMesh> device_mesh =
-      marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings);
+      marching_cubes_->extract_device(*grid_, 0.0f, &extract_timings, metrics);
   if (!device_mesh) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.errors;
@@ -1360,9 +1275,8 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   stats_.vertices = device_mesh.value().vertex_count;
   stats_.triangles = device_mesh.value().triangle_count;
   stats_.extract_ms = extract_ms;
-  // grid's struct, whole -- not a field-by-field transcription. `extract_ms`
-  // above is this call measured from here; this is what it decomposes into.
-  // See FusionStats::extract for why the copy is one assignment.
+  // grid's struct, whole -- not a field-by-field transcription. See
+  // FusionStats::extract for why the copy is one assignment.
   stats_.extract = extract_timings;
   // Stamped beside the block count it is the denominator for. Occupancy is
   // `extract.active_blocks` over this, and a ratio whose two halves are

@@ -261,6 +261,14 @@ Obj-C++/C++ bridge, and the Swift app linking it through a bridging header.
 Mixing Swift and C++ in a *single* target under the Xcode generator is the
 fragile configuration.
 
+The scanner's dashboard is SwiftUI, not gfx's ImGui panels. gfx's panels earn
+their place where one C++ panel serves several shells, as the player's does on
+the desktop and iOS. The scanner is iOS only, and its figures are its own, so
+nothing is copied. Its panel uses what gfx lacks and should not grow for one
+caller: Swift Charts' stacked bars, an adaptive card grid and threshold meters
+with a peak tick. And text entry, such as a server address, has no keyboard
+in ImGuiTouch. Revisit if a second shell of the scanner appears.
+
 ## Apps
 
 ### `scanner`

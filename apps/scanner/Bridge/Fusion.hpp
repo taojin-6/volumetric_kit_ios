@@ -171,23 +171,19 @@ struct FusionConfig {
   /// timestamps and reads them back per command buffer. On a fused frame that
   /// is the allocate (once per grow retry, so up to `kMaxGrowAttempts + 1`
   /// times), the fusion dispatch, and the active-set compaction -- every frame,
-  /// at capture rate.
+  /// at capture rate -- and each remesh's extract and texture pass.
   ///
   /// On, because the numbers are the point: a host span around a fence-blocked
   /// submit cannot separate a slow kernel from a stalled queue, and that
-  /// distinction has been guesswork on this device. The readback rides an
-  /// already-blocking wait rather than adding a second stall. Off costs only
-  /// the device column -- @ref FusionStats::allocate_ms and @ref
-  /// FusionStats::integrate_ms are measured either way and the read-out falls
-  /// back to them.
-  ///
-  /// @warning Device timing can retire itself mid-run, and does not come back.
-  ///          grid's and recon's tiers hold long-lived `GpuTimer`s; a failed
-  ///          `vkWaitForFences` leaks the command buffer carrying that window's
-  ///          queries, so the timer calls `abandon()` and every row is
-  ///          host-only from then on. Nothing here can reset it, and without
-  ///          @ref FusionStats::gpu_timing_retired that state is
-  ///          indistinguishable from a device that never had timestamps at all.
+  /// distinction has been guesswork on this device. Each row says it: its
+  /// host span splits into busy and the fence wait, and its device half is a
+  /// time, or why there is none (`core::DeviceTime`: a batch that failed or ran
+  /// out of queries reads NotTimed for that frame, and the timer times on).
+  /// The readback rides an already-blocking wait rather than adding a second
+  /// stall. Off costs the device column and the breakdowns --
+  /// @ref FusionStats::allocate_ms, @ref FusionStats::integrate_ms and
+  /// @ref FusionStats::extract_ms are measured either way and the read-out
+  /// falls back to them.
   bool measure_stages = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
@@ -420,31 +416,28 @@ struct FrameSample {
   ///          overlaid, or draw the host figure alone; a "host vs device"
   ///          split built by subtraction reads a device stall as host time.
   float host_ms = 0.0f;
-  /// Summed device milliseconds, breakdown rows excluded too: since the core's
-  /// 0.20.0 a stage's device time covers every command recorded inside it, its
-  /// breakdowns' included.
+  /// Summed device milliseconds, over the rows @ref host_ms sums: since the
+  /// core's 0.20.0 a stage's device time covers every command recorded inside
+  /// it, its breakdowns' included.
   ///
   /// Meaningful only where @ref device_timing_valid is set. A row carrying no
   /// GPU span contributes nothing, so a queue family that reports no timestamps
   /// and a frame whose device did no work are both a flat zero here.
   float device_ms = 0.0f;
-  /// Whether any stage this frame carried a real device measurement.
+  /// Whether any stage @ref device_ms sums carried a device measurement.
   ///
-  /// The distinction @ref device_ms cannot make on its own, and the one the
-  /// read-out already makes in text by printing `gpu -` rather than `0.00`. A
-  /// chart that omits this draws a zero device line on a device that was never
-  /// able to measure one, which reads as "all the time is host".
+  /// The distinction @ref device_ms cannot make on its own. A chart that omits
+  /// this draws a zero device line on a device that was never able to measure
+  /// one, which reads as "all the time is host".
   bool device_timing_valid = false;
-  /// Milliseconds the extract took, when one ran on this frame.
+  /// Milliseconds the extract took, when one ran on this frame: the mesh half.
   ///
-  /// Carried separately because it is **not** in @ref host_ms or
-  /// @ref device_ms: `MarchingCubes::extract_device` reports through
-  /// `vgrid::mesh::ExtractTimings` rather than the stage row set, so neither
-  /// total can see it. It is also the largest cost in a remesh frame -- 132.7
-  /// ms against ~20 ms of fuse on this device's own measurement -- and with
-  /// @ref FusionConfig::remesh_every at its default of 1 it is on every frame.
-  /// A history without it is a history that cannot show the spike this type was
-  /// built for.
+  /// **Not** in @ref host_ms or @ref device_ms, which leave grid's
+  /// `marching cubes` row out, so the extract counts once, here -- timed by the
+  /// bridge whatever @ref FusionConfig::measure_stages says. It is also the
+  /// largest cost in a remesh frame -- 132.7 ms against ~20 ms of fuse on this
+  /// device's own measurement -- and with @ref FusionConfig::remesh_every at
+  /// its default of 1 it is on every frame.
   ///
   /// Zero when this frame ran no extract, or when one ran and failed. Use
   /// @ref frames_since_extract to tell those from a genuinely fast one.
@@ -538,11 +531,8 @@ struct FusionStats {
   /// @brief Upper bound on @ref stages; rows past it are recorded as dropped in
   ///        @ref stages_truncated, not grown into.
   ///
-  /// Sixteen because the published set is the WHOLE pipeline, not just what
-  /// reports through StageMetrics: allocate, resize and integrate and their
-  /// breakdowns come from the tiers, and extract plus its phases are appended
-  /// from @ref extract so the end-to-end sequence is one list rather than two a
-  /// reader has to rejoin.
+  /// Sixteen for the whole pipeline's nine rows (see @ref stages) and the
+  /// breakdowns a tier may add.
   static constexpr std::size_t kMaxStages = 16;
 
   /// @brief The per-stage host/device rows the libraries reported for the last
@@ -558,19 +548,12 @@ struct FusionStats {
   /// inside that critical section -- the reason @ref FusionTraceStats exists at
   /// all.
   ///
-  /// Five rows on a healthy frame come from the tiers -- `allocate`, `resize`,
-  /// `integrate`, its `"  ..active set"` breakdown, and `texture` when @ref
-  /// FusionConfig::texture is on. **The extract is appended to them rather than
-  /// reported through them:** `MarchingCubes::extract_device` reports through
-  /// `mesh::ExtractTimings`, a richer per-phase struct this app holds whole in
-  /// @ref extract, and the appended rows are that struct flattened so a reader
-  /// sees one pipeline instead of rejoining two lists. Those rows carry
-  /// `has_gpu = false` -- honestly, not unfortunately: they are exactly the
-  /// part of the pipeline still measured on the host alone.
-  ///
-  /// They are appended **after the remesh**, which is why the publish sits
-  /// below it: @ref extract is written by `remesh`, so appending them beside
-  /// @ref frames_fused published the previous remesh's phases as this frame's.
+  /// Every row comes from a tier, in the order they run: `allocate`, `resize`,
+  /// `integrate` and its `"  ..active set"` breakdown, grid's `marching cubes`
+  /// and its `"  ..compact"`, `"  ..dispatch"` and `"  ..refit"`, then
+  /// `texture` when @ref FusionConfig::texture is on. The extract's and the
+  /// texture pass's rows read 0 on a frame that did not remesh. Published
+  /// **after the remesh**, which writes them.
   ///
   /// @warning `StageRow::name` is borrowed, not copied. Every row here comes
   ///          from a grid or recon tier reporting with a string literal, or
@@ -601,43 +584,14 @@ struct FusionStats {
   /// Zero when no frame has ever published rows, where "0 ms ago" would read as
   /// current. Check @ref stage_count first.
   float ms_since_stages = 0.0f;
-  /// Whether device timing was measured once and has since retired itself.
+  /// @brief The last successful extract's own counts, held whole.
   ///
-  /// grid's and recon's tiers hold long-lived `GpuTimer`s that `abandon()` on a
-  /// failed fence wait, permanently and process-wide. Without this the
-  /// aftermath -- every row host-only, every device cell a dash -- is
-  /// indistinguishable from a queue family that never reported timestamps,
-  /// which is a hardware verdict rather than a fault. See @ref
-  /// FusionConfig::measure_stages.
-  bool gpu_timing_retired = false;
-  /// @brief The last successful extract's own timings and counts, held whole.
-  ///
-  /// grid's struct by value rather than a hand-picked copy of its fields.
-  /// Eleven of its twelve were mirrored into scalars here, which meant every
-  /// field upstream added or renamed wanted three lockstep edits in this app --
-  /// declaration, copy, read-out -- with no compile error when one was missed;
-  /// and because all seven spans are the same type, any permutation slip in the
-  /// copy block compiled clean and surfaced only as a suspicious device
-  /// read-out. That is the same class of gap this diff exists to close, one
-  /// struct over. recon's own `fuse_viewer` holds it whole for the same reason.
-  /// Costs nothing new: marching_cubes.hpp is already included above, and
-  /// @ref Fusion::meshes already exposes a `vgrid::mesh::DeviceMesh` publicly.
-  ///
-  /// Where @ref extract_ms goes. The phases are worth the read-out space
-  /// because they have *nothing* in common as optimisation targets and the
-  /// total cannot tell them apart: `neighbour_lut_ms` is serial host work over
-  /// the whole active set (the 2x2x2 table the sparse kernel indexes instead of
-  /// probing the hash) and wants incremental extraction; `dispatch_ms` is the
-  /// meshing pass and wants fewer cells. On an M5 iPad Pro at ~107k blocks this
-  /// app measured extract at 132.7 ms, of which the lut was 102.2 and the
-  /// dispatch 25.9.
-  ///
-  /// @warning `dispatch_ms` is **not** GPU time. grid submits through
-  ///          `Device::submit_single_time`, which blocks on a fence, and
-  ///          `ExtractTimings` documents the span as covering host record
-  ///          *plus* device execution rather than either alone. Sizing a
-  ///          triangle-reduction win against it overstates the ceiling by
-  ///          however much of it is recording, submit and stall.
+  /// grid's struct by value rather than a hand-picked copy of its fields, so a
+  /// field upstream adds or renames needs no lockstep edit here. The read-out
+  /// takes its counts -- active blocks, the arena, the passes -- and none of
+  /// its host spans: the extract's times are grid's stage rows in
+  /// @ref stages, `marching cubes` and its breakdowns, with a wait and a
+  /// device half each.
   ///
   /// @note `arena_bytes` is grid's sum across the whole ring, while
   ///       `triangle_capacity` is what this extract planned for the one slot it
@@ -1071,10 +1025,9 @@ class Fusion {
   ///        on.
   /// @param metrics  @ref fuse's reporting window, or null when @ref
   ///                 FusionConfig::measure_stages is off. Threaded through
-  ///                 rather than opened here because the `texture` row belongs
-  ///                 beside the fuse's own: one window per frame is what makes
-  ///                 the rows comparable. The extract is *not* measured into it
-  ///                 -- it reports through `mesh::ExtractTimings`; see @ref
+  ///                 rather than opened here because the extract's and the
+  ///                 `texture` rows belong beside the fuse's own: one window
+  ///                 per frame is what makes the rows comparable. See @ref
   ///                 FusionStats::stages.
   void remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics);
 
@@ -1161,14 +1114,6 @@ class Fusion {
   // thread turns it while the fuse thread reads it once per remesh; see
   // set_occlusion_threshold for why it is not under mutex_.
   std::atomic<float> occlusion_threshold_{0.02f};
-  // Whether any published row has ever carried a device span.
-  //
-  // A one-way latch, and it has to be: what it detects is a GpuTimer that
-  // retired mid-run (FusionConfig::measure_stages), which is permanent and
-  // leaves no other trace. Rows arriving host-only *before* this is set are an
-  // ordinary device without timestamp support, so the latch is exactly the term
-  // that tells those two apart.
-  bool gpu_timing_seen_ = false;
   // `stats_.frames_fused` when the current survey window opened -- the last
   // survey -- and the map's tick then, which the next survey counts the blocks
   // stamped changed after. The published window length is measured from this

@@ -769,8 +769,9 @@ final class ScannerViewController: UIViewController {
     dashboard.memoryValid = snapshot.memoryValid
     dashboard.stages = snapshot.stages.map {
       StageBar(
-        id: $0.name, name: $0.name, hostMs: $0.cpuMs,
-        deviceMs: $0.gpuMs, hasGPU: $0.hasGpu)
+        id: $0.name, name: $0.name, busyMs: $0.busyMs, waitMs: $0.waitMs,
+        deviceMs: $0.gpuMs, deviceMeasured: $0.device == .measured,
+        deviceCell: $0.deviceCell)
     }
     // What the bars do not cover, and how far they can be trusted. The age is
     // two figures because it is a comparison: `msSinceStages` alone cannot tell
@@ -781,11 +782,10 @@ final class ScannerViewController: UIViewController {
     dashboard.msSinceFuse = snapshot.msSinceFuse
     dashboard.stagesStale = snapshot.stagesStale
     dashboard.stagesTruncated = snapshot.stagesTruncated
-    dashboard.gpuTimingRetired = snapshot.gpuTimingRetired
     dashboard.history = snapshot.history.map {
       FrameSample(
         id: $0.frame, hostMs: $0.hostMs, deviceMs: $0.deviceMs,
-        // The meshing cost, which neither total above covers. Dropping it made
+        // The meshing cost, which neither total above counts. Dropping it made
         // the chart plot the fuse alone and miss every remesh spike -- the one
         // thing the ring was built to show.
         extractMs: $0.extractMs, deviceTimingValid: $0.deviceTimingValid)
