@@ -20,6 +20,10 @@ final class ScannerViewController: UIViewController {
   /// cadence -- the *history* it charts is sampled per fused frame on the
   /// fusion thread, which is a different rate on purpose (see DashboardModel).
   private let dashboard = DashboardModel()
+  /// The live link the dashboard's entry drives. It describes the capture's
+  /// depth camera at its first connect, and lives as long as this controller,
+  /// so a reconnect is the same session.
+  private lazy var link = LinkModel(capture: arSession.capture)
   private var dashboardHost: UIHostingController<DashboardView>?
   /// When the view appeared, for the dashboard's elapsed clock. Wall clock
   /// rather than a fused-frame count: it is how long the person has been
@@ -131,7 +135,8 @@ final class ScannerViewController: UIViewController {
     // it -- so the reconstruction gets the lower 45% and, collapsed, all but
     // the headline.
     let host = UIHostingController(
-      rootView: DashboardView(model: dashboard) { [weak self] expanded in
+      rootView: DashboardView(model: dashboard, link: link) {
+        [weak self] expanded in
         // The height constraint follows the toggle. Collapsed, the body is a
         // plain VStack and sizes itself; expanded, it contains a ScrollView,
         // which has no intrinsic height and would otherwise keep whatever it

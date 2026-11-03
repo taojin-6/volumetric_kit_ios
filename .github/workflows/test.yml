@@ -13,9 +13,9 @@ name: test
 #
 # It configures with -DVI_HOST_TESTS=ON, which builds vi_core, vi_session and
 # the tests, and of the siblings only the tiers they link: the core, sensor's
-# interface and wire form, grid's .vrst container. No recon, gfx, MoltenVK
-# release or Xcode project. That is why this leg is minutes rather than the
-# build leg's tens.
+# interface and wire form, grid's .vrst container and server. No recon, gfx,
+# MoltenVK release or Xcode project. That is why this leg is minutes rather
+# than the build leg's tens. The link's tests dial 127.0.0.1 only.
 #
 # Invoked by ci.yml, which owns the triggers and the concurrency group.
 on:

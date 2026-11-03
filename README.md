@@ -54,9 +54,9 @@ parenthesised code) or in Xcode → Settings → Accounts.
 
 | Sibling | What the apps take from it |
 | --- | --- |
-| `volumetric_kit_core` | the shared device, `Status`, the scenario parser |
+| `volumetric_kit_core` | the shared device, `Status`, the scenario parser, and the address checks and dial the live link uses (`core_net`) |
 | `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), the `PixelBufferImporter` the keyframes use (`sensor_apple`), the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`), and the frames' wire form the session writer writes (`sensor_wire`) |
-| `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`), and the `.vrst` container (`grid_stream`) |
+| `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`), the `.vrst` container (`grid_stream`), and the server that serves it live (`grid_networking`) |
 | `volumetric_kit_recon` | TSDF fusion and the projective texturer (`recon_tsdf`, `recon_texture`) |
 | `volumetric_kit_gfx` | the renderer |
 
@@ -105,16 +105,24 @@ No toolchain file, no MoltenVK release, no recon or gfx, no Xcode project —
 that mode short-circuits before any of them. It fetches the core, sensor, grid
 and the test framework, and builds only the tiers the tests link: the core's,
 sensor's interface and wire form (`sensor_wire`), grid's `.vrst` container
-(`grid_stream`). Sensor's interface reaches the Vulkan headers through its
-frame tier, so the mode takes the Vulkan SDK and glm from Homebrew; nothing in
-it opens a device. CI runs it on the family's self-hosted Mac (label `mac`).
+and its server (`grid_stream`, `grid_networking`). Sensor's interface reaches
+the Vulkan headers through its frame tier, so the mode takes the Vulkan SDK and
+glm from Homebrew; nothing in it opens a device. CI runs it on the family's
+self-hosted Mac (label `mac`).
 
 `apps/scanner/Session/` is `vi_session`: `RgbdStreamWriter` writes any
 `IRgbdSensor`'s frames as one `.vrst` session, each frame its colour record
 (the caller's coded picture) then its depth record (sensor's wire form), with
-no decode and no device. Its tests write a fake sensor's frames and read them
-back with grid's reader. The pose and rate rules it is fed through are
-`vi_core`'s: `MapSteps` takes ARKit's map steps out of every pose and logs
+no decode and no device, to a file, to a live reader, or both. Live, it dials
+and listens on nothing: grid's `StreamServer` serves with no listener, and a
+thread of the writer's dials the reader (`core::net::dial`) and hands it the
+socket, dialling again each second while no reader is served. A joining
+reader asks for a key (`key_wanted`); `dial_to` moves the link, or ends it,
+within the one session. `parse_dial_entry` reads the on-screen entry with the
+core's checks. Its tests write a fake sensor's frames, read the file back with
+grid's reader, and read the link on 127.0.0.1 through grid's `StreamClient` on
+a core `Listener`, as the lab does. The pose and rate rules it is fed through
+are `vi_core`'s: `MapSteps` takes ARKit's map steps out of every pose and logs
 them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
 
 It exists because **everything else here is build-only by nature**: MoltenVK
@@ -294,6 +302,21 @@ compute path; this proves the render path.
 Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the native
 2420×1668, triangle on screen.
 
+#### The live link
+
+The dashboard's first card, on iPad and iPhone, names the reader the scanner
+dials: an IPv4 address (or `address:port`) and a port, empty for 47801, both
+remembered between launches. Connect dials it, Disconnect lets it go, and the
+line beneath says what the link does: dialling, connected, retrying with the
+failed count, or, on "No route to host", allow Local Network access. iOS
+answers a connect to the local network so until the person allows it, and
+keeps its prompt up only while the app keeps trying, which the link does each
+second. A refused entry shows the core's reason under the fields. The session
+opens at the first connect and lasts while the app runs, so a reconnect, to
+the same reader or another, is the same session. This build sends the session
+alone: it describes ARKit's depth camera as the capture last converted it, and
+no frames go out until the scanner reads ARKit through sensor's `IRgbdSensor`.
+
 #### The shared device
 
 One `VkDevice` serves every library, built by volumetric_kit_core's
@@ -371,6 +394,9 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
   by sensor's `PixelBufferImporter`, so the ring holds up to three of ARKit's
   pixel buffers beyond the frames being captured and fused. Fusion still
   converts each frame's colour on the CPU.
+- **Local Network access.** The live link's first connect to a local address
+  raises iOS's Local Network prompt (`NSLocalNetworkUsageDescription`); until
+  it is allowed, every connect fails with "No route to host".
 - **Shaders are compiled on the host** by `glslc` and embedded into the binary
   as constexpr byte arrays, so there is no runtime shader file and nothing to
   resolve in the app bundle.

@@ -21,17 +21,15 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <vector>
 
 #include <sys/resource.h>
-#include <unistd.h>
 
 #include "MapSteps.hpp"
 #include "RateGate.hpp"
 #include "fake_rgbd_sensor.hpp"
+#include "session_test_support.hpp"
 #include "volumetric_kit/grid/stream/session.hpp"
-#include "volumetric_kit/grid/stream/stream_reader.hpp"
 #include "volumetric_kit/sensor/testing/rgbd_contract.hpp"
 #include "volumetric_kit/sensor/wire/rgbd_wire.hpp"
 
@@ -46,106 +44,17 @@ namespace vkc = volumetric_kit::core;
 namespace wire = volumetric_kit::sensor::wire;
 
 using ios_test::FakeRgbdSensor;
+using ios_test::open_or_fail;
+using ios_test::options_for;
+using ios_test::Picture;
+using ios_test::picture;
+using ios_test::read_file;
+using ios_test::ReadFile;
+using ios_test::ReadRecord;
+using ios_test::TempFile;
 
 constexpr std::uint64_t kArkitNs = 16'669'375;  // 60 Hz, as ARKit's
 constexpr std::uint64_t kFemtoNs = 33'333'333;  // 30 Hz
-
-// A file of its own for each test, removed after it.
-class TempFile {
- public:
-  explicit TempFile(const std::string& name)
-      : path_((fs::temp_directory_path() /
-               ("vi_session_" + std::to_string(::getpid()) + "_" + name +
-                ".vrst"))
-                  .string()) {
-    std::error_code ec;
-    fs::remove(path_, ec);
-  }
-  ~TempFile() {
-    std::error_code ec;
-    fs::remove(path_, ec);
-  }
-  const std::string& path() const { return path_; }
-  std::uintmax_t size() const { return fs::file_size(path_); }
-
- private:
-  std::string path_;
-};
-
-app::RgbdStreamOptions options_for(const std::string& path) {
-  app::RgbdStreamOptions o;
-  o.path = path;
-  o.fps = 10;
-  o.session_id = {0x5e, 0x55, 0x10, 0x4e, 1, 2,  3,  4,
-                  5,    6,    7,    8,    9, 10, 11, 12};
-  o.created_ns = 1'793'492'974'605'774'900;
-  o.writer = "scanner-test";
-  return o;
-}
-
-// The colour the coded pictures state: the iPad's, BT.709 full range.
-sensor::ColorCodes ipad_codes() {
-  sensor::ColorCodes codes;
-  codes.matrix = 1;
-  codes.transfer = 1;
-  codes.primaries = 1;
-  codes.full_range = true;
-  codes.chroma_location = 0;
-  return codes;
-}
-
-// A coded picture for frame @p i: bytes that say which frame they are.
-struct Picture {
-  std::vector<std::uint8_t> bytes;
-  app::CodedColor color;
-};
-Picture picture(std::uint32_t i, bool key) {
-  Picture p;
-  p.bytes = {0, 0, 0, 1, static_cast<std::uint8_t>(key ? 0x26 : 0x02), 1};
-  for (int b = 0; b < 4; ++b) p.bytes.push_back((i >> (8 * b)) & 0xff);
-  p.bytes.resize(p.bytes.size() + 3 * (i % 5));  // pictures differ in size
-  p.color = {p.bytes.data(), p.bytes.size(), key, ipad_codes()};
-  return p;
-}
-
-struct ReadRecord {
-  stream::RecordInfo info;
-  std::vector<std::uint8_t> payload;
-};
-
-// Every record of the file at @p path, in file order, and its session.
-struct ReadFile {
-  stream::Session session;
-  bool finished = false;
-  std::vector<ReadRecord> records;
-};
-ReadFile read_file(const std::string& path) {
-  ReadFile out;
-  auto reader = stream::StreamReader::open(path);
-  EXPECT_TRUE(reader.ok()) << reader.status().message();
-  if (!reader.ok()) return out;
-  out.session = reader.value()->session();
-  out.finished = reader.value()->recovery().finished;
-  stream::Position pos = reader.value()->begin();
-  stream::Record record;
-  for (;;) {
-    const vkc::Result<bool> more = reader.value()->next(&pos, &record);
-    EXPECT_TRUE(more.ok()) << more.status().message();
-    if (!more.ok() || !more.value()) break;
-    ReadRecord r;
-    r.info = record.info;
-    EXPECT_TRUE(reader.value()->read(record, &r.payload).ok());
-    out.records.push_back(std::move(r));
-  }
-  return out;
-}
-
-std::unique_ptr<app::RgbdStreamWriter> open_or_fail(
-    const app::RgbdStreamOptions& options, const sensor::SensorInfo& info) {
-  auto writer = app::RgbdStreamWriter::open(options, info);
-  EXPECT_TRUE(writer.ok()) << writer.status().message();
-  return writer.ok() ? std::move(writer).value() : nullptr;
-}
 
 // --- The session -------------------------------------------------------------
 
@@ -507,7 +416,7 @@ TEST(RgbdStreamWriter, OpenRefusesWhatItCannotWrite) {
   const sensor::SensorInfo info = ios_test::arkit_like();
   app::RgbdStreamOptions options = options_for(file.path());
 
-  // An empty path writes no file: there is nothing to write to.
+  // No path and no dial host: there is nothing to write to.
   app::RgbdStreamOptions no_path = options;
   no_path.path.clear();
   EXPECT_EQ(app::RgbdStreamWriter::open(no_path, info).status().domain(),

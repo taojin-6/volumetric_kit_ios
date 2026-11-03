@@ -44,7 +44,8 @@ function(vi_add_scanner_bridge bridge_target)
     Bridge/MemoryQuery.cpp
     Bridge/Readout.mm
     Bridge/RendererErrors.mm
-    Bridge/ScannerSelfTest.mm)
+    Bridge/ScannerSelfTest.mm
+    Bridge/VolumetricLink.mm)
 
   # ARC, selected by language rather than by a second copy of the source list.
   #
@@ -148,6 +149,9 @@ function(vi_add_scanner_bridge bridge_target)
             # rules, on the device's VideoToolbox.
             volumetric_kit::sensor_video
             volumetric_kit::sensor_video_testing
+            # The live link (Bridge/VolumetricLink.mm): the session writer,
+            # which dials the reader the on-screen entry names.
+            vi_session
             vi_scanner_shaders)
 endfunction()
 
@@ -160,6 +164,7 @@ add_executable(
   Swift/ARSessionController.swift
   Swift/CameraGestureController.swift
   Swift/Dashboard.swift
+  Swift/LinkPanel.swift
   Swift/MetalView.swift
   Swift/ScannerViewController.swift
   Swift/SceneDelegate.swift

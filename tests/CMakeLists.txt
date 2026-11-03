@@ -35,6 +35,7 @@ add_executable(
   freshness_test.cpp
   growth_policy_test.cpp
   keyframe_binding_test.cpp
+  link_state_test.cpp
   map_steps_test.cpp
   memory_budget_test.cpp
   orbit_camera_test.cpp
@@ -53,11 +54,19 @@ gtest_discover_tests(vi_core_tests)
 
 # vi_session's writer, on a fake sensor's frames, read back through grid's
 # reader and sensor's wire form; with vi_core's map-step rule and rate gate in
-# the iPad's order.
-add_executable(vi_session_tests rgbd_stream_writer_test.cpp)
+# the iPad's order. Its live link on 127.0.0.1, read through grid's client on
+# the core's listener, as the lab reads it; and the on-screen entry.
+add_executable(vi_session_tests dial_entry_test.cpp rgbd_stream_link_test.cpp
+                                rgbd_stream_writer_test.cpp)
 target_link_libraries(
-  vi_session_tests PRIVATE vi_session vi_core volumetric_kit::sensor_wire
-                           volumetric_kit::grid_stream GTest::gtest_main)
+  vi_session_tests
+  PRIVATE vi_session
+          vi_core
+          volumetric_kit::sensor_wire
+          volumetric_kit::grid_stream
+          volumetric_kit::grid_networking
+          volumetric_kit::core_net
+          GTest::gtest_main)
 gtest_discover_tests(vi_session_tests)
 
 add_executable(vi_config_tests scanner_config_test.cpp)

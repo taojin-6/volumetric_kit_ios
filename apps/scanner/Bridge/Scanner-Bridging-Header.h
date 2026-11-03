@@ -7,4 +7,5 @@
 
 #import "ARKitCapture.h"
 #import "ScannerSelfTest.h"
+#import "VolumetricLink.h"
 #import "VolumetricRenderer.h"
