@@ -21,17 +21,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # The app targets are iOS-only. `vi_core` is not, and that is the whole point of
-# it: it is the scanner's pure logic. Together with the shared configuration
-# parser it can be tested on the host. The renderer is device-only -- MoltenVK
-# ships no simulator slice and ARKit scene depth needs LiDAR -- so without this
-# mode CI can assert that the app compiles and nothing more.
+# it: it is the scanner's pure logic. Together with the session writer
+# (`vi_session`) and the shared configuration parser it can be tested on the
+# host. The renderer is device-only -- MoltenVK ships no simulator slice and
+# ARKit scene depth needs LiDAR -- so without this mode CI can assert that the
+# app compiles and nothing more.
 #
 # Opt-in rather than inferred from the absence of the toolchain file, because
 # the FATAL_ERROR below is load-bearing: configuring without the toolchain is
 # the ordinary mistake, and it used to fail here with one actionable line
 # instead of somewhere deep in recon. Making a bare `cmake -S . -B build`
 # silently succeed at building a fraction of the repo would trade that away.
-option(VI_HOST_TESTS "Build vi_core and its tests for the host (not iOS)" OFF)
+option(VI_HOST_TESTS
+       "Build vi_core, vi_session and their tests for the host (not iOS)" OFF)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
   set(VI_IOS TRUE)
@@ -45,7 +47,7 @@ if(NOT VI_IOS AND NOT VI_HOST_TESTS)
       "This project targets iOS only. Configure with:\n"
       "  cmake -S . -B build-ios -G Xcode "
       "-DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake\n"
-      "To build and run the host tests for vi_core instead:\n"
+      "To build and run the host tests for vi_core and vi_session instead:\n"
       "  cmake -S . -B build-host -DVI_HOST_TESTS=ON")
 endif()
 
@@ -62,9 +64,9 @@ endif()
 # Objective-C++ stays the bridge because an .mm is the only translation unit
 # where an ARFrame and a C++ move-only type are both first-class.
 #
-# Enabled here rather than in project() so the host build needs neither: vi_core
-# is plain C++, and requiring a Swift-capable generator to run its tests would
-# be a dependency on a language none of them touch.
+# Enabled here rather than in project() so the host build needs no Swift:
+# vi_core and vi_session are plain C++, and requiring a Swift-capable generator
+# to run their tests would be a dependency on a language none of them touch.
 if(VI_IOS)
   enable_language(OBJCXX)
   enable_language(Swift)
@@ -100,14 +102,15 @@ set(VI_BUNDLE_PREFIX
 include(FetchContent)
 
 # The common scenario parser is CPU-only; host tests exercise the exact file
-# bundled into the scanner. Only iOS builds enable the Vulkan tier, and with it
-# the core's iOS module (its cmake/vkc_ios.cmake), which links MoltenVK's static
-# library from MoltenVK_ROOT and answers every find_package(glm) -- the
-# siblings' and this file's -- with the host's glm headers as a header-only
-# target.
+# bundled into the scanner. The Vulkan tier is on in both modes, as sensor's
+# interface reaches the Vulkan headers through its frame tier: a host build
+# takes the Vulkan SDK from Homebrew, an iOS one the core's iOS module (its
+# cmake/vkc_ios.cmake), which links MoltenVK's static library from MoltenVK_ROOT
+# and answers every find_package(glm) -- the siblings' and this file's -- with
+# the host's glm headers as a header-only target.
 set(VKC_WITH_CONFIG ON)
 set(VKC_WITH_VULKAN
-    ${VI_IOS}
+    ON
     CACHE BOOL "" FORCE)
 FetchContent_Declare(
   volumetric_kit_core
@@ -116,37 +119,10 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(volumetric_kit_core)
 vkc_require_core(0.44.0)
 
-# --- Host mode: pure scanner logic and configuration tests -------------------
-# Everything below this block needs the siblings and MoltenVK, none of which a
-# host build wants or can use. So the host configure stops here.
-#
-# vi_core is plain C++ over glm, so this mode fetches glm 1.0.3, header-only
-# (GLM_BUILD_LIBRARY=OFF), the version the siblings build against on desktop.
-if(NOT VI_IOS)
-  set(GLM_BUILD_LIBRARY
-      OFF
-      CACHE BOOL "" FORCE)
-  set(GLM_BUILD_TESTS
-      OFF
-      CACHE BOOL "" FORCE)
-  set(GLM_BUILD_INSTALL
-      OFF
-      CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    glm
-    GIT_REPOSITORY https://github.com/g-truc/glm.git
-    GIT_TAG 1.0.3
-    GIT_SHALLOW TRUE)
-  FetchContent_MakeAvailable(glm)
-  enable_testing()
-  add_subdirectory(apps/scanner/Core)
-  add_subdirectory(tests)
-  return()
-endif()
-
-# The core's answer, found here so that the imported glm::glm is visible to
-# vi_core and to the siblings below: an imported target belongs to the directory
-# that found it and those beneath it.
+# glm, found here so that the imported glm::glm is visible to vi_core and to the
+# siblings below: an imported target belongs to the directory that found it and
+# those beneath it. A host build finds Homebrew's; an iOS build, the core's
+# answer.
 find_package(glm CONFIG REQUIRED)
 
 # The siblings are pinned by commit, and adopted deliberately: a PR bumps a pin,
@@ -168,8 +144,9 @@ find_package(glm CONFIG REQUIRED)
 # sensor: the camera contract (camera parameters, colour encoding, camera and
 # colour conventions, YuvImage) ARKitCapture fills; sensor_apple's
 # PixelBufferImporter, which imports the camera pictures the keyframes sample;
-# and the HEVC encoder (sensor_video) with its rules (sensor_video_testing),
-# which the scanner's `-self-test hevc` runs.
+# the HEVC encoder (sensor_video) with its rules (sensor_video_testing), which
+# the scanner's `-self-test hevc` runs; and the frames' wire form (sensor_wire),
+# which vi_session writes.
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
@@ -182,17 +159,38 @@ vkc_require_sibling(
   volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple
   volumetric_kit::sensor_video
-  volumetric_kit::sensor_video_testing)
+  volumetric_kit::sensor_video_testing
+  volumetric_kit::sensor_wire)
 
 # grid: the sparse voxel block grid and Marching Cubes, whose DeviceMesh gfx
-# draws in place.
+# draws in place, and the .vrst container (grid_stream) vi_session writes.
 FetchContent_Declare(
   volumetric_kit_grid
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_grid.git
   GIT_TAG 17d48f30b3058a7ac9e2548ce2f11b95f659deab) # grid #18 (0.12.0)
 FetchContent_MakeAvailable(volumetric_kit_grid)
-vkc_require_sibling(volumetric_kit::grid 0.12.0 TARGETS
-                    volumetric_kit::grid_volume volumetric_kit::grid_mesh)
+vkc_require_sibling(
+  volumetric_kit::grid 0.12.0 TARGETS volumetric_kit::grid_volume
+  volumetric_kit::grid_mesh volumetric_kit::grid_stream)
+
+# --- Host mode: pure scanner logic, the session writer, configuration tests --
+# vi_core is plain C++ over glm; vi_session is host code on sensor's and grid's
+# public types. Neither needs recon, gfx, MoltenVK or a device, so the host
+# configure stops here. It builds only what the tests link: the siblings'
+# directories are left out of `all`, so their other tiers (shaders, Metal,
+# VideoToolbox) are configured and not compiled.
+if(NOT VI_IOS)
+  foreach(_vi_sibling volumetric_kit_core volumetric_kit_sensor
+                      volumetric_kit_grid)
+    set_property(DIRECTORY "${${_vi_sibling}_SOURCE_DIR}"
+                 PROPERTY EXCLUDE_FROM_ALL ON)
+  endforeach()
+  enable_testing()
+  add_subdirectory(apps/scanner/Core)
+  add_subdirectory(apps/scanner/Session)
+  add_subdirectory(tests)
+  return()
+endif()
 
 # recon: TSDF fusion and the projective texturer.
 FetchContent_Declare(
@@ -218,9 +216,11 @@ set(VG_WITH_GLFW
 FetchContent_MakeAvailable(volumetric_kit_gfx)
 
 # Added from here rather than from apps/scanner/CMakeLists.txt, which is where
-# it sits: the host build needs vi_core *without* the scanner, and the scanner
-# cannot be configured at all without the siblings and MoltenVK above.
+# they sit: the host build needs vi_core and vi_session *without* the scanner,
+# and the scanner cannot be configured at all without the siblings and MoltenVK
+# above. vi_session builds for iOS too, ahead of the scanner linking it.
 add_subdirectory(apps/scanner/Core)
+add_subdirectory(apps/scanner/Session)
 
 add_subdirectory(apps/compute_smoke)
 add_subdirectory(apps/scanner)

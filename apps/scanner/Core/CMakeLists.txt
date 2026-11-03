@@ -21,8 +21,10 @@ add_library(
   AllocationStop.cpp
   FailureHandling.cpp
   GrowthPolicy.cpp
+  MapSteps.cpp
   MemoryBudget.cpp
   OrbitCamera.cpp
+  RateGate.cpp
   SelfTest.cpp
   ViewOrientation.cpp)
 
