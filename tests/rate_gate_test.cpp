@@ -18,7 +18,7 @@ namespace app = volumetric_kit::ios_app;
 
 constexpr std::uint64_t kStart = 1'000'000'000'000;  // any clock's origin
 constexpr std::uint64_t k60HzNs = 16'666'667;        // 60 Hz, rounded
-constexpr std::uint64_t kArkitNs = 16'669'375;       // ARKit's, measured on 0b
+constexpr std::uint64_t kArkitNs = 16'669'375;       // ARKit's, as measured
 
 // The indices @p gate takes of frames at @p times.
 std::vector<std::size_t> taken(app::RateGate& gate,

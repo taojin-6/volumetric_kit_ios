@@ -78,15 +78,20 @@ glm::dmat4 MapSteps::take(std::uint64_t timestamp_ns,
   }
 
   if (in_run_ && timestamp_ns - run_ns_ > max_step_ns_) {
-    // Too long for a step: start again from this pose.
+    // Too long for a step, so motion: undo the run's steps, logged as a step
+    // back to before it, and start again from this pose.
     in_run_ = false;
     known_ = 0;
+    steps_.push_back({timestamp_ns, run_from_});
+    sent_from_raw_ = rigid_inverse(run_from_);
+    sent = sent_from_raw_ * camera_to_world;
     remember(sent);
     return sent;
   }
   if (!in_run_) {
     in_run_ = true;
     run_ns_ = timestamp_ns;
+    run_from_ = steps_.empty() ? glm::dmat4(1.0) : steps_.back().raw_from_sent;
   }
 
   const glm::dmat3 r1(last.sent);

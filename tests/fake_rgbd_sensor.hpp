@@ -29,7 +29,7 @@ namespace vkc = volumetric_kit::core;
 ///         256 x 192 depth camera beside a 1920 x 1440 colour camera.
 inline sensor::SensorInfo arkit_like() {
   sensor::SensorInfo info;
-  info.id = "ipad-0b";
+  info.id = "ipad-test";
   info.model = "Apple iPad Pro (M5) LiDAR";
   sensor::camera::CameraModel color;
   color.size = {1920, 1440};

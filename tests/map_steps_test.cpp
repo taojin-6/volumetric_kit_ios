@@ -6,8 +6,8 @@
 ///        motion left as it is.
 ///
 /// The chains are synthetic: a hand at 60 Hz, and a step as ARKit makes one,
-/// a rigid move of the whole world in one frame or a few. 0b's own take is
-/// lab data, so it is checked on the Mac, not here.
+/// a rigid move of the whole world in one frame or a few. Recorded poses are
+/// not part of the repository, so they are checked outside CI.
 
 #include "MapSteps.hpp"
 
@@ -96,8 +96,8 @@ TEST(MapSteps, AHandShakingAt30IsKeptBitForBit) {
   }
 }
 
-/// 0b's largest: 127 mm and 2.5 deg in one frame. It is taken out of that
-/// frame and every later one, and logged where it happened.
+/// The largest recorded: 127 mm and 2.5 deg in one frame. It is taken out of
+/// that frame and every later one, and logged where it happened.
 TEST(MapSteps, AStepIsTakenOutOfEveryLaterPose) {
   const glm::dmat4 step = world_step(127.0, 2.5);
   app::MapSteps steps;
@@ -118,7 +118,7 @@ TEST(MapSteps, AStepIsTakenOutOfEveryLaterPose) {
   }
 }
 
-/// ARKit spreads some steps over a few frames, as at 0b's 41.9 s. Each part
+/// ARKit spreads some steps over a few frames, as one recorded. Each part
 /// is a step of its own, and the log's last says the whole.
 TEST(MapSteps, AStepSpreadOverThreeFramesIsTakenOut) {
   const glm::dmat4 a = world_step(56.0, 0.8);
@@ -161,32 +161,72 @@ TEST(MapSteps, TwoStepsCompose) {
 }
 
 /// An acceleration past the bound held for 0.3 s is no step of ARKit's. Each
-/// run of steps stops at 50 ms and the prediction starts again from the pose
-/// given, so once the hand is smooth again no step is found: without the
-/// stop, the prediction would carry the old velocity on and take every later
-/// frame for a step.
-TEST(MapSteps, ARunLongerThanAStepStartsAgain) {
+/// run of steps stops at 50 ms and is undone, and the prediction starts again
+/// from the pose given, so once the hand is smooth again every pose goes out
+/// as given, and the log still rebuilds every pose. Without the stop, the
+/// prediction would carry the old velocity on and take every later frame for
+/// a step; without the undo, the runs' steps would stay in every later pose.
+TEST(MapSteps, ARunLongerThanAStepIsUndone) {
   constexpr std::size_t kBurst = 18;  // 0.3 s at 60 m/s^2
   app::MapSteps steps;
-  std::vector<std::uint64_t> stepped;
+  std::vector<glm::dmat4> raw;
+  std::vector<glm::dmat4> sent;
   glm::dvec3 p(3.0, 1.2, 0.0);
   glm::dvec3 v(0.0, 0.0, 0.5);
   for (std::size_t i = 0; i < 600; ++i) {
     if (i >= 300 && i < 300 + kBurst) v.x += 60.0 * kFrameS;
     p += v * kFrameS;
-    const std::size_t before = steps.steps().size();
-    (void)steps.take(time_of(i), glm::translate(glm::dmat4(1.0), p));
-    if (steps.steps().size() > before) stepped.push_back(time_of(i));
+    raw.push_back(glm::translate(glm::dmat4(1.0), p));
+    sent.push_back(steps.take(time_of(i), raw.back()));
+  }
+  // The frames taken for steps, sent other than as given.
+  std::vector<std::size_t> stepped;
+  for (std::size_t i = 0; i < sent.size(); ++i) {
+    if (distance_mm(sent[i], raw[i]) > 1e-3) stepped.push_back(i);
   }
   ASSERT_FALSE(stepped.empty());
-  EXPECT_GE(stepped.front(), time_of(300));
-  EXPECT_LE(stepped.back(), time_of(300 + kBurst + 2));
-  // No run is longer than 50 ms: 4 frames at 60 Hz.
+  EXPECT_GE(stepped.front(), 300u);
+  EXPECT_LE(stepped.back(), 300 + kBurst + 2);
+  // No run is longer than 50 ms: 3 frames at 60 Hz, the 4th 50.008 ms on.
   std::size_t run_frames = 1;
   for (std::size_t k = 1; k < stepped.size(); ++k) {
-    run_frames = stepped[k] - stepped[k - 1] == kFrameNs ? run_frames + 1 : 1;
-    EXPECT_LE(run_frames, 4u) << "at " << stepped[k];
+    run_frames = stepped[k] - stepped[k - 1] == 1 ? run_frames + 1 : 1;
+    EXPECT_LE(run_frames, 3u) << "at frame " << stepped[k];
   }
+  // After the burst, every pose as given: nothing of the runs stays.
+  for (std::size_t i = stepped.back() + 1; i < sent.size(); ++i) {
+    ASSERT_LT(distance_mm(sent[i], raw[i]), 1e-3) << "frame " << i;
+  }
+  // Each pose given is the log's raw_from_sent at its time, times the sent.
+  glm::dmat4 raw_from_sent(1.0);
+  std::size_t next = 0;
+  for (std::size_t i = 0; i < sent.size(); ++i) {
+    while (next < steps.steps().size() &&
+           steps.steps()[next].pts_ns <= time_of(i)) {
+      raw_from_sent = steps.steps()[next++].raw_from_sent;
+    }
+    ASSERT_LT(distance_mm(raw_from_sent * sent[i], raw[i]), 1e-3)
+        << "frame " << i;
+  }
+}
+
+/// The camera set down, from 1 m/s to rest in one frame, is motion: the run
+/// of steps it starts is undone at 50 ms, and from then on every pose goes
+/// out as given.
+TEST(MapSteps, ASuddenStopIsMotion) {
+  constexpr std::size_t kStop = 120;  // the first frame at rest is kStop + 1
+  app::MapSteps steps;
+  for (std::size_t i = 0; i < 300; ++i) {
+    const double t = static_cast<double>(std::min(i, kStop)) * kFrameS;
+    const glm::dmat4 raw =
+        glm::translate(glm::dmat4(1.0), glm::dvec3(1.0, 1.0, 1.0 * t));
+    const glm::dmat4 sent = steps.take(time_of(i), raw);
+    if (i <= kStop || i > kStop + 3) {
+      ASSERT_LT(distance_mm(sent, raw), 1e-3) << "frame " << i;
+    }
+  }
+  ASSERT_FALSE(steps.steps().empty());
+  EXPECT_EQ(steps.steps().back().raw_from_sent, glm::dmat4(1.0));
 }
 
 /// The test needs two frames before, each earlier: the first two frames, and
