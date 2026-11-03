@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Tao Jin
 
-# Host tests for vi_core.
+# Host tests for vi_core and vi_session.
 #
 # Configured only in host mode (see the root CMakeLists.txt): these run on the
 # machine that builds them, and an iOS-arm64 test binary is not runnable there.
-# They cover vi_core and the bundled configuration -- everything past them needs
-# a VkDevice, a live task port or an ARFrame, none of which exist off the
-# device.
+# They cover vi_core, vi_session and the bundled configuration -- everything
+# past them needs a VkDevice, a live task port or an ARFrame, none of which
+# exist off the device.
 #
 # googletest, matching the sibling libraries rather than inventing a harness for
 # one repo. Fetched only here, so an iOS configure never sees it.
@@ -35,9 +35,11 @@ add_executable(
   freshness_test.cpp
   growth_policy_test.cpp
   keyframe_binding_test.cpp
+  map_steps_test.cpp
   memory_budget_test.cpp
   orbit_camera_test.cpp
   picture_slot_test.cpp
+  rate_gate_test.cpp
   self_test_test.cpp
   stat_tone_test.cpp
   view_orientation_test.cpp)
@@ -48,6 +50,15 @@ target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main)
 # rather than the binary.
 include(GoogleTest)
 gtest_discover_tests(vi_core_tests)
+
+# vi_session's writer, on a fake sensor's frames, read back through grid's
+# reader and sensor's wire form; with vi_core's map-step rule and rate gate in
+# the iPad's order.
+add_executable(vi_session_tests rgbd_stream_writer_test.cpp)
+target_link_libraries(
+  vi_session_tests PRIVATE vi_session vi_core volumetric_kit::sensor_wire
+                           volumetric_kit::grid_stream GTest::gtest_main)
+gtest_discover_tests(vi_session_tests)
 
 add_executable(vi_config_tests scanner_config_test.cpp)
 target_link_libraries(vi_config_tests PRIVATE volumetric_kit::core_config
