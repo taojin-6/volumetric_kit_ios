@@ -27,11 +27,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ARKit scene depth needs LiDAR -- so without this mode CI can assert that the
 # app compiles and nothing more.
 #
-# Opt-in rather than inferred from the absence of the toolchain file, because
-# the FATAL_ERROR below is load-bearing: configuring without the toolchain is
-# the ordinary mistake, and it used to fail here with one actionable line
-# instead of somewhere deep in recon. Making a bare `cmake -S . -B build`
-# silently succeed at building a fraction of the repo would trade that away.
+# Opt-in rather than inferred from a configure that is not for iOS, because the
+# FATAL_ERROR below is load-bearing: configuring without the `ios` preset is the
+# ordinary mistake, and it fails here with one actionable line instead of
+# somewhere deep in recon. Making a bare `cmake -S . -B build` silently succeed
+# at building a fraction of the repo would trade that away.
 option(VI_HOST_TESTS
        "Build vi_core, vi_session and their tests for the host (not iOS)" OFF)
 
@@ -44,9 +44,9 @@ endif()
 if(NOT VI_IOS AND NOT VI_HOST_TESTS)
   message(
     FATAL_ERROR
-      "This project targets iOS only. Configure with:\n"
-      "  cmake -S . -B build-ios -G Xcode "
-      "-DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake\n"
+      "This project targets iOS only. Configure with the `ios` preset, with "
+      "MoltenVK_ROOT naming MoltenVK's iOS release:\n"
+      "  cmake -S . --preset ios\n"
       "To build and run the host tests for vi_core and vi_session instead:\n"
       "  cmake -S . -B build-host -DVI_HOST_TESTS=ON")
 endif()
@@ -72,8 +72,6 @@ if(VI_IOS)
   enable_language(Swift)
 endif()
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-
 # --- Options -----------------------------------------------------------------
 # The Apple Development team the app bundle is signed with. Required to install
 # on hardware; find yours with `security find-identity -v -p codesigning` (the
@@ -90,8 +88,8 @@ set(VI_BUNDLE_PREFIX
 # Fetched, not vendored: sensor, grid, recon and gfx are independent siblings
 # that release on their own, and this repo consumes them exactly as any other
 # downstream would. None needs an iOS-specific change -- the core's iOS module,
-# on the MoltenVK the toolchain file names, is the whole of the platform port --
-# so these are ordinary pinned checkouts.
+# on the MoltenVK release MoltenVK_ROOT names, is the whole of the platform port
+# -- so these are ordinary pinned checkouts.
 #
 # For local development against a working tree, point CMake at it instead of the
 # remote:
@@ -115,9 +113,9 @@ set(VKC_WITH_VULKAN
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 2163debc075bd7bfcd3738f8273821096cc6bece) # core #89 (0.43.0)
+  GIT_TAG aa0b4b2e36e4e550e8f765b4caa596c74083d830) # core #90 (0.44.0)
 FetchContent_MakeAvailable(volumetric_kit_core)
-vkc_require_core(0.43.0)
+vkc_require_core(0.44.0)
 
 # glm, found here so that the imported glm::glm is visible to vi_core and to the
 # siblings below: an imported target belongs to the directory that found it and
@@ -196,7 +194,7 @@ endif()
 FetchContent_Declare(
   volumetric_kit_recon
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_recon.git
-  GIT_TAG 83dd202d0c08fb5f4fa95da54f6611bb3c7edfc4) # recon #337 (0.1.0)
+  GIT_TAG fc153a4739d449139a7f962474fe50a32c59f1c5) # recon #339 (0.1.0)
 FetchContent_MakeAvailable(volumetric_kit_recon)
 vkc_require_sibling(volumetric_kit::recon 0.1.0 TARGETS
                     volumetric_kit::recon_tsdf volumetric_kit::recon_texture)

@@ -1,6 +1,7 @@
 name: build
 
-# Cross-compiles every app target for iOS arm64 (device).
+# Cross-compiles every app target for iOS arm64 (device), in Release, as the
+# apps ship.
 #
 # Build-only, by nature: MoltenVK ships no simulator slice and ARKit scene depth
 # needs LiDAR, so there is no runnable iOS target in CI. That is still worth
@@ -21,66 +22,30 @@ permissions:
 
 jobs:
   build:
-    # Pinned rather than macos-latest. `-latest` rolls to a new OS image on
-    # GitHub's schedule, which swaps the whole Xcode toolchain underneath the
-    # build without a commit here; this repo cross-compiles against that SDK, so
-    # that rollover is a real variable. macos-26 is what macos-latest resolves to
-    # today, so pinning changes nothing now and stops the surprise later.
-    runs-on: macos-26
+    # The family's self-hosted Mac (label `mac`), as the test leg. Its runners
+    # name MoltenVK's iOS release, installed once on that Mac, in MoltenVK_ROOT
+    # (the core's tools/runners/README.md, "Macs", step 5). Xcode, glslc and glm
+    # are the runner's too, which its owner installs and upgrades; the configure
+    # refuses a missing one with the core's own message.
+    runs-on: [self-hosted, mac]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # glslc compiles the GLSL to SPIR-V at build time. It is a *host* tool
-      # here -- the toolchain file resolves it with NO_CMAKE_FIND_ROOT_PATH so a
-      # cross build does not look for it in the iOS sysroot. glm's headers are
-      # the host's too: the core's iOS module answers every find_package(glm)
-      # with them, header-only.
-      - name: Install shaderc (glslc) and glm
-        run: brew install shaderc glm
-
-      # MoltenVK is a 34 MB upstream release artifact, fetched rather than
-      # vendored. Cache it on the pinned version so a run costs one download.
-      - name: Cache MoltenVK
-        id: cache-moltenvk
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: third_party/MoltenVK
-          key: moltenvk-ios-${{ hashFiles('tools/fetch_moltenvk.sh') }}
-
-      - name: Fetch MoltenVK
-        if: steps.cache-moltenvk.outputs.cache-hit != 'true'
-        run: tools/fetch_moltenvk.sh
-
-      # Every FetchContent dependency is pinned in CMakeLists.txt -- the
-      # siblings by commit -- so hashing that file keys the cache on
-      # exactly the sources a run compiles: a pin bump changes the hash and
-      # forces a clean miss. (Before the siblings were pinned, they tracked
-      # `main`, and a step folded both resolved tips into this key.)
-      - name: Cache FetchContent dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: build-ios/_deps
-          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          # No restore-keys, deliberately. A partial hit would restore the
-          # source tree from before the ref moved, and FetchContent does not
-          # reliably re-clone over an already-populated _deps -- so the build
-          # could compile stale sibling sources and report green, which is worse
-          # than no cache at all. A clean miss re-fetches; that is the run we
-          # most need to be honest.
-
+      # No dependency cache, as the test leg: the siblings' object files would
+      # outlive an Xcode or Homebrew upgrade of what built them, and the fetch
+      # is a few clones on a self-hosted runner.
       - name: Configure
-        run: |
-          cmake -S . -B build-ios -G Xcode \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake
+        run: cmake --preset ios
 
-      # No VI_DEVELOPMENT_TEAM is passed, so CMake warns that the bundles cannot
-      # be installed on hardware -- expected and correct for a build-only gate.
+      # The `ios` build preset: Release. No VI_DEVELOPMENT_TEAM is passed, so
+      # CMake warns that the bundles cannot be installed on hardware --
+      # expected and correct for a build-only gate.
       - name: Build (unsigned)
         run: |
-          cmake --build build-ios --config Debug -- \
+          cmake --build --preset ios -- \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       # A bundle that builds but is not actually an iOS arm64 binary would
@@ -91,7 +56,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           found=0
-          for app in build-ios/apps/*/Debug-iphoneos/*.app; do
+          for app in build-ios/apps/*/Release-iphoneos/*.app; do
             bin="${app}/$(basename "${app}" .app)"
             echo "--- ${bin}"
             lipo -info "${bin}"
@@ -110,4 +75,4 @@ jobs:
       - name: Verify the scanner scenario is bundled
         run: |
           cmp apps/scanner/config/scanner.json \
-            build-ios/apps/scanner/Debug-iphoneos/scanner.app/scanner.json
+            build-ios/apps/scanner/Release-iphoneos/scanner.app/scanner.json

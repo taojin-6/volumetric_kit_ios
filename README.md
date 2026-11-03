@@ -8,8 +8,8 @@ voxel grid and meshing →
 [`volumetric_kit_gfx`](https://github.com/taojin-6/volumetric_kit_gfx)
 rendering, all on MoltenVK, on a phone.
 
-This repo holds only what is genuinely iOS: the cross-compilation toolchain, the
-app targets, and the Xcode packaging. The libraries stay independent siblings —
+This repo holds only what is genuinely iOS: the build preset, the app targets,
+and the Xcode packaging. The libraries stay independent siblings —
 neither needed a single source change to build for iOS.
 
 [AGENTS.md](AGENTS.md) is the shared working guide for Codex and Claude Code;
@@ -27,24 +27,25 @@ other downstream would.
 The one thing iOS genuinely needs is a **Vulkan implementation**: the platform
 ships no ICD loader and no `libvulkan`, so MoltenVK's static library *is* Vulkan
 here, linked directly (and therefore with no validation layers on device).
-`cmake/ios.toolchain.cmake` names the platform and points `MoltenVK_ROOT` at
-the fetched release; volumetric_kit_core's iOS module (`cmake/vkc_ios.cmake`)
-then sets `Vulkan_LIBRARY` / `Vulkan_INCLUDE_DIR` from it, so every
-`find_package(Vulkan)` in the siblings makes `Vulkan::Vulkan` from MoltenVK's
-iOS xcframework.
+The `ios` preset (`CMakePresets.json`) names the platform for CMake's own iOS
+support, with no toolchain file. volumetric_kit_core's iOS module
+(`cmake/vkc_ios.cmake`) takes MoltenVK's iOS release from `MoltenVK_ROOT`,
+checks its version, and sets `Vulkan_LIBRARY` / `Vulkan_INCLUDE_DIR` from it,
+so every `find_package(Vulkan)` in the siblings makes `Vulkan::Vulkan` from
+MoltenVK's iOS xcframework.
 
 ## Build
 
+Needs Xcode, host `glslc` and glm (`brew install shaderc glm`), and MoltenVK's
+iOS release, 1.4.2 or newer, installed once as the core's
+[README](https://github.com/taojin-6/volumetric_kit_core#prerequisites) says
+and named by `MoltenVK_ROOT`; the build remembers it after the first
+configure. It builds Release, as the apps ship and CI builds them:
+
 ```sh
-brew install shaderc glm         # once — glslc and glm's headers, host tools
-tools/fetch_moltenvk.sh          # once — pulls MoltenVK's iOS release
-
-cmake -S . -B build-ios -G Xcode \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
-  -DVI_DEVELOPMENT_TEAM=<your team id>
-
-cd build-ios && xcodebuild -project volumetric_kit_ios.xcodeproj \
-  -target compute_smoke -configuration Debug -allowProvisioningUpdates build
+export MoltenVK_ROOT=<MoltenVK/ directory of MoltenVK-ios.tar>
+cmake --preset ios -DVI_DEVELOPMENT_TEAM=<your team id>
+cmake --build --preset ios --target compute_smoke -- -allowProvisioningUpdates
 ```
 
 Find your team id with `security find-identity -v -p codesigning` (the
@@ -101,7 +102,7 @@ cmake --build build-host --parallel
 ctest --test-dir build-host --output-on-failure
 ```
 
-No toolchain file, no MoltenVK release, no recon or gfx, no Xcode project —
+No `ios` preset, no MoltenVK release, no recon or gfx, no Xcode project —
 that mode short-circuits before any of them. It fetches the core, sensor, grid
 and the test framework, and builds only the tiers the tests link: the core's,
 sensor's interface and wire form (`sensor_wire`), grid's `.vrst` container
@@ -154,7 +155,7 @@ horizon. Both are now regressions rather than sightings.
 ```sh
 xcrun devicectl list devices
 xcrun devicectl device install app --device <id> \
-  build-ios/apps/compute_smoke/Debug-iphoneos/compute_smoke.app
+  build-ios/apps/compute_smoke/Release-iphoneos/compute_smoke.app
 xcrun devicectl device process launch --console --device <id> \
   io.taojin.volumetrickit.computesmoke
 ```
@@ -219,9 +220,11 @@ Two configuration notes specific to here:
   on a Linux hook runner. That is why the lint CI job runs on macOS while the
   siblings lint on Linux.
 
-CI (`.github/workflows/`) cross-compiles every app target for iOS arm64, runs
-the same hooks, and runs the `vi_core` and `vi_session` host tests on the
-self-hosted Mac. The build is **unsigned**
+CI (`.github/workflows/`) cross-compiles every app target for iOS arm64 in
+Release through the `ios` preset, runs the same hooks, and runs the `vi_core`
+and `vi_session` host tests. The build and the tests run on the family's
+self-hosted Mac (label `mac`), whose runners name MoltenVK's iOS release in
+`MoltenVK_ROOT` (the core's `tools/runners/README.md`). The build is **unsigned**
 (`CODE_SIGNING_ALLOWED=NO`), so no certificate or provisioning secret is needed,
 and **build-only**: MoltenVK ships no simulator slice and ARKit scene depth needs
 LiDAR, so no *app* target is runnable in CI. The test leg is the one that
@@ -234,9 +237,10 @@ final step asserts each bundle is really iOS arm64 (`LC_BUILD_VERSION`
 
 It runs on push and pull request only — there is **no scheduled run**. The
 siblings are pinned by commit in `CMakeLists.txt`, so sibling changes arrive
-only when a PR here bumps a pin, and CI builds exactly that set. The dependency cache is
-keyed on the hash of `CMakeLists.txt`, which holds every pin, and carries no
-`restore-keys`, so a bumped pin always re-fetches.
+only when a PR here bumps a pin, and CI builds exactly that set. Neither leg
+caches the siblings: their object files would outlive an Xcode or Homebrew
+upgrade of what built them, and the fetch is a few clones on the self-hosted
+Mac.
 
 Until 2026-10-03 the siblings were consumed at `GIT_TAG main`. Upstream breakage
 then arrived on upstream's schedule, with no commit here to fix it against, and
@@ -362,7 +366,7 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 
 - **Device only, arm64.** MoltenVK's iOS release ships no simulator slice, and
   ARKit scene depth needs LiDAR hardware anyway.
-- **iOS 26.0 or newer** (`cmake/ios.toolchain.cmake`).
+- **iOS 26.0 or newer** (the `ios` preset in `CMakePresets.json`).
 - **LiDAR required** for the ARKit slice: iPhone 12 Pro and later Pro models,
   iPad Pro 2020 and later. Guard with
   `ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`.
