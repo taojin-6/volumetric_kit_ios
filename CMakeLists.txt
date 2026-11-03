@@ -146,16 +146,15 @@ find_package(glm CONFIG REQUIRED)
 # PixelBufferImporter, which imports the camera pictures the keyframes sample;
 # the HEVC encoder (sensor_video) with its rules (sensor_video_testing), which
 # the scanner's `-self-test hevc` runs; and the frames' wire form (sensor_wire),
-# which vi_session writes. Pinned at sensor #34's head while #34 is open;
-# re-pinned at its merge commit before this merges.
+# which vi_session writes.
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG 54d7a9fd500c619cb27998c61ab328055a74df02) # sensor #34's head (0.28.0)
+  GIT_TAG 32be4cc19fffbf6c1484df7e3aea0e75a94cee9b) # sensor #34 (0.29.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
   volumetric_kit::sensor
-  0.28.0
+  0.29.0
   TARGETS
   volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple
