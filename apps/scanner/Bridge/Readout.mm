@@ -773,7 +773,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
   // `ExtractTimings` is filled by `remesh` either way; only the stage publish
   // is behind the flag.
   if (s.stage_count == 0) {
-    // Two host spans measured on every fused frame regardless of the switch.
+    // Three host spans measured on every fused frame regardless of the switch.
     // Their own section rather than rows beside the extract phases below,
     // because they are a different cadence: these are this frame's, and
     // everything in `s.extract` is the last *successful remesh's*. Putting two
@@ -781,6 +781,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     // Block table card was rewritten to stop making.
     if (s.frames_fused > 0) {
       NSMutableArray<VolumetricStatRow*>* r = [NSMutableArray array];
+      add(r, @"frame prep", fmt("%.2f ms", s.prep_ms));
       add(r, @"allocate", fmt("%.2f ms", s.allocate_ms));
       add(r, @"integrate", fmt("%.2f ms", s.integrate_ms));
       [out addObject:make_section(@"Fuse timing", r)];
