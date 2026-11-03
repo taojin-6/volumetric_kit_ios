@@ -9,7 +9,7 @@ do not duplicate these rules or create a circular reference.
 `volumetric_kit_ios` is the iOS application shell: ARKit capture →
 `volumetric_kit_recon` fusion on `volumetric_kit_grid` → `volumetric_kit_gfx`
 rendering on MoltenVK, with `volumetric_kit_sensor`'s camera contract.
-This repository owns the app, platform bridge, toolchain, and packaging.
+This repository owns the app, platform bridge, iOS build preset, and packaging.
 The libraries remain independent siblings with their own guidance.
 
 - Swift owns the app/UI/lifecycle; Objective-C++ owns the platform bridge;
@@ -33,7 +33,7 @@ The libraries remain independent siblings with their own guidance.
 
 | Task | Read |
 | --- | --- |
-| Build, dependencies, signing, device deployment | [README build guide](README.md#build), relevant CMake/toolchain files |
+| Build, dependencies, signing, device deployment | [README build guide](README.md#build), `CMakePresets.json`, relevant CMake files |
 | Pure app logic and host tests | [Host-test boundary](README.md#the-host-tests), `apps/scanner/Core/CMakeLists.txt`, affected tests |
 | Swift/Objective-C++ seam | [Language split](README.md#language-split), affected bridge headers and Swift callers |
 | Shared Vulkan device | [Shared device](README.md#the-shared-device), the core's `volumetric_kit/core/vulkan/shared_device.hpp`, `Bridge/VolumetricRenderer.mm` |
@@ -70,22 +70,22 @@ pre-commit run --all-files --show-diff-on-failure
 git -C "$ios_root" diff --check
 ```
 
-The host mode needs no iOS toolchain, MoltenVK release, recon or gfx; it
+The host mode needs no Xcode project, MoltenVK release, recon or gfx; it
 fetches the core, sensor and grid, and takes glm and the Vulkan SDK from
 Homebrew ([host tests](README.md#the-host-tests)). Changes to the
-bridge, Swift, shaders, or app packaging need the iOS build on macOS with Xcode
-and host `glslc` and glm installed (`brew install shaderc glm`):
+bridge, Swift, shaders, or app packaging need the iOS build on macOS with Xcode,
+host `glslc` and glm (`brew install shaderc glm`), and MoltenVK's iOS release
+named by `MoltenVK_ROOT` ([README build guide](README.md#build)):
 
 ```sh
-"$ios_root/tools/fetch_moltenvk.sh"
-cmake -S "$ios_root" -B "$ios_root/build-ios" -G Xcode \
-  -DCMAKE_TOOLCHAIN_FILE="$ios_root/cmake/ios.toolchain.cmake"
-cmake --build "$ios_root/build-ios" --config Debug -- \
+cmake -S "$ios_root" --preset ios
+cmake --build "$ios_root/build-ios" --config Release -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 ```
 
-- Keep host and iOS build trees separate. Use `--config Release` for Xcode
-  performance measurements and report the build type, device, and workload.
+- Keep host and iOS build trees separate. Build Release, as the apps ship and
+  CI builds them; report the build type, device, and workload with any
+  measurement.
 - Add regression coverage for changed pure logic. For runtime platform
   behavior, distinguish compilation, host tests, and actual device checks.
 - App targets are device-only iOS arm64. This MoltenVK package has no simulator
