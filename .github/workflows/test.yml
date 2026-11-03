@@ -1,18 +1,21 @@
 name: test
 
-# The host tests for vi_core -- the scanner's pure logic.
+# The host tests for vi_core -- the scanner's pure logic -- and vi_session, the
+# session writer.
 #
 # This is the only job in this repo that *runs* anything. The app targets are
 # build-only by nature: MoltenVK ships no simulator slice and ARKit scene depth
-# needs LiDAR, so nothing that touches Vulkan, the libraries or ARKit can execute
-# anywhere but a real device. vi_core is the part that carries no such
-# dependency, and it is deliberately the part that decides things -- a sign, a
-# threshold, whether a kernel reading is trustworthy -- so it is where a test
-# earns the most.
+# needs LiDAR, so nothing that touches ARKit or a GPU can execute anywhere but
+# a real device. vi_core is the part that carries no such dependency, and it is
+# deliberately the part that decides things -- a sign, a threshold, whether a
+# kernel reading is trustworthy -- so it is where a test earns the most.
+# vi_session is host code on sensor's and grid's public types.
 #
-# It configures with -DVI_HOST_TESTS=ON, which builds vi_core and the tests and
-# nothing else: no sibling library but the core, no MoltenVK, no Xcode project. That is why
-# this leg is a couple of minutes rather than the build leg's tens.
+# It configures with -DVI_HOST_TESTS=ON, which builds vi_core, vi_session and
+# the tests, and of the siblings only the tiers they link: the core, sensor's
+# interface and wire form, grid's .vrst container. No recon, gfx, MoltenVK
+# release or Xcode project. That is why this leg is minutes rather than the
+# build leg's tens.
 #
 # Invoked by ci.yml, which owns the triggers and the concurrency group.
 on:
@@ -23,40 +26,43 @@ permissions:
 
 jobs:
   test:
-    # Pinned for the same reason the other legs are: `-latest` rolls to a new
-    # image on GitHub's schedule and swaps the toolchain under the run.
-    #
-    # macOS rather than Linux only because it is what the rest of this repo
-    # already pins and what these tests were verified on. vi_core links no Apple
-    # framework and includes no Apple header -- that is the boundary its
-    # CMakeLists.txt describes -- so a Linux leg would build it too, and would
-    # additionally *prove* that boundary rather than leaving it a claim. Worth
-    # adding; not added here unverified.
-    runs-on: macos-26
-    timeout-minutes: 15
+    # The family's self-hosted Mac (label `mac`), as sensor's and recon's Mac
+    # legs: sensor's interface reaches the Vulkan headers through its frame
+    # tier, so the host build needs the Vulkan SDK, which that Mac has from
+    # Homebrew, and the iPad's encoder tests to come need its VideoToolbox
+    # hardware. The core's tools/runners/setup-runners.sh registers its runners.
+    runs-on: [self-hosted, mac]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # googletest is the only thing fetched in this mode, and it is pinned to a
-      # tag, so hashing the file that carries the pin is a complete key -- unlike
-      # the build leg, which has to resolve two moving sibling refs.
-      - name: Cache FetchContent dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: build-host/_deps
-          key: >-
-            host-deps-${{ runner.os }}-${{
-            hashFiles('tests/CMakeLists.txt', 'CMakeLists.txt') }}
+      # The Homebrew formulae the host build finds: glm and the Vulkan SDK
+      # (headers, loader, MoltenVK as its driver), and glslc, which sensor's
+      # configure looks for. Checked, not installed: the runner's owner
+      # installs and upgrades them.
+      - name: Check dependencies
+        run: |
+          missing=""
+          for pkg in cmake glm molten-vk vulkan-headers vulkan-loader shaderc; do
+            brew list --formula "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing Homebrew formulae:$missing"
+            exit 1
+          fi
 
+      # No dependency cache: the siblings' object files would outlive a
+      # Homebrew upgrade of the headers they were built against, and the
+      # fetch is a few clones on a self-hosted runner.
       - name: Configure
-        run: cmake -S . -B build-host -DVI_HOST_TESTS=ON
+        run: cmake -S . -B build-host -DVI_HOST_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build-host --parallel
+        run: cmake --build build-host --parallel 4
 
       # --output-on-failure so a red run carries the assertion in the log rather
       # than only the case name.
       - name: Test
-        run: ctest --test-dir build-host --output-on-failure
+        run: ctest --test-dir build-host --output-on-failure --parallel 4

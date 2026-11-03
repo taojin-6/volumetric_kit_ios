@@ -70,8 +70,9 @@ pre-commit run --all-files --show-diff-on-failure
 git -C "$ios_root" diff --check
 ```
 
-The host mode needs no iOS toolchain, MoltenVK, or sibling library beyond the
-core's config tier. Changes to the
+The host mode needs no iOS toolchain, MoltenVK release, recon or gfx; it
+fetches the core, sensor and grid, and takes glm and the Vulkan SDK from
+Homebrew ([host tests](README.md#the-host-tests)). Changes to the
 bridge, Swift, shaders, or app packaging need the iOS build on macOS with Xcode
 and host `glslc` and glm installed (`brew install shaderc glm`):
 

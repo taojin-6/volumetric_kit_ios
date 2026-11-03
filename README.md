@@ -55,8 +55,8 @@ parenthesised code) or in Xcode → Settings → Accounts.
 | Sibling | What the apps take from it |
 | --- | --- |
 | `volumetric_kit_core` | the shared device, `Status`, the scenario parser |
-| `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), the `PixelBufferImporter` the keyframes use (`sensor_apple`), and the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`) |
-| `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`) |
+| `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), the `PixelBufferImporter` the keyframes use (`sensor_apple`), the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`), and the frames' wire form the session writer writes (`sensor_wire`) |
+| `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`), and the `.vrst` container (`grid_stream`) |
 | `volumetric_kit_recon` | TSDF fusion and the projective texturer (`recon_tsdf`, `recon_texture`) |
 | `volumetric_kit_gfx` | the renderer |
 
@@ -91,18 +91,31 @@ app.
 
 ### The host tests
 
-`vi_core` — the scanner's pure logic — and the bundled configuration test
-build and run on the host:
+`vi_core` (the scanner's pure logic), `vi_session` (the session writer) and
+the bundled configuration test build and run on the host:
 
 ```sh
+brew install glm molten-vk vulkan-headers vulkan-loader shaderc  # once
 cmake -S . -B build-host -DVI_HOST_TESTS=ON
 cmake --build build-host --parallel
 ctest --test-dir build-host --output-on-failure
 ```
 
-No toolchain file, no MoltenVK, no sibling library, no Xcode project — that mode
-short-circuits before any of them. It fetches only glm, the CPU-only core
-configuration tier, its private JSON dependency, and the test framework.
+No toolchain file, no MoltenVK release, no recon or gfx, no Xcode project —
+that mode short-circuits before any of them. It fetches the core, sensor, grid
+and the test framework, and builds only the tiers the tests link: the core's,
+sensor's interface and wire form (`sensor_wire`), grid's `.vrst` container
+(`grid_stream`). Sensor's interface reaches the Vulkan headers through its
+frame tier, so the mode takes the Vulkan SDK and glm from Homebrew; nothing in
+it opens a device. CI runs it on the family's self-hosted Mac (label `mac`).
+
+`apps/scanner/Session/` is `vi_session`: `RgbdStreamWriter` writes any
+`IRgbdSensor`'s frames as one `.vrst` session, each frame its colour record
+(the caller's coded picture) then its depth record (sensor's wire form), with
+no decode and no device. Its tests write a fake sensor's frames and read them
+back with grid's reader. The pose and rate rules it is fed through are
+`vi_core`'s: `MapSteps` takes ARKit's map steps out of every pose and logs
+them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
 
 It exists because **everything else here is build-only by nature**: MoltenVK
 ships no simulator slice and ARKit scene depth needs LiDAR, so nothing that
@@ -207,7 +220,8 @@ Two configuration notes specific to here:
   siblings lint on Linux.
 
 CI (`.github/workflows/`) cross-compiles every app target for iOS arm64, runs
-the same hooks, and runs the `vi_core` host tests. The build is **unsigned**
+the same hooks, and runs the `vi_core` and `vi_session` host tests on the
+self-hosted Mac. The build is **unsigned**
 (`CODE_SIGNING_ALLOWED=NO`), so no certificate or provisioning secret is needed,
 and **build-only**: MoltenVK ships no simulator slice and ARKit scene depth needs
 LiDAR, so no *app* target is runnable in CI. The test leg is the one that
@@ -240,8 +254,8 @@ Swift          app shell, UI, lifecycle (later: ARSession config, permissions)
     ↓ bridging header
 Obj-C++ (.mm)  VolumetricRenderer — CAMetalLayer → VkSurfaceKHR, ARFrame → PODs
     ↓
-C++            vi_core (pure, host tested) + volumetric_kit_sensor, _grid,
-               _recon and _gfx
+C++            vi_core (pure, host tested), vi_session (host tested)
+               + volumetric_kit_sensor, _grid, _recon and _gfx
 ```
 
 `vi_core` (`apps/scanner/Core/`) is a fourth layer only in the sense that it sits
@@ -363,7 +377,7 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 - **glm is header-only.** Homebrew's glm 1.0.3 defines `glm::glm` as a *macOS*
   dylib, which the iOS linker refuses; the core's iOS module answers every
   `find_package(glm)` with the host's glm headers as a header-only target
-  instead. The host tests fetch glm 1.0.3 header-only.
+  instead. The host tests, a macOS build, take Homebrew's.
 
 ## Roadmap
 
