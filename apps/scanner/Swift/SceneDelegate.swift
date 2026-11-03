@@ -19,7 +19,10 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   ) {
     guard let windowScene = scene as? UIWindowScene else { return }
     let window = UIWindow(windowScene: windowScene)
-    window.rootViewController = ScannerViewController()
+    // `-self-test <name>` runs a self-test instead of the scanner.
+    let test = ScannerSelfTest.kind(forArguments: ProcessInfo.processInfo.arguments)
+    window.rootViewController =
+      test == .none ? ScannerViewController() : SelfTestViewController(kind: test)
     window.makeKeyAndVisible()
     self.window = window
   }

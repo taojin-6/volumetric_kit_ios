@@ -6,4 +6,5 @@
 // C++ underneath stays entirely on the Objective-C++ side.
 
 #import "ARKitCapture.h"
+#import "ScannerSelfTest.h"
 #import "VolumetricRenderer.h"

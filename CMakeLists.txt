@@ -166,16 +166,24 @@ find_package(glm CONFIG REQUIRED)
 # its library tiers build.
 
 # sensor: the camera contract (camera parameters, colour encoding, camera and
-# colour conventions, YuvImage) ARKitCapture fills, and sensor_apple's
-# PixelBufferImporter, which imports the camera pictures the keyframes sample.
+# colour conventions, YuvImage) ARKitCapture fills; sensor_apple's
+# PixelBufferImporter, which imports the camera pictures the keyframes sample;
+# and the HEVC encoder (sensor_video) with its rules (sensor_video_testing),
+# which the scanner's `-self-test hevc` runs. Pinned at sensor #34's head while
+# #34 is open; re-pinned at its merge commit before this merges.
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG aa7d9402ae6726a84995c7bc52f936298d0d36d1) # sensor #27 (0.20.0)
+  GIT_TAG a83e13f3ae23ae3815552742924226e64b6802d2) # sensor #34's head (0.27.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
-  volumetric_kit::sensor 0.20.0 TARGETS volumetric_kit::sensor_interface
-  volumetric_kit::sensor_apple)
+  volumetric_kit::sensor
+  0.27.0
+  TARGETS
+  volumetric_kit::sensor_interface
+  volumetric_kit::sensor_apple
+  volumetric_kit::sensor_video
+  volumetric_kit::sensor_video_testing)
 
 # grid: the sparse voxel block grid and Marching Cubes, whose DeviceMesh gfx
 # draws in place.

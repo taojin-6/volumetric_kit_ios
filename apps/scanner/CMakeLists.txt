@@ -40,9 +40,11 @@ function(vi_add_scanner_bridge bridge_target)
     Bridge/BridgeStrings.mm
     Bridge/FrameTrace.cpp
     Bridge/Fusion.mm
+    Bridge/HevcSelfTest.cpp
     Bridge/MemoryQuery.cpp
     Bridge/Readout.mm
-    Bridge/RendererErrors.mm)
+    Bridge/RendererErrors.mm
+    Bridge/ScannerSelfTest.mm)
 
   # ARC, selected by language rather than by a second copy of the source list.
   #
@@ -141,7 +143,12 @@ function(vi_add_scanner_bridge bridge_target)
            volumetric_kit::recon_texture
            volumetric_kit::recon_tsdf
            volumetric_kit::gfx_pipelines
-    PRIVATE volumetric_kit::core_config vi_scanner_shaders)
+    PRIVATE volumetric_kit::core_config
+            # `-self-test hevc` (Bridge/HevcSelfTest.cpp): the encoder and its
+            # rules, on the device's VideoToolbox.
+            volumetric_kit::sensor_video
+            volumetric_kit::sensor_video_testing
+            vi_scanner_shaders)
 endfunction()
 
 vi_add_scanner_bridge(scanner_bridge)
@@ -155,7 +162,8 @@ add_executable(
   Swift/Dashboard.swift
   Swift/MetalView.swift
   Swift/ScannerViewController.swift
-  Swift/SceneDelegate.swift)
+  Swift/SceneDelegate.swift
+  Swift/SelfTestViewController.swift)
 
 target_link_libraries(${VI_APP_NAME} PRIVATE scanner_bridge)
 

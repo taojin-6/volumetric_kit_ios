@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+#pragma once
+
+/// @file SelfTest.hpp
+/// @brief The scanner's launch self-tests: which one a launch asks for, and
+///        what `-self-test hevc` reports and whether it passed.
+///
+/// Pure, so the argument rule, the report's text and its verdict are host
+/// tested. The run itself, on the device's encoder, is
+/// `Bridge/HevcSelfTest.cpp`'s.
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace volumetric_kit::ios_app {
+
+/// @brief What a launch's arguments ask for.
+enum class SelfTestKind : std::uint8_t {
+  None,     ///< No `-self-test`: the scanner runs.
+  Hevc,     ///< `-self-test hevc`.
+  Unknown,  ///< `-self-test` with no name after it, or a name no test has.
+};
+
+/// @return What @p arguments (the process's, the program first) ask for:
+///         the word after the first `-self-test`.
+SelfTestKind self_test_kind(const std::vector<std::string>& arguments);
+
+/// @brief One run of sensor's encoder rules (`hevc_encoder_breach`).
+struct RuleCase {
+  enum class Result : std::uint8_t {
+    Kept,    ///< Every rule held.
+    Broken,  ///< A rule broke; @ref detail names it ("C5: ...").
+    /// The session opens, but the run stopped on a status: a decode (C6), a
+    /// send or a receive that failed. @ref detail is its text.
+    Failed,
+    /// The session does not open for the case's options
+    /// (`HevcEncoder::create`'s refusal); @ref detail is its text.
+    NotRun,
+  };
+  std::string name;  ///< The case: size, colour, QP.
+  Result result = Result::NotRun;
+  std::string detail;    ///< Empty when kept.
+  double seconds = 0.0;  ///< The run's wall time.
+  /// Set when the case was run again without the decode
+  /// (@ref rerun_without_decode): that run's result and detail, which say
+  /// whether the encoder's own rules held.
+  std::optional<Result> without_decode;
+  std::string without_decode_detail;
+};
+
+/// @return Whether @p c, run with the decode (C6), is run again without it:
+///         when it failed on a status, which may be the decoder's, or broke
+///         C6. A rule broken before C6 (C1-C5) breaks again without it, and
+///         one broken after it (C7 on) means C6 held.
+bool rerun_without_decode(const RuleCase& c);
+
+/// @brief The encoder's timing on one session, one picture in flight: each
+///        picture sent, then received before the next.
+struct EncodeTiming {
+  std::string what;             ///< The session: size, colour, QP.
+  std::uint32_t sent = 0;       ///< Pictures sent and timed.
+  std::uint32_t coded = 0;      ///< Of those, access units received.
+  std::uint32_t keys = 0;       ///< Of those coded, IDRs.
+  std::string failure;          ///< The first failure's text; empty for none.
+  std::vector<double> send_ms;  ///< Each send's return time.
+  std::vector<double> to_unit_ms;  ///< Each send to its access unit.
+  std::vector<std::size_t> bytes;  ///< Each access unit's size.
+};
+
+/// @return The @p p-th percentile (0 to 100) of @p values by nearest rank;
+///         0 for none.
+double percentile(std::vector<double> values, double p);
+
+/// @return @p c as one report line, ending in "; without C6: " and that
+///         run's result where it was run again without the decode.
+std::string rule_line(const RuleCase& c);
+
+/// @return @p t as report lines: counts, then the send return time, send to
+///         access unit and access unit bytes at p50, p95 and max.
+std::vector<std::string> timing_lines(const EncodeTiming& t);
+
+/// @return Whether the run passed: the cases were decoded on a GPU
+///         (@p decoded), at least one case, every case kept, and the timing
+///         coded every picture it sent, with no failure.
+bool self_test_passed(const std::vector<RuleCase>& cases,
+                      const EncodeTiming& timing, bool decoded);
+
+/// @return The report's last line: PASS or FAIL, with the counts it rests
+///         on, and "none decoded" when not @p decoded.
+std::string verdict_line(const std::vector<RuleCase>& cases,
+                         const EncodeTiming& timing, bool decoded);
+
+}  // namespace volumetric_kit::ios_app
