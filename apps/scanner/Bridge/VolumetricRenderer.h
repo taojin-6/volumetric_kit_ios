@@ -567,8 +567,10 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                frame with depth, and the first time the app asks, for the
 ///                user's answer to the camera prompt: call this off the main
 ///                thread. A camera that does not open fails nothing else:
-///                @ref cameraStatus says why and nothing fuses.
-///                `VolumetricCameraSourceNone` opens none.
+///                @ref cameraStatus says why and nothing fuses until the app
+///                is launched again, since only bring-up opens it (a start
+///                does not retry the open). `VolumetricCameraSourceNone` opens
+///                none.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
