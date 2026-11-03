@@ -163,19 +163,25 @@ It codes sensor's test pattern in IOSurface pixel buffers at ARKit's
 1920×1440 and writes no file and sends nothing. Its report, on the console
 and the screen, gives:
 
-- the device, the GPU and the encoder's own settings line, which says whether
-  it takes a QP a picture;
+- the device and its thermal state, the GPU and the encoder's own settings
+  line, which says whether it takes a QP a picture;
 - one line per run of sensor's encoder rules (`hevc_encoder_breach`, C1–C8 and
   C10–C13), each decoded back on the GPU: BT.601 at either range, BT.709
   centre-sited, QP 1 and 51, then every colour code and siting the encoder
-  accepts;
+  accepts. `kept` or `BROKEN` (a rule's name); `FAILED` for a status from a
+  session that opens, `NOT RUN` for one that does not. A run that failed or
+  broke C6 runs again without the decode and ends in `; without C6: kept` or
+  what broke. With no GPU, no case decodes, each name ends in `, no decode`,
+  and the run fails;
 - one session's timing, one picture in flight: `send` return time, send to
-  access unit, and access-unit bytes, at p50, p95 and max;
-- the thermal state before and after, and a PASS or FAIL line.
+  access unit (an upper bound on the encode), and access-unit bytes, at p50,
+  p95 and max;
+- the thermal state at the end, and last a PASS or FAIL line.
 
-The app exits when the report ends: 0 passed, 1 failed, 2 for an unknown test
-name. `Core/SelfTest.hpp` decides what the report says and whether it passed,
-and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
+The report stays on the screen for 20 s after it ends, then the app exits: 0
+passed, 1 failed, 2 for an unknown test name, so `--console` returns about 20 s
+after the last line. `Core/SelfTest.hpp` decides what the report says and
+whether it passed, and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
 ## Development
 

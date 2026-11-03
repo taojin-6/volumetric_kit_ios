@@ -8,9 +8,13 @@ import UIKit
 ///
 /// Each report line goes to stdout as it is made, which
 /// `devicectl device process launch --console` relays, and onto the screen.
-/// The app exits when the test ends: 0 when it passed, 1 when it failed, 2 for
-/// a name no test has.
+/// The screen holds the report for `hold` seconds after the test ends, then
+/// the app exits: 0 when it passed, 1 when it failed, 2 for a name no test
+/// has.
 final class SelfTestViewController: UIViewController {
+  /// How long the finished report stays on the screen before the app exits.
+  private static let hold: TimeInterval = 20
+
   private let kind: ScannerSelfTestKind
   private let report = UITextView()
   private var started = false
@@ -58,8 +62,8 @@ final class SelfTestViewController: UIViewController {
         self.emit("self-test: the launch names no test this app has (it has: hevc)")
         status = 2
       }
-      // After every line queued for the screen.
-      DispatchQueue.main.async { exit(status) }
+      // After every line queued for the screen, and long enough to read them.
+      DispatchQueue.main.asyncAfter(deadline: .now() + Self.hold) { exit(status) }
     }
   }
 
@@ -67,7 +71,10 @@ final class SelfTestViewController: UIViewController {
     print(line)
     fflush(stdout)
     DispatchQueue.main.async {
-      self.report.text = (self.report.text ?? "") + line + "\n"
+      let text = (self.report.text ?? "") + line + "\n"
+      self.report.text = text
+      // The newest line, and at the end the verdict, stays in view.
+      self.report.scrollRangeToVisible(NSRange(location: (text as NSString).length, length: 0))
     }
   }
 }

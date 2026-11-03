@@ -23,8 +23,7 @@ typedef NS_ENUM(NSInteger, ScannerSelfTestKind) {
 + (ScannerSelfTestKind)kindForArguments:(NSArray<NSString*>*)arguments;
 
 /// @brief Run `-self-test hevc` (`HevcSelfTest.hpp`) on the calling thread,
-///        which must not be the main one, between two lines on the device's
-///        thermal state.
+///        which must not be the main one, with the device's thermal state.
 /// @param line  Handed each line of the report as it is made, on the calling
 ///              thread.
 /// @return Whether it passed.

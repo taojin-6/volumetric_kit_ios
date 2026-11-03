@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,15 +35,29 @@ struct RuleCase {
   enum class Result : std::uint8_t {
     Kept,    ///< Every rule held.
     Broken,  ///< A rule broke; @ref detail names it ("C5: ...").
-    /// The run gave a status instead, such as the session's refusal to open;
-    /// @ref detail is its text.
+    /// The session opens, but the run stopped on a status: a decode (C6), a
+    /// send or a receive that failed. @ref detail is its text.
+    Failed,
+    /// The session does not open for the case's options
+    /// (`HevcEncoder::create`'s refusal); @ref detail is its text.
     NotRun,
   };
   std::string name;  ///< The case: size, colour, QP.
   Result result = Result::NotRun;
   std::string detail;    ///< Empty when kept.
   double seconds = 0.0;  ///< The run's wall time.
+  /// Set when the case was run again without the decode
+  /// (@ref rerun_without_decode): that run's result and detail, which say
+  /// whether the encoder's own rules held.
+  std::optional<Result> without_decode;
+  std::string without_decode_detail;
 };
+
+/// @return Whether @p c, run with the decode (C6), is run again without it:
+///         when it failed on a status, which may be the decoder's, or broke
+///         C6. A rule broken before C6 (C1-C5) breaks again without it, and
+///         one broken after it (C7 on) means C6 held.
+bool rerun_without_decode(const RuleCase& c);
 
 /// @brief The encoder's timing on one session, one picture in flight: each
 ///        picture sent, then received before the next.
@@ -61,21 +76,23 @@ struct EncodeTiming {
 ///         0 for none.
 double percentile(std::vector<double> values, double p);
 
-/// @return @p c as one report line.
+/// @return @p c as one report line, ending in "; without C6: " and that
+///         run's result where it was run again without the decode.
 std::string rule_line(const RuleCase& c);
 
 /// @return @p t as report lines: counts, then the send return time, send to
 ///         access unit and access unit bytes at p50, p95 and max.
 std::vector<std::string> timing_lines(const EncodeTiming& t);
 
-/// @return Whether the run passed: at least one case, every case kept, and
-///         the timing coded every picture it sent, with no failure.
+/// @return Whether the run passed: the cases were decoded on a GPU
+///         (@p decoded), at least one case, every case kept, and the timing
+///         coded every picture it sent, with no failure.
 bool self_test_passed(const std::vector<RuleCase>& cases,
-                      const EncodeTiming& timing);
+                      const EncodeTiming& timing, bool decoded);
 
 /// @return The report's last line: PASS or FAIL, with the counts it rests
-///         on.
+///         on, and "none decoded" when not @p decoded.
 std::string verdict_line(const std::vector<RuleCase>& cases,
-                         const EncodeTiming& timing);
+                         const EncodeTiming& timing, bool decoded);
 
 }  // namespace volumetric_kit::ios_app

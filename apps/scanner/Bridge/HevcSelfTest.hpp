@@ -19,19 +19,26 @@
 namespace volumetric_kit::ios_app {
 
 /// @brief Run the self-test on the calling thread (not the main one), which
-///        takes a minute or so.
+///        takes about 20 s (17 s on an M5 Max).
 ///
-/// Its report, line by line, as each is made: the device, the GPU the
-/// decode check (C6) runs on, the encoder's facts, one line per case of
-/// `testing::hevc_encoder_breach` (C1-C8 and C10-C13 on 1920x1440 pixel
-/// buffers: BT.601 at either range, BT.709 centre-sited, the QP ends, and
-/// every colour code and siting in the encoder's set, each decoded back on
-/// the GPU), the timing of one session with one picture in flight
-/// (send return time, send to access unit, access unit bytes), then the
-/// verdict.
+/// Its report, line by line, as each is made: the device and its thermal
+/// state, the GPU the decode check (C6) runs on, the encoder's facts, one
+/// line per case of `testing::hevc_encoder_breach` (C1-C8 and C10-C13 on
+/// 1920x1440 pixel buffers: BT.601 at either range, BT.709 centre-sited, the
+/// QP ends, and every colour code and siting in the encoder's set, each
+/// decoded back on the GPU, and run again without the decode when that is
+/// what failed), the timing of one session with one picture in flight
+/// (send return time, send to access unit, access unit bytes), the thermal
+/// state at the end, then the verdict, last.
 ///
-/// @param line  Handed each line, without a newline, on the calling thread.
-/// @return Whether every case kept the rules and every timed picture coded.
-bool run_hevc_self_test(const std::function<void(const std::string&)>& line);
+/// With no GPU, the GPU's line says why, each case's name ends in
+/// ", no decode", and the verdict fails.
+///
+/// @param line     Handed each line, without a newline, on the calling thread.
+/// @param thermal  The device's thermal state, read when its line is made.
+/// @return Whether the cases were decoded, every case kept the rules and every
+///         timed picture coded.
+bool run_hevc_self_test(const std::function<void(const std::string&)>& line,
+                        const std::function<std::string()>& thermal);
 
 }  // namespace volumetric_kit::ios_app

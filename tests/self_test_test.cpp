@@ -107,6 +107,57 @@ TEST(SelfTestReport, ACaseThatDidNotRunCarriesItsStatus) {
   EXPECT_TRUE(has(line, c.detail));
 }
 
+TEST(SelfTestReport, ARunThatStoppedOnAStatusFailedRatherThanDidNotRun) {
+  RuleCase c = kept_case("1920x1440 BT.601 full");
+  c.result = RuleCase::Result::Failed;
+  c.detail = "Unsupported: HevcDecoder: the device imports no Metal textures";
+  const std::string line = app::rule_line(c);
+  EXPECT_TRUE(has(line, "FAILED"));
+  EXPECT_FALSE(has(line, "NOT RUN"));
+  EXPECT_TRUE(has(line, "2.4 s"));
+  EXPECT_TRUE(has(line, c.detail));
+}
+
+TEST(SelfTestReport, OnlyAFailureOrABrokenC6RunsAgainWithoutTheDecode) {
+  RuleCase c = kept_case("a");
+  EXPECT_FALSE(app::rerun_without_decode(c));
+  c.result = RuleCase::Result::Failed;
+  c.detail = "Backend: decode";
+  EXPECT_TRUE(app::rerun_without_decode(c));
+  c.result = RuleCase::Result::Broken;
+  c.detail = "C6: picture 2 decodes with another matrix, range or siting";
+  EXPECT_TRUE(app::rerun_without_decode(c));
+  c.detail = "C3: picture 1 is not one access unit";  // before C6
+  EXPECT_FALSE(app::rerun_without_decode(c));
+  c.detail = "C7: the key after a drop";  // after C6, which held
+  EXPECT_FALSE(app::rerun_without_decode(c));
+  c.result = RuleCase::Result::NotRun;  // the session does not open
+  c.detail = "Unsupported: no hardware path";
+  EXPECT_FALSE(app::rerun_without_decode(c));
+}
+
+TEST(SelfTestReport, ARunWithoutTheDecodeEndsTheLine) {
+  RuleCase c = kept_case("1920x1440 siting 3");
+  c.result = RuleCase::Result::Failed;
+  c.detail = "Unsupported: HevcDecoder: no import";
+  EXPECT_FALSE(has(app::rule_line(c), "without C6"));
+
+  c.without_decode = RuleCase::Result::Kept;
+  std::string line = app::rule_line(c);
+  EXPECT_TRUE(has(line, "FAILED"));
+  EXPECT_TRUE(
+      has(line, "Unsupported: HevcDecoder: no import; without C6: kept"));
+
+  c.without_decode = RuleCase::Result::Broken;
+  c.without_decode_detail = "C4: the SPS's chroma_loc is 0, not 3";
+  line = app::rule_line(c);
+  EXPECT_TRUE(has(line, "; without C6: C4: the SPS's chroma_loc is 0, not 3"));
+
+  c.without_decode = RuleCase::Result::Failed;
+  c.without_decode_detail = "Backend: lost";
+  EXPECT_TRUE(has(app::rule_line(c), "; without C6: failed: Backend: lost"));
+}
+
 TEST(SelfTestReport, TimingGivesCountsAndSpreads) {
   const auto lines = app::timing_lines(full_timing());
   ASSERT_EQ(lines.size(), 4U);
@@ -135,35 +186,50 @@ TEST(SelfTestReport, TimingNamesItsFailure) {
 
 TEST(SelfTestVerdict, PassesOnlyWhenEveryCaseKeptAndEveryPictureCoded) {
   const std::vector<RuleCase> cases = {kept_case("a"), kept_case("b")};
-  EXPECT_TRUE(app::self_test_passed(cases, full_timing()));
-  EXPECT_TRUE(has(app::verdict_line(cases, full_timing()),
+  EXPECT_TRUE(app::self_test_passed(cases, full_timing(), true));
+  EXPECT_TRUE(has(app::verdict_line(cases, full_timing(), true),
                   "PASS: 2 of 2 cases kept the rules; 4 of 4 timed pictures"));
 
   std::vector<RuleCase> broken = cases;
   broken[1].result = RuleCase::Result::Broken;
   broken[1].detail = "C7: the key after a drop";
-  EXPECT_FALSE(app::self_test_passed(broken, full_timing()));
-  EXPECT_TRUE(
-      has(app::verdict_line(broken, full_timing()), "FAIL: 1 of 2 cases kept"));
+  EXPECT_FALSE(app::self_test_passed(broken, full_timing(), true));
+  EXPECT_TRUE(has(app::verdict_line(broken, full_timing(), true),
+                  "FAIL: 1 of 2 cases kept"));
 
   std::vector<RuleCase> not_run = cases;
   not_run[0].result = RuleCase::Result::NotRun;
-  EXPECT_FALSE(app::self_test_passed(not_run, full_timing()));
+  EXPECT_FALSE(app::self_test_passed(not_run, full_timing(), true));
 
-  EXPECT_FALSE(app::self_test_passed({}, full_timing()));
+  // Kept without the decode, but not with it: still a failure.
+  std::vector<RuleCase> failed = cases;
+  failed[0].result = RuleCase::Result::Failed;
+  failed[0].without_decode = RuleCase::Result::Kept;
+  EXPECT_FALSE(app::self_test_passed(failed, full_timing(), true));
+
+  EXPECT_FALSE(app::self_test_passed({}, full_timing(), true));
+}
+
+TEST(SelfTestVerdict, FailsWithNoGpuThoughEveryCaseKept) {
+  const std::vector<RuleCase> cases = {kept_case("a"), kept_case("b")};
+  EXPECT_FALSE(app::self_test_passed(cases, full_timing(), false));
+  const std::string verdict = app::verdict_line(cases, full_timing(), false);
+  EXPECT_TRUE(has(verdict, "FAIL: 2 of 2 cases kept the rules, none decoded"));
+  EXPECT_TRUE(has(verdict, "4 of 4 timed pictures coded"));
+  EXPECT_FALSE(has(app::verdict_line(cases, full_timing(), true), "decoded"));
 }
 
 TEST(SelfTestVerdict, FailsOnATimingShortfall) {
   const std::vector<RuleCase> cases = {kept_case("a")};
   EncodeTiming lost = full_timing();
   lost.coded = 3;
-  EXPECT_FALSE(app::self_test_passed(cases, lost));
+  EXPECT_FALSE(app::self_test_passed(cases, lost, true));
 
   EncodeTiming failed = full_timing();
   failed.failure = "Backend: lost";
-  EXPECT_FALSE(app::self_test_passed(cases, failed));
+  EXPECT_FALSE(app::self_test_passed(cases, failed, true));
 
-  EXPECT_FALSE(app::self_test_passed(cases, EncodeTiming{}));
+  EXPECT_FALSE(app::self_test_passed(cases, EncodeTiming{}, true));
 }
 
 }  // namespace

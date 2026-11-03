@@ -51,10 +51,9 @@ NSString* thermal_state() {
 }
 
 + (BOOL)runHevcWithLine:(NS_NOESCAPE void (^)(NSString* line))line {
-  line([@"thermal: " stringByAppendingString:thermal_state()]);
   const bool passed = app::run_hevc_self_test(
-      [line](const std::string& text) { line(app::to_ns_string(text)); });
-  line([@"thermal at the end: " stringByAppendingString:thermal_state()]);
+      [line](const std::string& text) { line(app::to_ns_string(text)); },
+      [] { return std::string(thermal_state().UTF8String); });
   return passed ? YES : NO;
 }
 

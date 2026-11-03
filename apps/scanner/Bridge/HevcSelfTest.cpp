@@ -123,8 +123,9 @@ std::vector<Case> cases() {
   return all;
 }
 
-RuleCase run_case(const Case& c, const vkc::Device* device,
-                  vkc::Allocator* allocator) {
+// One run of the rules on @p c, decoded on @p device when it is not null.
+RuleCase run_rules(const Case& c, const vkc::Device* device,
+                   vkc::Allocator* allocator) {
   testing::HevcEncoderCase run;
   run.options = c.options;
   run.device = device;
@@ -137,8 +138,11 @@ RuleCase run_case(const Case& c, const vkc::Device* device,
   const auto broken = testing::hevc_encoder_breach(run);
   out.seconds = ms(Clock::now() - start) / 1000.0;
   if (!broken) {
-    out.result = RuleCase::Result::NotRun;
-    out.detail = said(broken.status());
+    // Not run only where the session itself does not open; any other
+    // status (the decoder's, a send's or a receive's) is a failure.
+    const auto opens = sensor::HevcEncoder::create(c.options);
+    out.result = opens ? RuleCase::Result::Failed : RuleCase::Result::NotRun;
+    out.detail = said(opens ? broken.status() : opens.status());
   } else if (broken->empty()) {
     out.result = RuleCase::Result::Kept;
   } else {
@@ -148,8 +152,23 @@ RuleCase run_case(const Case& c, const vkc::Device* device,
   return out;
 }
 
+// @p c's case, and where the decode may be what failed, the same case again
+// without it, so the encoder's own rules are answered either way.
+RuleCase run_case(const Case& c, const vkc::Device* device,
+                  vkc::Allocator* allocator) {
+  RuleCase out = run_rules(c, device, allocator);
+  if (device != nullptr && rerun_without_decode(out)) {
+    const RuleCase alone = run_rules(c, nullptr, nullptr);
+    out.without_decode = alone.result;
+    out.without_decode_detail = alone.detail;
+  }
+  return out;
+}
+
 // One session, one picture in flight: each picture sent, then received
-// before the next, so send to access unit is the encode's own time.
+// before the next, so send to access unit bounds the encode's own time from
+// above (it includes the hand-off to the coding thread and the receive's
+// wake-up).
 EncodeTiming time_encoder() {
   EncodeTiming t;
   t.what = std::to_string(kWidth) + "x" + std::to_string(kHeight) +
@@ -209,16 +228,17 @@ EncodeTiming time_encoder() {
 
 }  // namespace
 
-bool run_hevc_self_test(const Line& line) {
+bool run_hevc_self_test(const Line& line,
+                        const std::function<std::string()>& thermal) {
   line(
       "self-test hevc: sensor's HEVC encoder rules on synthetic 1920x1440 "
       "pixel buffers; no camera, no file, no network");
   line("device: " + sysctl_text("hw.machine") + ", OS " +
        sysctl_text("kern.osproductversion"));
+  line("thermal: " + thermal());
 
   // The GPU the decode check (C6) runs on, with what sensor's decoder needs.
   // Declared in order, so they go in reverse.
-  std::vector<RuleCase> results;
   std::optional<vkc::Instance> instance;
   std::optional<vkc::Device> device;
   std::optional<vkc::Allocator> allocator;
@@ -243,14 +263,13 @@ bool run_hevc_self_test(const Line& line) {
          (device->extension_enabled("VK_EXT_metal_objects") ? "on" : "off"));
     return vkc::Status{};
   }();
-  if (!gpu.ok()) {
+  // Without it the cases still run, so the encoder's own rules are answered,
+  // and the verdict fails.
+  const bool decoded = gpu.ok();
+  if (!decoded) {
     allocator.reset();
     device.reset();
-    RuleCase none;
-    none.name = "a Vulkan device for C6 (left out)";
-    none.detail = said(gpu);
-    line(rule_line(none));
-    results.push_back(std::move(none));
+    line("GPU: none, so no case decodes (C6 left out): " + said(gpu));
   }
 
   // The session's own facts: its encoder, and the configuration it reports,
@@ -261,9 +280,10 @@ bool run_hevc_self_test(const Line& line) {
   } else {
     line("encoder: does not open: " + said(probe.status()));
   }
-  line("buffer copy: not stated (the session's facts name none)");
 
-  for (const Case& c : cases()) {
+  std::vector<RuleCase> results;
+  for (Case c : cases()) {
+    if (!decoded) c.name += ", no decode";
     results.push_back(run_case(c, device ? &*device : nullptr,
                                allocator ? &*allocator : nullptr));
     line(rule_line(results.back()));
@@ -271,8 +291,9 @@ bool run_hevc_self_test(const Line& line) {
 
   const EncodeTiming timing = time_encoder();
   for (const std::string& l : timing_lines(timing)) line(l);
-  line(verdict_line(results, timing));
-  return self_test_passed(results, timing);
+  line("thermal at the end: " + thermal());
+  line(verdict_line(results, timing, decoded));
+  return self_test_passed(results, timing, decoded);
 }
 
 }  // namespace volumetric_kit::ios_app

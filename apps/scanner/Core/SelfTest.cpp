@@ -25,6 +25,22 @@ std::string spread(const std::vector<double>& values, int decimals) {
   return text;
 }
 
+// The tail of a case's line for its run without the decode.
+std::string without_decode_text(RuleCase::Result result,
+                                const std::string& detail) {
+  switch (result) {
+    case RuleCase::Result::Kept:
+      return "kept";
+    case RuleCase::Result::Broken:
+      return detail;  // the rule's own name leads it ("C3: ...")
+    case RuleCase::Result::Failed:
+      return "failed: " + detail;
+    case RuleCase::Result::NotRun:
+      return "not run: " + detail;
+  }
+  return "not run: " + detail;
+}
+
 std::size_t kept(const std::vector<RuleCase>& cases) {
   return static_cast<std::size_t>(std::count_if(
       cases.begin(), cases.end(),
@@ -51,17 +67,34 @@ double percentile(std::vector<double> values, double p) {
   return values[std::min(at, values.size() - 1)];
 }
 
+bool rerun_without_decode(const RuleCase& c) {
+  return c.result == RuleCase::Result::Failed ||
+         (c.result == RuleCase::Result::Broken &&
+          c.detail.rfind("C6:", 0) == 0);
+}
+
 std::string rule_line(const RuleCase& c) {
+  const std::string timed = c.name + " (" + seconds_text(c.seconds) + ")";
+  std::string line;
   switch (c.result) {
     case RuleCase::Result::Kept:
-      return "kept     " + c.name + " (" + seconds_text(c.seconds) + ")";
+      line = "kept     " + timed;
+      break;
     case RuleCase::Result::Broken:
-      return "BROKEN   " + c.name + " (" + seconds_text(c.seconds) +
-             "): " + c.detail;
+      line = "BROKEN   " + timed + ": " + c.detail;
+      break;
+    case RuleCase::Result::Failed:
+      line = "FAILED   " + timed + ": " + c.detail;
+      break;
     case RuleCase::Result::NotRun:
-      return "NOT RUN  " + c.name + ": " + c.detail;
+      line = "NOT RUN  " + c.name + ": " + c.detail;
+      break;
   }
-  return "NOT RUN  " + c.name + ": " + c.detail;
+  if (c.without_decode) {
+    line += "; without C6: " +
+            without_decode_text(*c.without_decode, c.without_decode_detail);
+  }
+  return line;
 }
 
 std::vector<std::string> timing_lines(const EncodeTiming& t) {
@@ -79,17 +112,19 @@ std::vector<std::string> timing_lines(const EncodeTiming& t) {
 }
 
 bool self_test_passed(const std::vector<RuleCase>& cases,
-                      const EncodeTiming& timing) {
-  return !cases.empty() && kept(cases) == cases.size() && timing.sent > 0 &&
-         timing.coded == timing.sent && timing.failure.empty();
+                      const EncodeTiming& timing, bool decoded) {
+  return decoded && !cases.empty() && kept(cases) == cases.size() &&
+         timing.sent > 0 && timing.coded == timing.sent &&
+         timing.failure.empty();
 }
 
 std::string verdict_line(const std::vector<RuleCase>& cases,
-                         const EncodeTiming& timing) {
+                         const EncodeTiming& timing, bool decoded) {
   return std::string("self-test hevc: ") +
-         (self_test_passed(cases, timing) ? "PASS" : "FAIL") + ": " +
+         (self_test_passed(cases, timing, decoded) ? "PASS" : "FAIL") + ": " +
          std::to_string(kept(cases)) + " of " + std::to_string(cases.size()) +
-         " cases kept the rules; " + std::to_string(timing.coded) + " of " +
+         " cases kept the rules" + (decoded ? "" : ", none decoded (no GPU)") +
+         "; " + std::to_string(timing.coded) + " of " +
          std::to_string(timing.sent) + " timed pictures coded";
 }
 
