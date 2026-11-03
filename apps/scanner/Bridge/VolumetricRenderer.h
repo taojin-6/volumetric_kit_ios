@@ -578,11 +578,6 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @ref beginStopFusion for the non-blocking half and why the two are split.
 - (void)stopFusion;
 
-/// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
-/// stays reachable because when the mesh first renders wrong, being able to A/B
-/// against a known-good draw is worth more than the code it costs.
-@property(nonatomic) BOOL drawMesh;
-
 /// How far a vertex may sit from the current frame's depth reading and still be
 /// textured, in metres. Default 0.02.
 ///

@@ -23,6 +23,7 @@
 // to Fusion.hpp's copy, on this file's own rule about transitive includes.
 #import "GrowthPolicy.hpp"
 #import "MemoryQuery.hpp"
+#import "MeshHandoff.hpp"
 #import "OrbitCamera.hpp"
 #import "Readout.hpp"
 #import "RendererErrors.hpp"
@@ -518,6 +519,15 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // frame is still reading -- and the ring is what makes that impossible rather
   // than merely unlikely.
   fusion_config.mesh_slots = app::RendererImpl::kMeshSlots;
+  // How this renderer reads the meshes, which the exchange checks each one
+  // against before handing it over: the frame loop's own depth, and the
+  // sharing mode the two families need. grid collapses the families below to
+  // EXCLUSIVE where they are one, which is correct there and refused here
+  // where they are not.
+  fusion_config.consumer.frames_in_flight =
+      _impl->app.frame_loop().frames_in_flight();
+  fusion_config.consumer.cross_family =
+      _impl->shared->graphics_family() != _impl->shared->compute_family();
   // Both families, always. Under the two-families plan a phone actually gets,
   // grid and sensor write these buffers and images on one and gfx reads them on
   // the other, and an EXCLUSIVE buffer read by a family that does not own it is
@@ -572,120 +582,41 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // one dumped 24 empty lines and none of the frames that could have caused it.
   app::FrameTrace::Entry& trace = _impl->trace.begin_frame_entry();
 
-  // Take the newest mesh, if fusion published one since the last upload. Never
-  // wait for it: the render loop draws the previous mesh rather than stalling,
-  // which is what keeps presentation smooth while a remesh is in flight.
+  // Retire this slot's last frame (begin_frame waited for it), release what no
+  // frame in flight still reads, and take the newest mesh: grid's exchange,
+  // keyed on the frame loop's slot. Never waits: with nothing new the live
+  // mesh is drawn again, which keeps presentation smooth while a remesh runs.
+  // The buffers are the extractor's own, drawn in place.
   //
-  // Take the newest mesh, if fusion published one since the last. Nothing is
-  // uploaded and nothing is copied: interop seam B hands over the extractor's
-  // own VkBuffers, which the draw below reads in place. What used to be here
-  // was a ~53 MB download plus a blocking one-shot upload, every remesh, for
-  // geometry that never left the device.
-  std::optional<app::Fusion::Published> fresh;
-  if (!_impl->mesh_unusable) {
-    fresh = _impl->fusion.take_mesh(_impl->uploaded_version);
-  }
-  if (fresh) {
-    const vgrid::mesh::DeviceMesh& m = fresh->mesh;
-    // Every generation take_mesh hands over becomes this renderer's to release,
-    // drawn or not -- recorded before the test below so the release logic can
-    // still retire one it refuses to draw.
-    _impl->newest_taken_generation = m.generation;
-    // Advanced whichever way the test goes. It used to move only on the
-    // accepting branch, so a mesh that could not be bound was re-taken on every
-    // following tick: a 60 Hz storm of release calls and failure counts that
-    // never terminated, which made the "! upload xN" banner a tick counter
-    // rather than a count of anything.
-    _impl->uploaded_version = fresh->version;
-
-    // Verified, not assumed. grid reports the usage *and the sharing mode* its
-    // buffers were actually created with precisely because Vulkan cannot be
-    // asked, and binding one that lacks a usage bit is a validation-layer-only
-    // diagnostic -- undefined behaviour in the shipping configuration, which is
-    // this one.
-    //
-    // The sharing mode is the term that can actually vary here, and the one
-    // with the most at stake: reading an EXCLUSIVE buffer from a family that
-    // does not own it is undefined outright, where a missing usage bit is at
-    // least a diagnostic -- and on Apple, where Metal has no queue-ownership
-    // concept, it is undefined in the way that appears to work. Checked only
-    // when the families actually differ, which is what the queue plan decides
-    // at bring-up and what -initWithLayer: passes to Fusion::start; grid
-    // collapses the pair to EXCLUSIVE wherever they are the same family, and
-    // that is correct rather than a failure.
-    const bool cross_family =
-        _impl->shared->graphics_family() != _impl->shared->compute_family();
-    const bool sharing_ok =
-        !cross_family || m.sharing_mode == VK_SHARING_MODE_CONCURRENT;
-    const bool bindable =
-        m.valid() && sharing_ok &&
-        (m.vertex_usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) != 0 &&
-        (m.index_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0 &&
-        (m.indirect_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
-    if (bindable) {
-      // A slot per frame in flight, holding the *generation* rather than the
-      // geometry: the buffers are grid's, and this only has to remember which
-      // one to release once this frame's fence has signalled.
-      _impl->mesh_slot = (_impl->mesh_slot + 1) % app::RendererImpl::kMeshSlots;
-      _impl->mesh_slots[_impl->mesh_slot] = m;
-      _impl->have_mesh = true;
-
-      // --- Publish the keyframe this mesh's uv0 index into -----------------
-      //
-      // Into the SAME slot the mesh just went into. They are one value: the
-      // uv0 recon wrote address this particular picture, so a mesh drawn
-      // against any other keyframe samples the wrong place on every textured
-      // triangle -- and the result looks like a plausible photograph of
-      // somewhere else, not like an error.
-      //
-      // Every mesh rebinds its slot, textured or not and drawn or not: a mesh
-      // without a keyframe binds white and lets the slot's old picture go, so
-      // the ring never holds a camera picture longer than its slot's mesh. The
-      // rebind is a descriptor write and a 32-byte uniform; the picture itself
-      // is sampled where the camera left it. The slot was last bound by a frame
-      // that has retired (see kMeshSlots), and this frame binds it only below.
-      const vkc::Status bound = app::bind_keyframe(
-          _impl->atlas.slots[_impl->mesh_slot], std::move(fresh->keyframe),
-          _impl->atlas_texture.view());
-      if (!bound.ok()) {
-        // Not fatal and not latched: the mesh still draws, with its textured
-        // triangles white, and the next mesh tries again. Its own counter, not
-        // the mesh-upload pair: that one latches and means the geometry is
-        // undrawable forever. See `atlas_failures`.
-        ++_impl->atlas_failures;
-        _impl->atlas_error = std::string(bound.message());
-      }
-      // The message is deliberately NOT cleared here. `mesh_upload_failures` is
-      // a running total like every other counter on this read-out, and clearing
-      // only the message left the banner gated on a count that never resets:
-      // one transient failure followed by a recovery read "! upload x1: " --
-      // for the rest of the process, an alarm with no content. Count and reason
-      // stay together, so the line means "this happened N times, most recently
-      // for this reason" whether or not it is still happening.
-    } else {
-      // Deliberately *not* released here. release_through is a monotonic
-      // high-water mark, so handing it this generation would retire every older
-      // one with it -- including the generation this very frame goes on to
-      // draw, since have_mesh and mesh_slot still name it. grid would then be
-      // free to claim that slot, and a grow frees its buffers outright, under a
-      // live draw. The ordinary in-flight logic below retires it instead, which
-      // by construction never releases past something still being read.
-      //
-      // Latched, because this cannot heal: the usage bits come from two
-      // constants in Fusion::start and the sharing mode from the queue plan, so
-      // a mesh that is unusable once is unusable every time. Collecting the
-      // ones that follow would only walk grid's ring to exhaustion, one
-      // undrawable generation at a time, and bury the reason under a count.
-      _impl->mesh_unusable = true;
-      ++_impl->mesh_upload_failures;
-      _impl->mesh_upload_error =
-          sharing_ok
-              ? "mesh is not bindable as geometry (usage bits or handles "
-                "missing)"
-              : "mesh buffers are VK_SHARING_MODE_EXCLUSIVE but grid and gfx "
-                "are on different queue families; binding them would be "
-                "undefined";
-    }
+  // The commit binds the mesh's keyframe into the next keyframe slot -- every
+  // mesh, textured or not, so the ring never holds a camera picture longer than
+  // its mesh -- and commits whatever the bind says (commit_keyframe). A
+  // keyframe that cannot be bound leaves its textured triangles white and is
+  // counted on its own, not latched: the mesh-upload pair means the geometry
+  // can never be drawn, this one is retryable. Neither message is cleared on a
+  // later success: a count and its last reason stay together.
+  app::Fusion::MeshExchange& meshes = _impl->fusion.meshes();
+  const vgrid::mesh::ExchangeOutcome outcome = meshes.begin_frame(
+      f.slot, [&](const vgrid::mesh::DeviceMesh&, app::Keyframe& keyframe) {
+        return app::commit_keyframe(
+            _impl->atlas.slots, _impl->atlas_slot, std::move(keyframe),
+            [&](app::AtlasSlot& slot, app::Keyframe picture) {
+              const vkc::Status bound = app::bind_keyframe(
+                  slot, std::move(picture), _impl->atlas_texture.view());
+              if (!bound.ok()) {
+                ++_impl->atlas_failures;
+                _impl->atlas_error = std::string(bound.message());
+              }
+            });
+      });
+  if (outcome == vgrid::mesh::ExchangeOutcome::kRefused) {
+    // Latched by the exchange, because this cannot heal: the usage bits come
+    // from two constants in Fusion::start and the sharing mode from the queue
+    // plan. Nothing more is taken, so the fuse thread stops extracting rather
+    // than walking grid's ring through undrawable meshes.
+    ++_impl->mesh_upload_failures;
+    _impl->mesh_upload_error =
+        std::string("mesh cannot be bound as geometry: ") + meshes.refused();
   }
 
   vg::RenderTargetBeginInfo begin{};
@@ -739,67 +670,11 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   }
   _impl->camera.set_device_pose(device_pose);
 
-  const bool draw_mesh = _impl->draw_mesh && _impl->have_mesh;
-
-  // --- Retire the generations no frame in flight is reading any more --------
-  //
-  // Outside the draw branch, and that placement is the correction rather than a
-  // tidy-up: every release the consumer owes grid used to sit inside
-  // `if (draw_mesh)`, so setting the public `drawMesh` property to NO stopped
-  // all of them permanently. The renderer went on collecting meshes --
-  // take_mesh runs regardless, and marking one taken is exactly what stops
-  // fusion reusing its slot -- released nothing, and after kMeshSlots extracts
-  // grid refused every one that followed. Turning drawing back on could not
-  // recover it either: the renderer only ever released what it drew, and by
-  // then it could no longer obtain anything to draw.
-  //
-  // Park the generation this frame draws -- zero when it draws none -- then
-  // release everything strictly older than the oldest generation any frame
-  // still in flight is reading.
-  //
-  // Releasing "what the frame that just retired drew" is what this used to
-  // do, and it is wrong whenever one generation spans more than one frame --
-  // which is the normal case, not a corner: mesh_slot advances only when
-  // take_mesh yields a *new* mesh, so at 60 Hz with a remesh every few fused
-  // frames the same generation is drawn many frames running. Two frames in
-  // flight then both hold it, begin_frame has waited on only the older one's
-  // fence, and releasing on that fence hands grid a slot the newer frame is
-  // still reading. grid is then free to pick it -- and a grow *frees* its
-  // buffers outright, so the in-flight draw reads a destroyed VkBuffer. That
-  // is a GPU fault surfacing as VK_ERROR_DEVICE_LOST out of the next
-  // vkWaitForFences, and it needs the arena to actually grow, which is why it
-  // only shows up once the scan gets large.
-  //
-  // The min is over the whole array because every entry names a frame still
-  // in flight once the current one is recorded; anything older than all of
-  // them is finished everywhere. release_through is a monotonic high-water
-  // mark, so a repeated or lower value is harmless.
-  const std::size_t recording =
-      _impl->frame_slot % app::RendererImpl::kFramesInFlight;
-  _impl->frame_generations[recording] =
-      draw_mesh ? _impl->mesh_slots[_impl->mesh_slot].generation : 0;
-  ++_impl->frame_slot;
-
-  std::uint64_t oldest_in_flight = 0;
-  for (const std::uint64_t g : _impl->frame_generations) {
-    if (g != 0 && (oldest_in_flight == 0 || g < oldest_in_flight)) {
-      oldest_in_flight = g;
-    }
-  }
-  // Generations are pre-incremented from 0, so 1 is the first real one and
-  // there is nothing below it to release. An all-zero array means no frame in
-  // flight holds a generation at all -- drawing is off, or nothing has been
-  // drawn yet -- and then everything collected so far is finished by
-  // definition. That fallback is the only thing that drains the ring while
-  // drawMesh is NO, and the only thing that lets it refill when it goes back
-  // on.
-  const std::uint64_t released_through = oldest_in_flight > 0
-                                             ? oldest_in_flight - 1
-                                             : _impl->newest_taken_generation;
-  if (released_through > 0) {
-    _impl->fusion.release_through(released_through);
-  }
-  trace.released_through = released_through;
+  // The live mesh: drawn when it has buffers and triangles. An empty one may
+  // name null buffers and draws nothing; before the first commit the frame
+  // draws the bring-up triangle.
+  const vgrid::mesh::DeviceMesh& live_src = meshes.live();
+  const app::LiveDraw live_draw = app::live_draw(live_src);
 
   // Fusion's half of the entry, outside the draw branch.
   //
@@ -811,10 +686,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // latched upload failure. `arena_bytes` carries a reading
   // instruction on FrameTrace::Entry -- compare it against the previous entry
   // -- and a phantom drop to 0 at every drew=1 -> drew=0 boundary breaks
-  // exactly the comparison that would find the use-after-free described above.
-  //
-  // The same placement mistake as the release logic thirty lines up, which sat
-  // inside this branch until it stopped grid reusing anything at all.
+  // exactly the comparison that would find a draw from a freed, grown arena.
   //
   // The narrow accessor, not stats(): this runs every frame, and FusionStats
   // carries a std::string whose copy would malloc inside the mutex the fuse
@@ -835,12 +707,10 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   trace.ms_since_fuse = fused.ms_since_fuse;
   trace.extract_ms = fused.extract_ms;
 
-  if (draw_mesh) {
+  if (live_draw == app::LiveDraw::kMesh) {
     // grid's buffers, named rather than copied. LiveMesh owns nothing and
     // reads the index count GPU-side out of the indirect command, so the count
     // never crosses the CPU either.
-    const vgrid::mesh::DeviceMesh& live_src =
-        _impl->mesh_slots[_impl->mesh_slot];
     vg::pipelines::LiveMesh live;
     live.vertices = live_src.vertices;
     live.indices = live_src.indices;
@@ -850,7 +720,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // The three fields that are genuinely about the mesh this frame drew.
     trace.drew_mesh = true;
     trace.generation = live_src.generation;
-    trace.mesh_slot = _impl->mesh_slot;
+    trace.atlas_slot = _impl->atlas_slot;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is
     // just as reachable as a zero height -- an orientation change, an iPad
@@ -888,14 +758,14 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     // Either the device pose or the turntable, depending on whether the user
     // has taken the camera over.
     frame_info.view_proj = proj * _impl->camera.view();
-    // The keyframe belonging to the mesh this frame is about to draw, indexed
-    // by `mesh_slot` because the two are one value -- see AtlasSlot. Always
-    // bindable: a slot's set names its held picture or the white texture.
-    frame_info.atlas = _impl->atlas.slots[_impl->mesh_slot].set->set();
+    // The keyframe belonging to the mesh this frame is about to draw, bound
+    // by its commit -- the two are one value. Always bindable: a slot's set
+    // names its held picture or the white texture.
+    frame_info.atlas = _impl->atlas.slots[_impl->atlas_slot].set->set();
     frame_info.draws = &draw;
     frame_info.draw_count = 1;
     _impl->mesh_pipeline->submit(f.cmd, frame_info);
-  } else {
+  } else if (live_draw == app::LiveDraw::kBringUp) {
     vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       _impl->pipeline.handle());
 
@@ -1023,19 +893,6 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // After the join, never before: the thread dereferences the capture handle
   // this retain keeps alive.
   _capture = nil;
-}
-
-// Written out rather than left to auto-synthesis. A `@property` with no
-// accessors gets an ivar of its own, so `renderer.drawMesh = NO` would set a
-// field nothing reads and leave `_impl->draw_mesh` at its default -- silently
-// disabling the one A/B this app has for telling a dead render path from
-// misplaced geometry.
-- (BOOL)drawMesh {
-  return _impl->draw_mesh;
-}
-
-- (void)setDrawMesh:(BOOL)drawMesh {
-  _impl->draw_mesh = drawMesh;
 }
 
 - (float)textureOcclusionThreshold {

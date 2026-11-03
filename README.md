@@ -290,7 +290,10 @@ compute side's requirements -- grid's, recon's and sensor's, merged with
 side: sensor, grid and recon share one `vkc::Device::adopt` of the shared
 device's `compute_payload()`, gfx goes through `WindowedApp::adopt` with its
 `graphics_payload()`. A `VkBuffer` is valid only on the device that made
-it, so the zero-copy mesh handoff needs the one device.
+it, so the zero-copy mesh handoff needs the one device. That handoff is grid's
+`MeshExchange`, keyed on gfx's frame slot, with each mesh's keyframe as its
+payload: the renderer draws the extractor's buffers in place and releases them
+as its frames retire.
 
 The app used to keep its own copy of this bootstrap, beside recon's desktop
 viewer's; both now use the core's, which owns the parts a copy loses quietly --

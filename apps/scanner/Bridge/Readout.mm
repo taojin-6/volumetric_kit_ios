@@ -678,9 +678,7 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     add(r, @"resident",
         fmt("%.0f MB across %u slots", s.extract.arena_bytes / mb,
             s.mesh_slots));
-    add(r, @"version",
-        fmt("v%u after %llu remeshes", s.mesh_version,
-            (unsigned long long)s.remeshes));
+    add(r, @"remeshes", fmt("%llu", (unsigned long long)s.remeshes));
     // `pass` rather than `dispatch`: the number is how many times the surface
     // was meshed, and `dispatch` is a duration on the latency bars. Read it as
     // cost, not as a verdict on the capacity planner -- the refit triggers

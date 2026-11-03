@@ -48,7 +48,6 @@
 #include "volumetric_kit/gfx/core/shader.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_pipeline.hpp"
 #include "volumetric_kit/gfx/pipelines/hybrid_mesh_texture_set.hpp"
-#include "volumetric_kit/grid/mesh/device_mesh.hpp"
 #include "volumetric_kit/sensor/frame/vector_types.hpp"
 
 namespace volumetric_kit::ios_app {
@@ -70,9 +69,7 @@ namespace sensor = volumetric_kit::sensor;
 //      allocator belongs to `app`. So `atlas_texture` and `atlas`, whose slots
 //      each hold a texture set with a uniform from `app.allocator()`, must be
 //      declared *after* `app` to be destroyed *before* it. Those two, and the
-//      pipelines and shaders above them -- not `mesh_slots`, which is borrowed
-//      views of grid's buffers and allocates nothing here, so its position is
-//      unconstrained either way.
+//      pipelines and shaders above them.
 //   2. gfx warns that resources destroyed while the frame loop still has frames
 //      in flight referencing them is VUID-vkDestroyPipeline-pipeline-00765 and
 //      friends. Rule 1 puts them in exactly that position.
@@ -110,21 +107,18 @@ struct RendererImpl {
 
   // --- Render state (plain values; destruction order does not matter) -------
   std::uint64_t frames_presented = 0;
-  std::uint32_t uploaded_version = 0;
-  bool have_mesh = false;
-  bool draw_mesh = true;
-  // Failures of the mesh upload, which is the one stage with no Status to
-  // propagate: it happens on the render thread, after fusion has already
-  // reported success. Without these a mesh that never reaches the GPU reads as
-  // a rising vertex count next to a frozen screen.
+  // A mesh the exchange refused to hand over, which is the one stage with no
+  // Status to propagate: it happens on the render thread, after fusion has
+  // already reported success. Without these a mesh that never reaches the GPU
+  // reads as a rising vertex count next to a frozen screen.
   std::uint64_t mesh_upload_failures = 0;
   std::string mesh_upload_error;
   // The atlas path's own counter and reason, deliberately NOT the pair above.
   //
   // They report opposite things and sharing one channel made them
-  // indistinguishable. `mesh_upload_failures` has exactly one other writer,
-  // which latches `mesh_unusable` first, so it fires once per process and means
-  // "the geometry can never be drawn". The atlas path does not latch -- a ring
+  // indistinguishable. The exchange latches its refusal, so
+  // `mesh_upload_failures` counts once per scan and means "the geometry can
+  // never be drawn". The atlas path does not latch -- a ring
   // refusal is degraded rendering, not a dead one -- so on a persistent failure
   // it counts at frame rate, and every iteration overwrote the shared message.
   // A genuine unbindable-mesh fault arriving afterwards had its reason erased
@@ -174,83 +168,33 @@ struct RendererImpl {
   // white.
   vkc::Image atlas_texture;
 
-  // A ring, not one slot: replacing a GpuMesh the GPU may still be reading is a
-  // use-after-free, and at per-frame meshing that would be every frame. One
-  // slot more than the frames in flight means a mesh uploaded now is untouched
-  // again by the time the ring comes back round -- the cheap version of the
-  // mesh-slot ring the interop decision describes, and no wait_idle per frame.
-  //
-  // Derived from kFramesInFlight rather than written as a literal, which is the
-  // whole correctness argument: a mesh must outlive every frame that can still
-  // be reading it. The literal 3 held only because gfx's WindowedAppConfig
-  // happens to default frames_in_flight to 2 -- a value in another repo that
-  // nothing here set or read.
-  // +1, which is both what grid's `slot_count` prescribes ("the consumer's
-  // frames in flight plus one") and what the ring now needs. The extra slot was
-  // buying headroom around two ordering faults on the producing side, since
-  // fixed in Fusion::remesh: the consumer's release was applied *after* the
-  // extract it exists to make room for, so the ring always ran a slot shallower
-  // than its depth, and a mesh nobody had collected was published over rather
-  // than left alone, which put a third generation outstanding at once.
-  //
-  // With both gone the outstanding set is exactly the generations named in
-  // frame_generations plus the one being extracted. Each slot is a full vertex
-  // arena that never shrinks, so the padding was not free -- against the arena
-  // sizes this app reaches, it was a few hundred megabytes resident to cover an
-  // ordering choice.
+  // grid's mesh ring depth (FusionConfig::mesh_slots): one slot more than the
+  // frames in flight, which is what grid's `slot_count` prescribes for a
+  // producer that does not extract while a mesh waits to be taken. Each slot
+  // is a full vertex arena that never shrinks, so it is not padded further.
   //
   // What binds gfx to kFramesInFlight is one assignment in a *different*
   // translation unit: `config.frames_in_flight = RendererImpl::kFramesInFlight`
-  // in VolumetricRenderer.mm's -initWithLayer:. Reading this header alone does
-  // not show it, and deleting it as redundant hands the depth silently back to
-  // gfx's default -- so a sibling raising that default then overwrites a mesh
-  // slot a frame is still reading. Nothing here can check that the assignment
-  // exists; the static_assert below covers the half that is visible, which is
-  // that the two rings stay as deep as the pipeline they serve.
+  // in VolumetricRenderer.mm's -initWithLayer:. Deleting it as redundant hands
+  // the depth silently back to gfx's default, which this ring would then be
+  // too shallow for. The static_assert below keeps the keyframe ring as deep.
   static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
-  // The atlas ring is indexed by `mesh_slot`, so the two rings are one depth.
   // AtlasRing.hpp declares its arrays and so has to state that depth; this is
   // what stops the two drifting apart silently, in either direction.
   static_assert(kMeshSlots == kRingSlots,
-                "the atlas ring is indexed by mesh_slot, so it must be exactly "
-                "as deep as the mesh ring");
-  // The meshes in flight -- borrowed views of grid's buffers, not storage.
-  // Copying one is copying a few handles.
-  vgrid::mesh::DeviceMesh mesh_slots[kMeshSlots];
-  // The generation each in-flight frame drew. Read as a *set*: what may be
-  // released is everything older than the oldest entry, not the entry belonging
-  // to the frame that just retired -- one generation is normally drawn by
-  // several consecutive frames, so the retired frame's generation is often
-  // still being read by a newer one. begin_frame's fence wait is the only
-  // completion signal gfx gives (no fence is exposed, and no semaphore may
-  // cross the seam), and it says a frame finished, not that a generation did.
-  std::uint64_t frame_generations[kFramesInFlight] = {};
-  std::size_t frame_slot = 0;
-  std::size_t mesh_slot = 0;
+                "the atlas ring holds a keyframe per mesh slot, so it must be "
+                "exactly as deep as the mesh ring");
 
-  /// The keyframes the textured mesh samples, one per @ref mesh_slot, each
-  /// holding its camera picture until the slot is rebound.
+  /// The keyframes the textured mesh samples, one per committed mesh round the
+  /// ring, each holding its camera picture until the slot is rebound.
   ///
   /// Declared here, after `app`, because its slots own gfx texture sets: rule 1
   /// of the teardown note above. The pictures are images sensor imported on
   /// `compute_device`, which is declared before both and outlives them.
   AtlasRing atlas;
-  // The newest generation take_mesh has handed over, drawn or not. What the
-  // release logic falls back to when *no* frame is holding a generation: the
-  // per-frame minimum says nothing then, and without this the generations taken
-  // while drawing was off were never released at all -- `drawMesh = NO`
-  // exhausted grid's ring within kMeshSlots extracts and turning drawing back
-  // on could not recover, because the renderer only released what it drew and
-  // could no longer obtain anything to draw.
-  std::uint64_t newest_taken_generation = 0;
-  // Latched when a published mesh cannot be bound as geometry. That is a
-  // configuration fault, not a transient: the usage bits come from two
-  // constants in Fusion::start and the sharing mode from the queue plan, so a
-  // mesh that is unusable once is unusable every time. Latching stops the
-  // renderer collecting meshes it cannot draw -- which at 60 Hz was a storm of
-  // failure counts, and which would otherwise walk grid's ring to exhaustion
-  // one uncollectable generation at a time.
-  bool mesh_unusable = false;
+  /// The slot of @ref atlas the live mesh's keyframe is bound in, advanced by
+  /// every commit (`commit_keyframe`).
+  std::size_t atlas_slot = 0;
   // Diagnostic only: what the last few frames drew, dumped when a device loss
   // (or any begin_frame failure) is detected. See FrameTrace.
   FrameTrace trace;

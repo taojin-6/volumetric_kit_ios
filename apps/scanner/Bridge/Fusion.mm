@@ -138,8 +138,8 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   if (config.mesh_slots < kMinMeshSlots) {
     return vkc::Status::invalid_argument(
         "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
-        ", which switches grid's slot-release contract off; Published::mesh "
-        "borrows the extractor's buffers, so it needs at least " +
+        ", which switches grid's slot-release contract off; the renderer "
+        "draws the extractor's buffers in place, so it needs at least " +
         std::to_string(kMinMeshSlots) +
         " (and the consumer's frames in flight "
         "plus one to actually pipeline).");
@@ -188,47 +188,13 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     // long the app sat between scans. Only the counter needs clearing; the
     // entries themselves become unreachable once it is zero.
     history_next_ = 0;
-    // With the same reasoning: a new scan must not hand out the previous one's
-    // keyframe.
-    published_keyframe_ = sensor::YuvImage{};
-    // ...and the mesh half with it, which is the same argument and the more
-    // dangerous omission. Clearing only the keyframe left the pair internally
-    // asymmetric: `mesh_` still named the *previous* scan's DeviceMesh, whose
-    // buffers belong to a MarchingCubes that `marching_cubes_.emplace()` below
-    // is about to replace. A renderer whose `uploaded_version` was stale would
-    // take that mesh on its next frame -- a destroyed VkBuffer under a live
-    // vkCmdDrawIndexedIndirect, which on this configuration is a device loss
-    // with no validation message.
-    //
-    // `consumer_released_` goes too, and for its own reason: it is a monotonic
-    // high-water mark over the *old* extractor's generations, and carrying it
-    // into a new one would hand grid a release covering slots the fresh
-    // extractor has not written yet on its very first remesh.
-    //
-    // `published_taken_ = true` rather than false -- it is the member's own
-    // default and it means "nothing outstanding", which is exactly the state a
-    // scan starts in. False would claim a mesh is waiting to be collected.
-    mesh_ = vgrid::mesh::DeviceMesh{};
-    published_generation_ = 0;
-    published_taken_ = true;
-    consumer_released_ = 0;
-    // `mesh_version_` deliberately NOT reset, and it is the one member here
-    // where resetting is worse than keeping. It is a change-detection token,
-    // not a per-scan count: `take_mesh` returns nothing when it equals the
-    // version the caller already has. Restart it at zero and the new scan's
-    // first publish can land on a number the renderer is still holding from the
-    // old one -- take_mesh then says "nothing new", and the renderer goes on
-    // drawing the previous scan's DeviceMesh, which is precisely the
-    // use-after-free the rest of this block exists to prevent. Monotonic across
-    // scans, it cannot collide.
-    //
-    // Note this block can only clear what *this* object owns. A renderer that
-    // has already taken a mesh keeps naming those buffers until its next
-    // successful take, so a genuine mid-session restart also needs the consumer
-    // to drop what it holds. Nothing wires that today because `start` is called
-    // exactly once, from -initWithLayer: -- which is a property of the caller,
-    // not of this method, and is why the rest of this is worth doing now.
   }
+  // A new exchange, before the extractor it hands out is replaced below: the
+  // last scan's pending and live meshes, its keyframes and its release mark
+  // all name the old extractor's slots. Nothing may be in the renderer's
+  // begin_frame meanwhile; `start` runs once, from -initWithLayer:, before the
+  // first frame.
+  exchange_.emplace(config.consumer);
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
   // one-way latch, so a scan that carried it in would report the *next* scan's
@@ -1273,53 +1239,13 @@ void Fusion::fuse(const CapturedFrame& frame) {
 }
 
 void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
-  // --- Hand the consumer's release to grid, on this thread ------------------
-  //
-  // `MarchingCubes::release_through` is not atomic, and its header makes
-  // serializing it against the extracting thread a caller obligation: calling
-  // it concurrently with an `extract_device` on the same object is a data race,
-  // and a stale read of the mark makes `claim_output_slot` refuse with "every
-  // output slot is still outstanding" -- which then freezes the occupancy guard
-  // in `fuse` and is self-sustaining. So `Fusion::release_through` only records
-  // the mark, and it is applied here, on the fuse thread. Nothing else in this
-  // class touches the extractor, so grid sees exactly one thread.
-  //
-  // *Before* the extract, not after. This release is what makes room for the
-  // extract below; running it afterwards kept the ring permanently one slot
-  // shallower than its depth suggests, and on a failing extract the early
-  // return skipped it altogether -- stranding the slot whose absence caused the
-  // failure, which is how the ring stalled for good.
-  std::uint64_t consumer_released = 0;
-  bool uncollected = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    consumer_released = consumer_released_;
-    uncollected = !published_taken_ && published_generation_ != 0;
-  }
-  if (consumer_released != 0) {
-    marching_cubes_->release_through(consumer_released);
-  }
-
-  // --- Do not publish over a mesh nobody collected --------------------------
-  //
-  // It still holds its slot, and freeing that slot is not something this side
-  // can do: `release_through` is a monotonic high-water mark, so releasing the
-  // uncollected generation retires every *older* one with it -- including the
-  // generations the renderer's in-flight frames are drawing out of. grid
-  // reclaims one, a grow frees its buffers outright (`vmaDestroyBuffer`, no
-  // fence wait), and the live `vkCmdDrawIndexedIndirect` reads a destroyed
-  // VkBuffer: VK_ERROR_DEVICE_LOST, which is the fault this seam was built to
-  // remove. grid does have a single-slot primitive for this and keeps it
-  // private (`free_slot_of`), precisely because the high-water mark is the
-  // consumer's to move and not the producer's.
-  //
-  // So the uncollected mesh is left where it is and this extract simply does
-  // not run. Its result would have been thrown away regardless, so the skip
-  // costs nothing and saves the dispatch -- and it is what lets the ring be the
-  // consumer's frames in flight plus one instead of plus two. The renderer
-  // collects on every frame it draws, so in the steady state this skips at most
-  // one remesh.
-  if (uncollected) {
+  // The renderer's release, applied to the extractor on this thread -- the
+  // only one that touches it -- before the extract it makes room for. While
+  // the last mesh waits to be taken this extract does not run: publishing over
+  // it would supersede it, and its slot then waits for a later commit, which
+  // is the extra slot the ring does not have (see FusionConfig::mesh_slots).
+  // The renderer takes on every frame, so this skips at most a remesh or two.
+  if (!exchange_->release_and_may_publish(*marching_cubes_)) {
     return;
   }
 
@@ -1339,10 +1265,10 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   // host round trip between the two GPU tiers. The current frame is the
   // keyframe, i.e. the live single-camera path (recon's 2026-07-07 decision).
   //
-  // On now, and both halves it used to wait on are built: Published carries the
-  // keyframe beside the mesh and the renderer holds a ring of keyframes
-  // indexed by the same slot. See FusionConfig::texture -- including its
-  // warning that the flag being on is not the same as the pass running.
+  // On now, and both halves it used to wait on are built: the exchange carries
+  // the keyframe with the mesh and the renderer binds it as it commits the
+  // mesh. See FusionConfig::texture -- including its warning that the flag
+  // being on is not the same as the pass running.
   float texture_ms = 0.0f;
   // The tolerance this remesh actually ran at, read once and published with the
   // result. Read once rather than twice because it is turnable mid-scan: the
@@ -1423,24 +1349,14 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
     keyframe = sensor::YuvImage{};
   }
 
-  // No host copy of the GEOMETRY. The renderer draws those very buffers --
-  // interop seam B --
-  // so the ~53 MB round trip per remesh that seam A cost is simply not here.
-  // What replaces it is the release contract handled at the top of this
-  // function: the slot this mesh lives in is not extracted into again until the
-  // consumer says it has finished with it.
-  std::lock_guard<std::mutex> lock(mutex_);
+  // No host copy of the GEOMETRY: the renderer draws these very buffers, and
+  // their slot is not extracted into again until its release says so. Every
+  // extract is published, an empty one included -- it holds a slot all the
+  // same -- with its keyframe, which has no planes when this remesh did not
+  // texture.
+  exchange_->publish(device_mesh.value(), std::move(keyframe));
 
-  mesh_ = device_mesh.value();
-  published_generation_ = device_mesh.value().generation;
-  published_taken_ = false;
-  // Published together, under one lock, because they are one value: `uv0` is
-  // a coordinate into *this* keyframe. Replaced by one with no planes when this
-  // remesh did not texture, so a consumer cannot bind the previous keyframe
-  // against a mesh whose uv0 are all sentinel.
-  published_keyframe_ = std::move(keyframe);
-  ++mesh_version_;
-  stats_.mesh_version = mesh_version_;
+  std::lock_guard<std::mutex> lock(mutex_);
   ++stats_.remeshes;
   stats_.vertices = device_mesh.value().vertex_count;
   stats_.triangles = device_mesh.value().triangle_count;
@@ -1476,50 +1392,6 @@ void Fusion::remesh(const CapturedFrame& frame, vkc::StageMetrics* metrics) {
   stats_.texture_state = texture_state;
   stats_.occlusion_threshold = threshold;
   stats_.keyframe_import_ms = keyframe_import_ms;
-}
-
-std::optional<Fusion::Published> Fusion::take_mesh(
-    std::uint32_t known_version) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  // The validity check does double duty: nothing has been meshed yet, or this
-  // version has already been taken.
-  if (mesh_version_ == known_version || !mesh_.valid()) {
-    return std::nullopt;
-  }
-  // Copied, not moved -- it is a handful of handles and counts now, and the
-  // buffers it names stay the extractor's. The consumer must call
-  // release_through once the frames drawing them retire; marking it taken here
-  // is what stops the next publish releasing a slot the renderer is using.
-  published_taken_ = true;
-
-  Published out;
-  out.mesh = mesh_;
-  out.version = mesh_version_;
-  // The keyframe travels with the mesh or not at all. A caller that got a mesh
-  // and had to ask separately for its keyframe could pair a mesh with the
-  // *next* remesh's picture, which is the one failure this pairing exists to
-  // make unrepresentable -- every textured triangle would sample the wrong
-  // place. Moved, not copied: the consumer holds the picture from here, and a
-  // copy kept here would hold a camera buffer nothing will sample again.
-  out.keyframe = std::move(published_keyframe_);
-  published_keyframe_ = sensor::YuvImage{};
-  return out;
-}
-
-void Fusion::release_through(std::uint64_t generation) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  // Recorded, not forwarded. grid's extractor is touched by the fuse thread
-  // and only the fuse thread; `remesh` applies this at the top of its next run.
-  // Forwarding from here would race `extract_device` -- grid's header names
-  // that a caller obligation rather than making the member atomic -- and the
-  // repair that would keep the call here, holding this mutex across the
-  // extract, blocks the caller for a whole extract. The caller is the render
-  // thread, which on this app is the main thread.
-  //
-  // Monotonic, matching the contract it stands in for: a generation already
-  // released stays released, and a value older than the newest reported is
-  // ignored rather than un-releasing anything.
-  consumer_released_ = std::max(consumer_released_, generation);
 }
 
 bool Fusion::set_occlusion_threshold(float metres) {

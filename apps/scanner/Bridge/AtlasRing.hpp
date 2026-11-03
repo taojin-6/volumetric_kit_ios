@@ -10,8 +10,9 @@
 /// its two planes imported by sensor's `PixelBufferImporter` and sampled by
 /// gfx's texture set, with no copy. A ring rather than one set for the same
 /// reason the mesh slots are a ring: a slot's set is rewritten, and its old
-/// picture let go, only once no pending frame has bound it. Indexed by
-/// `mesh_slot`, since a mesh and the keyframe its `uv0` address are one value.
+/// picture let go, only once no pending frame has bound it. Each committed
+/// mesh binds its keyframe into the next slot (`commit_keyframe`), since a
+/// mesh and the keyframe its `uv0` address are one value.
 
 #include <cstddef>
 #include <memory>
@@ -52,7 +53,7 @@ struct AtlasSlot {
 ///          `WindowedApp` that made them. See the teardown note on
 ///          @ref RendererImpl.
 struct AtlasRing {
-  /// Indexed by `mesh_slot`.
+  /// Indexed by the renderer's `atlas_slot`.
   AtlasSlot slots[kRingSlots];
 };
 

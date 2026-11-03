@@ -8,18 +8,18 @@
 ///
 /// Owns the per-scan state — grid's sparse block grid and marching cubes,
 /// recon's TSDF integrator and projective texturer — and turns polled
-/// `CapturedFrame`s into a host mesh the renderer draws. The desktop
-/// `fuse_viewer` is the reference; this is that loop with ARKit in place of a
-/// Replica sequence.
+/// `CapturedFrame`s into meshes the renderer draws in place, handed over
+/// through grid's `MeshExchange`. The desktop `fuse_viewer` is the reference;
+/// this is that loop with ARKit in place of a Replica sequence.
 ///
 /// @warning **No cross-library GPU wait.** iOS gives one queue in the family,
 ///          so the compute libraries and gfx submit through one mutex — and
 ///          gfx's `Swapchain::recreate` drains via `Device::wait_idle`, which
 ///          takes that mutex *and then* waits on the queue. Any command buffer
 ///          waiting on a value the sibling has not signalled yet deadlocks
-///          against a rotation. So the handoff here is a **host mesh** (interop
-///          seam A): readiness is checked on the host and a not-ready frame is
-///          skipped, never waited on.
+///          against a rotation. So the handoff is decided on the host: an
+///          extract has completed before it is published, and the renderer's
+///          release follows its own fence waits.
 
 #include <atomic>
 #include <chrono>
@@ -50,6 +50,7 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/grid/mesh/marching_cubes.hpp"
 #include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/mesh/mesh_exchange.hpp"
 #include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/texture/projective_texturer.hpp"
 #include "volumetric_kit/recon/tsdf/tsdf_integrator.hpp"
@@ -190,10 +191,10 @@ struct FusionConfig {
   bool measure_stages = true;
   /// Project the current keyframe onto the mesh after each remesh.
   ///
-  /// **On**, and both halves it used to wait on are now built:
-  /// @ref Fusion::Published carries the keyframe alongside the mesh -- the
-  /// camera picture itself, imported where it is -- and the renderer holds a
-  /// ring of keyframes indexed by the same slot as the mesh.
+  /// **On**, and both halves it used to wait on are now built: the mesh
+  /// exchange carries the keyframe with the mesh -- the camera picture itself,
+  /// imported where it is -- and the renderer binds it into its keyframe ring
+  /// as it commits the mesh.
   ///
   /// What it does: after each remesh, `ProjectiveTexturer` projects the current
   /// frame into the mesh and writes a real `uv0` for every vertex it can see
@@ -276,7 +277,7 @@ struct FusionConfig {
   ///
   /// One is grid's own default and means a single arena reused in
   /// place, with `release_through` recording a number and changing no
-  /// behaviour -- but every @ref Published::mesh here is a *borrowed*
+  /// behaviour -- but every mesh the exchange hands over is a *borrowed*
   /// @ref vgrid::mesh::DeviceMesh, so at one slot the next extract overwrites
   /// the buffers an in-flight draw is reading, and a grow frees them outright
   /// (`vmaDestroyBuffer`, no fence wait). That is silent geometry corruption or
@@ -285,9 +286,19 @@ struct FusionConfig {
   ///
   /// Two only *arms* the contract. A consumer drawing these buffers has to size
   /// it to its own frames in flight plus one, which is what the renderer passes
-  /// (`RendererImpl::kMeshSlots`). Each slot costs a full vertex arena, so
-  /// higher is not free -- see grid's `slot_count`.
+  /// (`RendererImpl::kMeshSlots`): this producer never extracts while a mesh
+  /// waits to be taken, so it needs no second extra slot
+  /// (`MeshExchangeConfig::frames_in_flight`). Each slot costs a full vertex
+  /// arena, so higher is not free -- see grid's `slot_count`.
   std::uint32_t mesh_slots = 2;
+
+  /// @brief How the renderer reads the meshes: its frames in flight, whether
+  ///        it reads them from another queue family than the compute one, and
+  ///        the usage it binds them with.
+  ///
+  /// The exchange @ref Fusion::start makes is built on it, so it checks every
+  /// mesh it hands over against what the renderer will do with it.
+  vgrid::mesh::MeshExchangeConfig consumer{};
 
   /// @brief The queue families that will touch the mesh buffers and the
   ///        keyframes' plane images; the compute device's own family among
@@ -479,7 +490,6 @@ struct FusionStats {
   std::uint64_t remeshes = 0;
   std::uint32_t vertices = 0;
   std::uint32_t triangles = 0;
-  std::uint32_t mesh_version = 0;
   /// Host spans around the allocate and the integrate, measured on every fused
   /// frame whatever @ref FusionConfig::measure_stages says.
   ///
@@ -611,7 +621,7 @@ struct FusionStats {
   /// read-out. That is the same class of gap this diff exists to close, one
   /// struct over. recon's own `fuse_viewer` holds it whole for the same reason.
   /// Costs nothing new: marching_cubes.hpp is already included above, and
-  /// @ref Published already exposes a `vgrid::mesh::DeviceMesh` publicly.
+  /// @ref Fusion::meshes already exposes a `vgrid::mesh::DeviceMesh` publicly.
   ///
   /// Where @ref extract_ms goes. The phases are worth the read-out space
   /// because they have *nothing* in common as optimisation targets and the
@@ -916,9 +926,8 @@ struct FusionTraceStats {
 
 /// @brief Fuses captured frames into a volume and extracts a drawable mesh.
 ///
-/// Single-threaded from the caller's side: one thread calls @ref fuse, another
-/// reads @ref take_mesh. The mesh is published under a lock and versioned, so
-/// the render thread can tell "nothing new" from "a new mesh" without copying.
+/// Single-threaded from the caller's side: one thread calls @ref fuse, and the
+/// render thread takes the meshes through @ref meshes.
 class Fusion {
  public:
   Fusion() = default;
@@ -953,82 +962,23 @@ class Fusion {
   /// surface rather than looking at it.
   sensor::Mat4f last_pose() const;
 
-  /// @brief Take the mesh if it is newer than @p known_version.
+  /// @brief The handoff of each remesh to the renderer: the extractor's own
+  ///        buffers, borrowed, with the keyframe their `uv0` index into.
   ///
-  /// The mesh is **moved** out, so a second call for the same version returns
-  /// nothing even though the version has not advanced. That is the intended
-  /// contract: the caller uploads what it takes before returning, and the next
-  /// remesh republishes.
-  ///
-  /// @return The mesh and its version, or nothing when unchanged or taken.
-  /// @brief A remesh's two halves, which are one value.
-  ///
-  /// `uv0` is a normalized coordinate into the image of the camera that
-  /// textured it, and @ref texture rewrites every vertex's `uv0` on every call
-  /// against the *current* frame. So a mesh and the keyframe it indexes are
-  /// only meaningful together: draw a mesh against a later frame's image and
-  /// every textured triangle samples the wrong place. They are published,
-  /// versioned, and taken as one.
-  struct Published {
-    /// The extractor's own buffers, borrowed. Nothing is copied to the host at
-    /// all -- this is interop seam B, and the ~53 MB round trip per remesh that
-    /// seam A cost is exactly what it removes.
-    ///
-    /// Valid until its slot is reused, which cannot happen before the consumer
-    /// releases it: see @ref release_through.
-    vgrid::mesh::DeviceMesh mesh;
-    std::uint32_t version = 0;
-    /// @brief The keyframe @ref mesh's `uv0` index into: the camera picture
-    ///        the mesh was textured from, its two planes imported as images
-    ///        where the camera left them, with the matrix, range and chroma
-    ///        siting it was coded with -- or no planes when this mesh was not
-    ///        textured.
-    ///
-    /// The second half of the pair this struct's own documentation describes:
-    /// a mesh and the picture its `uv0` address are only meaningful together,
-    /// and drawing one against a later frame's picture samples the wrong place
-    /// everywhere it was textured.
-    ///
-    /// The images hold the camera's pixel buffer, so the picture stays as long
-    /// as the consumer holds this; @ref take_mesh hands it over and keeps no
-    /// copy. The capture's writer has finished with it, so sampling it waits on
-    /// nothing.
-    ///
-    /// No planes whenever the import or the texture pass did not succeed: a
-    /// refusal leaves `uv0` at the sentinel, so no coordinate points at a
-    /// keyframe the consumer never has, and @ref FusionStats::texture_state
-    /// says which happened.
-    sensor::YuvImage keyframe;
-  };
+  /// The payload is the camera picture the mesh was textured from, its two
+  /// planes imported where the camera left them -- or no planes when the
+  /// import or the texture pass did not succeed, which leaves `uv0` at the
+  /// sentinel (@ref FusionStats::texture_state says which happened). A mesh
+  /// and its picture travel as one value, so a mesh is never drawn against a
+  /// later frame's picture.
+  using MeshExchange = vgrid::mesh::MeshExchange<sensor::YuvImage>;
 
-  std::optional<Published> take_mesh(std::uint32_t known_version);
-
-  /// @brief Report that every mesh up to @p generation has been drawn, so its
-  ///        slot may be extracted into again.
+  /// @brief The exchange this scan's meshes come through, for the renderer's
+  ///        half of it (`begin_frame`, `live`, `refused`) on its own thread.
   ///
-  /// The consumer half of the ring. Call it as the frames that drew a
-  /// @ref Published::mesh retire -- for the render loop, once the frame's fence
-  /// has signalled.
-  ///
-  /// Host-side, and that is the whole design rather than a simplification: a
-  /// semaphore the extract waited on would deadlock against a swapchain
-  /// rebuild, which drains the queue while holding the submit mutex (see the
-  /// warning at the top of this file). Reporting completion after the fact
-  /// cannot.
-  ///
-  /// Takes grid's @ref vgrid::mesh::DeviceMesh::generation, not @ref
-  /// Published::version -- the two number different things, and the ring is
-  /// grid's.
-  ///
-  /// **This records the mark; it does not hand it to grid.** The fuse thread
-  /// applies it at the top of its next remesh, which is what keeps grid's
-  /// extractor single-threaded. `MarchingCubes::release_through` is not atomic
-  /// and its header makes serializing it against the extracting thread a caller
-  /// obligation -- calling it from here would race `extract_device` on the fuse
-  /// thread, and the obvious repair (hold the publish mutex across the extract)
-  /// would block this thread, the *main* thread, for the length of a whole
-  /// extract. Deferring costs at most one remesh of latency and no lock at all.
-  void release_through(std::uint64_t generation);
+  /// One per @ref start, which makes it before the first remesh; call only
+  /// after a successful start, and not across a later one.
+  MeshExchange& meshes() noexcept { return *exchange_; }
 
   /// @brief Record a failure raised *outside* @ref fuse -- the fuse thread's
   ///        exception guard -- so it reaches the read-out like any other.
@@ -1135,45 +1085,18 @@ class Fusion {
   std::optional<vr::tsdf::TsdfIntegrator> integrator_;
   std::optional<vgrid::mesh::MarchingCubes> marching_cubes_;
   std::optional<vr::texture::ProjectiveTexturer> texturer_;
+  // The handoff to the renderer, made by every start(): it can neither move
+  // nor reset, and the last scan's live mesh names buffers of the extractor
+  // start() replaces.
+  std::optional<MeshExchange> exchange_;
 
   std::uint64_t captured_ = 0;
 
   mutable std::mutex mutex_;
-  // The published view of the extractor's buffers -- handles and counts, not
-  // bytes. Copying it is copying five words.
-  vgrid::mesh::DeviceMesh mesh_;
-  std::uint32_t mesh_version_ = 0;
-  // grid's generation for the mesh currently published, and whether anyone has
-  // taken it. Fusion outruns the render loop routinely -- it remeshes every
-  // fused frame -- so a mesh can be superseded before the renderer ever asks
-  // for it, and that mesh still holds a slot.
-  //
-  // What `remesh` does about it is *not extract*. Publishing over it and
-  // releasing the old generation is the obvious move and it is unsound: grid's
-  // release_through is a monotonic high-water mark, so releasing the untaken
-  // generation also retires every older one -- including the generation the
-  // renderer's in-flight frames are still drawing out of. grid has a
-  // single-slot primitive for this (`free_slot_of`) and keeps it private,
-  // precisely because the high-water mark is the consumer's to move.
-  //
-  // Skipping costs nothing: the extract that would have been thrown away is
-  // simply not run, so the ring never needs the extra slot and the GPU never
-  // does the work. The renderer takes every frame it draws, so the skip lasts
-  // one frame in the steady state.
-  std::uint64_t published_generation_ = 0;
-  bool published_taken_ = true;
   /// Imports each textured frame's camera picture as two plane images,
   /// shared with the renderer's queue family. Made in @ref start when
   /// texturing is on, and used on the fuse thread alone.
   std::optional<sensor::PixelBufferImporter> importer_;
-  /// The keyframe the published mesh indexes into, until @ref take_mesh hands
-  /// it over; no planes when the last remesh did not texture. Guarded by
-  /// @ref mutex_ with the mesh it belongs to -- see @ref Published::keyframe.
-  sensor::YuvImage published_keyframe_;
-  // The consumer's high-water mark, recorded by @ref release_through and handed
-  // to grid by the fuse thread at the top of the next remesh. See that method:
-  // this indirection is what keeps grid's extractor single-threaded.
-  std::uint64_t consumer_released_ = 0;
   // `stats_.frames_fused` as of the last extract that published a breakdown,
   // and whether one ever has. These fed the occupancy guard too, until it moved
   // to VoxelHashMap::load_factor -- a reading that cannot go stale, so the

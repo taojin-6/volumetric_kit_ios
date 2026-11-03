@@ -34,13 +34,13 @@ void FrameTrace::dump(const char* why) const {
     char line[384];
     std::snprintf(
         line, sizeof(line),
-        "f=%llu drew=%d gen=%llu slot=%zu released<=%llu tris=%u/%u "
+        "f=%llu drew=%d gen=%llu atlas=%zu tris=%u/%u "
         "arena=%llu blocks=%u occ=%s alloc=%s fuse=%.0fms extract=%.1fms",
         static_cast<unsigned long long>(e.frame), e.drew_mesh ? 1 : 0,
-        static_cast<unsigned long long>(e.generation), e.mesh_slot,
-        static_cast<unsigned long long>(e.released_through), e.triangles,
-        e.triangle_capacity, static_cast<unsigned long long>(e.arena_bytes),
-        e.active_blocks, occupancy, allocation_stop_tag(e.stop),
+        static_cast<unsigned long long>(e.generation), e.atlas_slot,
+        e.triangles, e.triangle_capacity,
+        static_cast<unsigned long long>(e.arena_bytes), e.active_blocks,
+        occupancy, allocation_stop_tag(e.stop),
         static_cast<double>(e.ms_since_fuse),
         static_cast<double>(e.extract_ms));
     os_log_error(OS_LOG_DEFAULT, "vk-trace: %{public}s", line);

@@ -36,6 +36,7 @@ add_executable(
   growth_policy_test.cpp
   keyframe_binding_test.cpp
   memory_budget_test.cpp
+  mesh_handoff_test.cpp
   orbit_camera_test.cpp
   picture_slot_test.cpp
   self_test_test.cpp
