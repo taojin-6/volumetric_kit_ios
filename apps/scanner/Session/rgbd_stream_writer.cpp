@@ -37,6 +37,8 @@ namespace wire = sensor::wire;
 
 namespace {
 
+using Clock = std::chrono::steady_clock;
+
 // A sensor on its own clock takes the session's clock 1; one sensor a session.
 constexpr std::uint16_t kDeviceClock = 1;
 // How often the dial thread looks whether the served reader is still there.
@@ -102,12 +104,17 @@ struct RgbdStreamWriter::Impl {
   std::condition_variable link_wake;
   std::string host;  // the target; empty dials none
   std::uint16_t port = 0;
-  std::uint64_t generation = 0;  // one up each time the target is set
+  std::uint64_t generation = 0;  // one up each time the target moves
+  // A connect (open or dial_to) wants a dial now, not at the redial time; the
+  // dial under way, or the next, answers it.
+  bool dial_now = false;
+  Clock::time_point last_dial{};  // when the last dial started
   std::uint64_t dial_failures = 0;
   bool no_route = false;
   // A second descriptor of the served reader's socket, to let it go: the
   // server owns the first, and closes it only as the reader leaves or fails.
   core::UniqueFd reader;
+  Clock::time_point served_at{};  // when `reader` was served
   bool stopping = false;
   std::thread dialer;
 
@@ -148,6 +155,7 @@ core::Status RgbdStreamWriter::Impl::serve(core::UniqueFd connected) try {
   }
   VKC_TRY(server->add_viewer(std::move(connected)));
   reader = std::move(copy);
+  served_at = Clock::now();
   return {};
 } catch (...) {
   return core::exception_status("RgbdStreamWriter: serve",
@@ -157,8 +165,19 @@ core::Status RgbdStreamWriter::Impl::serve(core::UniqueFd connected) try {
 void RgbdStreamWriter::Impl::dial_loop() noexcept try {
   std::unique_lock<std::mutex> lock(link_mutex);
   while (!stopping) {
-    // The served reader has ended (left, failed or stalled): its end goes now.
-    if (reader.valid() && server->viewers() == 0) let_go(&reader);
+    const Clock::time_point now = Clock::now();
+    if (reader.valid()) {
+      if (server->viewers() == 0) {
+        // The served reader has ended (left, refused the session, failed or
+        // stalled): its end goes now. One served for less than kRedialWait
+        // counts as a failed dial, so a reader that refuses every connection
+        // reads as retrying.
+        let_go(&reader);
+        if (now - served_at < kRedialWait) ++dial_failures;
+      } else if (now - served_at >= kRedialWait) {
+        dial_failures = 0;  // a reader that stays ends the failures' run
+      }
+    }
     if (host.empty() && server->viewers() == 0) {
       link_wake.wait(lock);  // until a target, or the stop
       continue;
@@ -167,14 +186,24 @@ void RgbdStreamWriter::Impl::dial_loop() noexcept try {
       link_wake.wait_for(lock, kWatch);  // a reader served, or going
       continue;
     }
+    // At most one dial a kRedialWait, however the last ended; a connect
+    // dials at once.
+    if (!dial_now && now < last_dial + kRedialWait) {
+      link_wake.wait_until(lock, last_dial + kRedialWait,
+                           [&] { return stopping || dial_now; });
+      continue;
+    }
     const std::uint64_t dialled = generation;
     const std::string to = host;
     const std::uint16_t at = port;
+    last_dial = now;
     lock.unlock();
     core::Result<core::UniqueFd> fd = net::dial(to, at, kDialLimit);
     lock.lock();
-    // Stopped, or the target moved meanwhile: the socket closes unserved.
+    // Stopped, or the target moved meanwhile: the socket closes unserved,
+    // and the new target is dialled at once.
     if (stopping || dialled != generation) continue;
+    dial_now = false;  // a connect to this target while it ran: answered
     const core::Status served =
         fd.ok() ? serve(std::move(fd).value()) : fd.status();
     if (served.ok()) {
@@ -183,8 +212,6 @@ void RgbdStreamWriter::Impl::dial_loop() noexcept try {
     }
     ++dial_failures;
     no_route = is_no_route(served);
-    link_wake.wait_for(lock, kRedialWait,
-                       [&] { return stopping || dialled != generation; });
   }
 } catch (...) {
   // Only copying the target allocates: out of memory, the dialling ends, and
@@ -275,6 +302,7 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
     const std::lock_guard<std::mutex> lock(impl->link_mutex);
     impl->host = options.dial_host;
     impl->port = options.dial_port;
+    impl->dial_now = true;
     VKC_TRY(impl->start_link());
   }
   return std::unique_ptr<RgbdStreamWriter>(
@@ -405,10 +433,15 @@ core::Status RgbdStreamWriter::dial_to(const std::string& host,
     if (host.empty() && !s.server) return {};  // no link, and none wanted
     if (!host.empty()) VKC_TRY(s.start_link());
     const bool moved = host != s.host || (!host.empty() && port != s.port);
-    if (moved) let_go(&s.reader);
+    if (moved) {
+      // A dial under way to the last target is let go as it ends.
+      let_go(&s.reader);
+      ++s.generation;
+    }
     s.host = host;
     s.port = host.empty() ? 0 : port;
-    ++s.generation;
+    // The same target keeps a served reader, and a dial under way to it.
+    s.dial_now = !host.empty() && !s.reader.valid();
     s.dial_failures = 0;
     s.no_route = false;
   }

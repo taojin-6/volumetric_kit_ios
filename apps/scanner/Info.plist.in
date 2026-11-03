@@ -53,7 +53,7 @@
   <!-- The live link dials the address typed on screen. iOS asks before the
        first connect to the local network, and until access is allowed it
        answers "No route to host", which the link shows as "allow Local
-       Network"; the link keeps dialling, which keeps the prompt up. -->
+       Network"; the link keeps dialling. -->
   <key>NSLocalNetworkUsageDescription</key>
   <string>Scanner sends its scan to the computer whose address you enter.</string>
   <key>UIRequiredDeviceCapabilities</key>

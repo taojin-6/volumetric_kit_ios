@@ -85,8 +85,9 @@ final class LinkModel: ObservableObject {
     case .retrying:
       return "Retrying \(target): \(dialFailures) dials failed."
     case .needsLocalNetwork:
-      return "No route to \(target). Allow Local Network access: Settings › "
-        + "Privacy & Security › Local Network › Scanner."
+      return "No route to \(target). If iOS asked, allow Local Network access "
+        + "(Settings › Privacy & Security › Local Network › Scanner); "
+        + "otherwise check the address."
     @unknown default:
       return "Link state unknown."
     }

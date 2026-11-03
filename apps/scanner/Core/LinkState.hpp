@@ -26,18 +26,20 @@ enum class LinkState {
   Dialing,
   /// A reader is being served.
   Connected,
-  /// Dials to the reader failed; the link dials again each second.
+  /// Dials to the reader failed, or readers it reached left at once; the link
+  /// dials again each second.
   Retrying,
   /// The last dial found no route to the host, as iOS answers until the app
-  /// is allowed Local Network access. The link goes on dialling, which keeps
-  /// iOS's prompt up; the screen asks the person to allow it.
+  /// is allowed Local Network access. The link goes on dialling; the screen
+  /// asks the person to allow it.
   NeedsLocalNetwork,
 };
 
 /// @brief The state of a link.
 /// @param target         Whether a reader is named (a host is set).
 /// @param viewers        Readers served now.
-/// @param dial_failures  Dials failed since the target was last set.
+/// @param dial_failures  Dials failed in a row
+///                       (`RgbdStreamStats::dial_failures`).
 /// @param no_route       The last dial found no route to the host.
 /// @return Off without a target; Connected while a reader is served, however
 ///         dials went before; else Dialing before any failure, then

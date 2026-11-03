@@ -116,14 +116,14 @@ self-hosted Mac (label `mac`).
 no decode and no device, to a file, to a live reader, or both. Live, it dials
 and listens on nothing: grid's `StreamServer` serves with no listener, and a
 thread of the writer's dials the reader (`core::net::dial`) and hands it the
-socket, dialling again each second while no reader is served. A joining
-reader asks for a key (`key_wanted`); `dial_to` moves the link, or ends it,
-within the one session. `parse_dial_entry` reads the on-screen entry with the
-core's checks. Its tests write a fake sensor's frames, read the file back with
-grid's reader, and read the link on 127.0.0.1 through grid's `StreamClient` on
-a core `Listener`, as the lab does. The pose and rate rules it is fed through
-are `vi_core`'s: `MapSteps` takes ARKit's map steps out of every pose and logs
-them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
+socket, dialling again at most once a second while no reader is served. A
+joining reader asks for a key (`key_wanted`); `dial_to` moves the link, or
+ends it, within the one session. `parse_dial_entry` reads the on-screen entry
+with the core's checks. Its tests write a fake sensor's frames, read the file
+back with grid's reader, and read the link on 127.0.0.1 through grid's
+`StreamClient` on a core `Listener`, as the lab does. The pose and rate rules
+it is fed through are `vi_core`'s: `MapSteps` takes ARKit's map steps out of
+every pose and logs them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
 
 It exists because **everything else here is build-only by nature**: MoltenVK
 ships no simulator slice and ARKit scene depth needs LiDAR, so nothing that
@@ -308,10 +308,11 @@ The dashboard's first card, on iPad and iPhone, names the reader the scanner
 dials: an IPv4 address (or `address:port`) and a port, empty for 47801, both
 remembered between launches. Connect dials it, Disconnect lets it go, and the
 line beneath says what the link does: dialling, connected, retrying with the
-failed count, or, on "No route to host", allow Local Network access. iOS
-answers a connect to the local network so until the person allows it, and
-keeps its prompt up only while the app keeps trying, which the link does each
-second. A refused entry shows the core's reason under the fields. The session
+failed count, or, on "No route to host", allow Local Network access if iOS
+asked, or check the address. iOS answers a connect to the local network so
+until the person allows it. The link dials again at most once a second, also
+after a reader that refuses the session; Connect dials at once. A refused
+entry shows the core's reason under the fields. The session
 opens at the first connect and lasts while the app runs, so a reconnect, to
 the same reader or another, is the same session. This build sends the session
 alone: it describes ARKit's depth camera as the capture last converted it, and

@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "dial_entry.hpp"
 #include "fake_rgbd_sensor.hpp"
 #include "rgbd_stream_writer.hpp"
 #include "session_test_support.hpp"
@@ -266,8 +267,9 @@ TEST(RgbdStreamLink, DialToMovesTheLinkAndAnEmptyHostLetsTheReaderGo) {
   expect_same_records(got, read.records, 8);
 }
 
-/// A reader that leaves is dialled again, and gets the same session; depth
-/// alone is track 0, every record a key, so a joiner starts at the next.
+/// A reader that leaves after a while is dialled again, and gets the same
+/// session; depth alone is track 0, every record a key, so a joiner starts at
+/// the next.
 TEST(RgbdStreamLink, ItRedialsAReaderThatLeft) {
   auto listener = listen_or_fail();
   ASSERT_NE(listener, nullptr);
@@ -289,7 +291,9 @@ TEST(RgbdStreamLink, ItRedialsAReaderThatLeft) {
   EXPECT_EQ(got[0].info.track, 0u);
   EXPECT_EQ(reader->session()->tracks.size(), 1u);
 
-  reader.reset();  // the reader leaves
+  // The reader leaves after a while, so no dial has failed.
+  std::this_thread::sleep_for(app::kRedialWait + 100ms);
+  reader.reset();
   ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 0; }));
   reader = take_reader(*listener);
   ASSERT_NE(reader, nullptr);
@@ -303,10 +307,83 @@ TEST(RgbdStreamLink, ItRedialsAReaderThatLeft) {
   EXPECT_EQ(writer->stats().frames, 2u);
 }
 
+/// A reader that takes the session and closes at once, as one does that
+/// refuses a session other than its first, is dialled again no more than
+/// once a second, and each counts as a failed dial; a reader that stays a
+/// second starts the count again from 0.
+TEST(RgbdStreamLink, AReaderThatLeavesAtOnceIsDialledOnceASecond) {
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = options_for("");
+  options.color = false;
+  options.dial_host = kLoopback;
+  options.dial_port = listener->port();
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+
+  int connections = 0;
+  const auto end = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < end) {
+    auto fd = listener->accept(50ms);
+    if (!fd.ok() || !fd.value().valid()) continue;
+    ++connections;
+    auto reader = networking::StreamClient::adopt(std::move(fd).value());
+    if (!reader.ok()) continue;
+    const auto read_by = std::chrono::steady_clock::now() + 500ms;
+    stream::Record record;
+    while (reader.value()->session() == nullptr &&
+           std::chrono::steady_clock::now() < read_by) {
+      if (!reader.value()->next(10ms, &record, nullptr).ok()) break;
+    }
+    EXPECT_NE(reader.value()->session(), nullptr);
+  }  // each reader closes once it has the session
+  EXPECT_GE(connections, 2);
+  EXPECT_LE(connections, 4);  // at 0, 1 and 2 s, and perhaps at 3
+  EXPECT_LE(writer->stats().key_wanted, 4u);
+  EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures >= 2; }));
+
+  auto reader = take_reader(*listener);  // one that stays
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
+  EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures == 0; }));
+  EXPECT_EQ(writer->stats().viewers, 1u);
+}
+
+/// A connect to the target already served keeps its reader: no second dial,
+/// and the reader goes on reading every record.
+TEST(RgbdStreamLink, DialToTheServedTargetKeepsTheReader) {
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = options_for("");
+  options.color = false;
+  options.dial_host = kLoopback;
+  options.dial_port = listener->port();
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+  const FakeRgbdSensor camera(info, kArkitNs);
+
+  auto reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
+  ASSERT_TRUE(writer->append(camera.frame(0), nullptr).ok());
+  ASSERT_TRUE(writer->dial_to(kLoopback, listener->port()).ok());
+  ASSERT_TRUE(writer->append(camera.frame(1), nullptr).ok());
+  EXPECT_EQ(take_reader(*listener, 1500ms), nullptr);  // no second dial
+  ASSERT_TRUE(writer->append(camera.frame(2), nullptr).ok());
+  const std::vector<ReadRecord> got = read_records(*reader, 3);
+  ASSERT_EQ(got.size(), 3u);
+  for (std::size_t k = 0; k < got.size(); ++k) {
+    EXPECT_EQ(got[k].info.seq, k) << "record " << k;
+  }
+  EXPECT_EQ(writer->stats().viewers, 1u);
+}
+
 // --- Failed dials ------------------------------------------------------------
 
-/// Dials to a closed port fail and are counted, once a second; a new target
-/// starts the count again from 0.
+/// Dials to a closed port fail and are counted, one a second; a connect to the
+/// same target dials at once, and a new target starts the count again from 0.
 TEST(RgbdStreamLink, DialFailuresCountAClosedPortAndRestartAtANewTarget) {
   std::uint16_t closed = 0;
   {
@@ -320,9 +397,21 @@ TEST(RgbdStreamLink, DialFailuresCountAClosedPortAndRestartAtANewTarget) {
   options.dial_port = closed;
   auto writer = open_or_fail(options, info);
   ASSERT_NE(writer, nullptr);
-  ASSERT_TRUE(eventually([&] { return writer->stats().dial_failures >= 2; }));
-  EXPECT_EQ(writer->stats().viewers, 0u);
-  EXPECT_FALSE(writer->stats().no_route);  // refused: a route, no listener
+  std::this_thread::sleep_for(2500ms);  // dials at 0, 1 and 2 s
+  const app::RgbdStreamStats failed = writer->stats();
+  EXPECT_GE(failed.dial_failures, 2u);
+  EXPECT_LE(failed.dial_failures, 4u);
+  EXPECT_EQ(failed.viewers, 0u);
+  EXPECT_FALSE(failed.no_route);  // refused: a route, no listener
+
+  // Just after a failure, the next dial is a second away; Connect dials now.
+  const std::uint64_t before = writer->stats().dial_failures;
+  ASSERT_TRUE(
+      eventually([&] { return writer->stats().dial_failures > before; }, 2s));
+  ASSERT_TRUE(writer->dial_to(kLoopback, closed).ok());
+  EXPECT_EQ(writer->stats().dial_failures, 0u);
+  EXPECT_TRUE(
+      eventually([&] { return writer->stats().dial_failures == 1; }, 400ms));
 
   auto listener = listen_or_fail();
   ASSERT_NE(listener, nullptr);
@@ -332,6 +421,62 @@ TEST(RgbdStreamLink, DialFailuresCountAClosedPortAndRestartAtANewTarget) {
   ASSERT_NE(reader, nullptr);
   ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
   EXPECT_EQ(writer->stats().dial_failures, 0u);
+}
+
+/// A dial that finds no route to the host sets no_route, iOS's answer before
+/// Local Network access is allowed; a new target clears it. macOS answers a
+/// connect to 0.0.0.1 so at once.
+TEST(RgbdStreamLink, NoRouteIsSetByTheDialAndClearedByANewTarget) {
+  constexpr const char* kNoRoute = "0.0.0.1";
+  const auto probe = net::dial(kNoRoute, 9, 500ms);
+  if (probe.ok() || !app::is_no_route(probe.status())) {
+    GTEST_SKIP() << "this host answers a dial to " << kNoRoute << " with "
+                 << (probe.ok() ? "a connection" : probe.status().message());
+  }
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = options_for("");
+  options.color = false;
+  options.dial_host = kNoRoute;
+  options.dial_port = 9;
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().dial_failures >= 1; }));
+  EXPECT_TRUE(writer->stats().no_route);
+
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  ASSERT_TRUE(writer->dial_to(kLoopback, listener->port()).ok());
+  EXPECT_FALSE(writer->stats().no_route);
+  auto reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
+  EXPECT_FALSE(writer->stats().no_route);
+}
+
+/// A connect to the same target while a dial to it is under way keeps that
+/// dial, whose failure counts. 192.0.2.1 (TEST-NET-1) answers no connect on
+/// most networks, so the dial waits out its kDialLimit.
+TEST(RgbdStreamLink, DialToTheSameTargetKeepsTheDialUnderWay) {
+  constexpr const char* kSilent = "192.0.2.1";
+  const auto probe = net::dial(kSilent, 9, 300ms);
+  if (probe.ok() || probe.status().message().find("cannot connect within") ==
+                        std::string::npos) {
+    GTEST_SKIP() << "this network answers a dial to " << kSilent << " with "
+                 << (probe.ok() ? "a connection" : probe.status().message());
+  }
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = options_for("");
+  options.color = false;
+  options.dial_host = kSilent;
+  options.dial_port = 9;
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+  std::this_thread::sleep_for(300ms);  // the first dial under way
+  ASSERT_TRUE(writer->dial_to(kSilent, 9).ok());
+  // That dial ends at kDialLimit (2 s from open) and counts; a dial begun
+  // again would end 2 s after it.
+  EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures >= 1; },
+                         app::kDialLimit + 700ms));
 }
 
 // --- Refusals ----------------------------------------------------------------

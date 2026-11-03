@@ -17,7 +17,10 @@
 /// Until then it describes the sensor from the capture's last converted
 /// frame: ARKit's depth camera, tracked, on the host's clock, depth alone.
 ///
-/// @warning Main thread only.
+/// @warning Main thread only. Releasing the link ends its session there,
+///          which waits for the dial under way and the reader's last records
+///          (up to about 3 s); the scanner's view controller keeps it for
+///          the app's life, so that wait does not arise today.
 
 #import <Foundation/Foundation.h>
 
@@ -38,18 +41,19 @@ typedef NS_ENUM(NSInteger, VolumetricLinkState) {
   VolumetricLinkStateDialing,
   /// A reader is being served.
   VolumetricLinkStateConnected,
-  /// Dials failed; one more each second.
+  /// Dials failed, or readers reached left at once; one more each second.
   VolumetricLinkStateRetrying,
   /// The last dial found no route to the host: iOS's answer until the app is
-  /// allowed Local Network access. Dialling goes on, which keeps iOS's prompt
-  /// up.
+  /// allowed Local Network access, and a router's for a host it cannot
+  /// reach. Dialling goes on.
   VolumetricLinkStateNeedsLocalNetwork,
 };
 
 /// @brief The link now, as plain values.
 typedef struct {
   VolumetricLinkState state;
-  /// Dials failed since the address was last set.
+  /// Dials failed in a row, since the address was last set or a reader last
+  /// stayed connected a second.
   uint64_t dial_failures;
   /// Readers that joined or fell back and so asked for a key.
   uint64_t key_wanted;
