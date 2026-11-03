@@ -211,22 +211,31 @@ Launched with `-source pattern`, the scanner scans sensor's test pattern
 frame's index coded in its depth and its picture, at the camera's sizes and
 rate, through the same queue, frame prep and fusion. `-source camera` is the
 default. `-minutes N` (1 to 1440) stops the scan after N minutes, prints the
-run's last line, and exits. An argument it cannot read is refused, and then no
-camera opens at all.
+stop's line, and exits; the minutes count from launch. An argument it cannot
+read is refused, and then no camera opens at all.
 
 ```sh
 xcrun devicectl device process launch --console --device <id> \
   io.taojin.volumetrickit.scanner -- -source pattern -minutes 2
 ```
 
-Every 10 s, and at the stop, the fuse thread prints one `sa` line of counts,
-times, states and colour codes, never a pixel, a depth value, a pose or a
-path: the camera's tracking and counters (`SensorStats`, `ArkitStatus`),
-frames fused, poll and fuse (prep + allocate + integrate) milliseconds at p50
-and p95 over the window, the picture's H.273 colour codes, sensor's frame
-contract (`testing::RgbdContract`), and for the pattern how many frames
-carried their own index. `Core/CaptureReport.hpp` reads the arguments and
-writes the line, and is host-tested.
+Every 10 s the fuse thread prints one `sa` line of counts, times, states and
+colour codes, never a pixel, a depth value, a pose or a path: the camera's
+tracking and counters (`SensorStats`, `ArkitStatus`), frames fused, seconds
+to the first frame, poll and fuse (prep + allocate + integrate) milliseconds
+at p50 and p95 over the window, the picture's H.273 colour codes, sensor's
+frame contract (`testing::RgbdContract`), and for the pattern how many frames
+carried their own index. Each stop prints an `sa stop` line, a lock or
+backgrounding as well as the run's end; the next start counts its seconds and
+counters from 0 again, so its first frame says how soon the camera came back.
+`Core/CaptureReport.hpp` reads the arguments and writes the line, and is
+host-tested.
+
+The pattern has 4 pictures, and a tick that finds all 4 held is skipped and
+counted `missed`. The scanner and the camera's queue hold up to 6 (3 in the
+keyframe ring, the published keyframe, the frame being fused, the frame
+waiting to be polled), so a pattern run skips ticks by design:
+`received + missed` is the pattern's 60 Hz, and `received` alone is not.
 
 ## Development
 
@@ -442,7 +451,7 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 1. ✅ **`compute_smoke`** — the compute path on device.
 2. ✅ **`scanner` bring-up** — gfx rendering to a `CAMetalLayer` surface via
    `VK_EXT_metal_surface`, proving the render path and the Swift/Obj-C++ build.
-3. ✅ **ARKit capture** — sensor's `ArkitSensor`, an `IRgbdSensor`: ARKit's
+3. **ARKit capture** — sensor's `ArkitSensor`, an `IRgbdSensor`: ARKit's
    depth (256×192, millimetres and confidence), its picture where ARKit left
    it, and its pose in sensor's camera axes. ARKit's depth is *registered* to
    its picture, so the two share a pose and differ only in intrinsics scale.

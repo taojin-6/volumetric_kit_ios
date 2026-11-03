@@ -14,7 +14,7 @@ struct RendererImpl;
 /// @brief Poll `impl.camera`, fuse each frame it hands out, and print one
 ///        line of counts, times, states and colour codes every
 ///        `kReportEverySeconds` (Core/CaptureReport.hpp), until `impl.fusing`
-///        goes false; then print the run's last line.
+///        goes false; then print the stop's line ("sa stop").
 ///
 /// Waits on `impl.frame_signal` while the camera holds nothing. Each frame
 /// is checked against sensor's frame contract (`testing::RgbdContract`) and,

@@ -45,6 +45,9 @@ struct Window {
   std::vector<double> fuse_ms;
   std::vector<double> prep_ms;
   std::uint64_t fused = 0;  // since the start
+  // When the first frame came, since the start: after a lock, how soon the
+  // camera is back.
+  std::optional<double> first_frame_s;
   void clear() {
     poll_ms.clear();
     fuse_ms.clear();
@@ -103,7 +106,7 @@ void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
 // The window as its line, printed to stdout, where the device console reads
 // it, with the contract's verdict published for the read-out.
 void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
-            Window& window, Clock::time_point started, bool last) {
+            Window& window, Clock::time_point started, bool stop) {
   const sensor::ArkitSensor& camera = *impl.arkit;
   const sensor::SensorStats stats = camera.stats();
   const sensor::ArkitStatus status = camera.status();
@@ -111,7 +114,8 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   r.source =
       impl.camera_pattern ? CaptureSource::Pattern : CaptureSource::Camera;
   r.seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  r.last = last;
+  r.stop = stop;
+  r.first_frame_s = window.first_frame_s;
   r.tracking = sensor::to_string(status.tracking);
   r.interrupted = status.interrupted;
   r.session_error = status.session_error;
@@ -194,6 +198,10 @@ void run_fuse_loop(RendererImpl& impl) {
           if (!got.value()) {
             impl.frame_signal.wait_for(kIdleWait);
             return;
+          }
+          if (!window.first_frame_s) {
+            window.first_frame_s =
+                std::chrono::duration<double>(Clock::now() - started).count();
           }
           take(impl, contract, window, *got.value(), poll_ms);
         },

@@ -80,7 +80,7 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
 std::string capture_report_line(const CaptureReport& r) {
   char head[160];
   std::snprintf(head, sizeof head, "sa%s %s %.1f s: tracking %s%s",
-                r.last ? " end" : "", to_string(r.source), r.seconds,
+                r.stop ? " stop" : "", to_string(r.source), r.seconds,
                 r.tracking.empty() ? "-" : r.tracking.c_str(),
                 r.interrupted ? ", interrupted" : "");
   std::string line = head;
@@ -97,6 +97,14 @@ std::string capture_report_line(const CaptureReport& r) {
                 static_cast<unsigned long long>(r.missed),
                 static_cast<unsigned long long>(r.fused));
   line += counts;
+  if (r.first_frame_s) {
+    char first[48];
+    std::snprintf(first, sizeof first, " | first frame %.2f s",
+                  *r.first_frame_s);
+    line += first;
+  } else {
+    line += " | first frame -";
+  }
   line += " | poll ms " + spread(r.poll_ms, 3);
   line += " | fuse ms " + spread(r.fuse_ms, 2);
   line += ", prep " + spread(r.prep_ms, 2);

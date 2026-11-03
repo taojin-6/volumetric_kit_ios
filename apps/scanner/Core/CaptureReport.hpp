@@ -57,12 +57,15 @@ inline constexpr std::uint32_t kReportEverySeconds = 10;
 
 /// @brief One window of a run, as its console line says it.
 ///
-/// The counters are the camera's since the run's start (`SensorStats` and
-/// `ArkitStatus` begin again at each start); the times are this window's.
+/// The counters are the camera's since the start (`SensorStats` and
+/// `ArkitStatus` begin again at each start, a resume after a lock or
+/// backgrounding too); the times are this window's.
 struct CaptureReport {
   CaptureSource source = CaptureSource::Camera;
-  double seconds = 0.0;         ///< Since the start.
-  bool last = false;            ///< The run's last line, at its stop.
+  double seconds = 0.0;  ///< Since the start.
+  bool stop = false;     ///< The line at a stop: each stop prints one.
+  /// Seconds from the start to its first frame; empty before one came.
+  std::optional<double> first_frame_s;
   std::string tracking;         ///< ARKit's tracking at the last frame, named.
   bool interrupted = false;     ///< ARKit has stopped the camera for a while.
   std::string session_error;    ///< ARKit's failure; empty for none.
@@ -97,10 +100,11 @@ struct CaptureReport {
   std::uint64_t index_mismatches = 0;
 };
 
-/// @return @p report as one line, "sa <source> <seconds> s: ..." ("sa end"
-///         for the last): tracking; the counters; frames fused; poll, fuse
-///         and prep ms at p50 and p95 over the window, with their counts; the
-///         colour codes; the contract; and, for the pattern, the index check.
+/// @return @p report as one line, "sa <source> <seconds> s: ..." ("sa stop"
+///         at a stop): tracking; the counters; frames fused; when the first
+///         frame came; poll, fuse and prep ms at p50 and p95 over the window,
+///         with their counts; the colour codes; the contract; and, for the
+///         pattern, the index check.
 std::string capture_report_line(const CaptureReport& report);
 
 }  // namespace volumetric_kit::ios_app
