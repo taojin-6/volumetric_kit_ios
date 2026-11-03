@@ -358,9 +358,10 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   // at gfx's 4x MSAA into one transient colour and depth set that every frame
   // reuses in queue order, so it is depth-safe at any frames-in-flight count.
   config.swapchain.depth_format = VK_FORMAT_D32_SFLOAT;
-  // Set rather than left at gfx's default: RendererImpl::kMeshSlots is sized
-  // against this number, and a default that changed in the other repo would
-  // silently turn the mesh ring into a use-after-free.
+  // Set rather than left at gfx's default: RendererImpl::kMeshSlots and the
+  // keyframe ring are sized against this number. A deeper default in the other
+  // repo would have Fusion::start refuse the mesh ring, and would rebind
+  // keyframe slots that pending frames still sample.
   config.frames_in_flight = app::RendererImpl::kFramesInFlight;
 
   vkc::Result<vg::app::WindowedApp> app = vg::app::WindowedApp::adopt(
@@ -460,7 +461,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   _impl->mesh_pipeline.emplace(std::move(mesh_pipeline).value());
 
   // --- The keyframe sets -----------------------------------------------------
-  // 1x1 white for a mesh slot with no keyframe: the fragment shader samples
+  // 1x1 white for a ring slot with no keyframe: the fragment shader samples
   // set 0 only where a triangle carries a real uv0. Where projective texturing
   // did not win a camera, uv0 is the (-1,-1) sentinel and the TSDF's
   // per-vertex colour is used instead -- so the white image is never selected
@@ -490,7 +491,7 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   vg::pipelines::HybridMeshTextureSet::Options keyframe_sampling;
   keyframe_sampling.filter = VK_FILTER_LINEAR;
   keyframe_sampling.address = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  for (std::size_t i = 0; i < app::RendererImpl::kMeshSlots; ++i) {
+  for (std::size_t i = 0; i < app::kRingSlots; ++i) {
     vkc::Result<std::unique_ptr<vg::pipelines::HybridMeshTextureSet>> slot_set =
         vg::pipelines::HybridMeshTextureSet::create(
             _impl->app.device(), _impl->app.allocator(), *_impl->mesh_pipeline,
@@ -706,6 +707,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   trace.stop = fused.allocation_stop;
   trace.ms_since_fuse = fused.ms_since_fuse;
   trace.extract_ms = fused.extract_ms;
+  // The live generation whether or not it draws, so `drew=0 gen=N` (an empty
+  // mesh live) reads apart from `drew=0 gen=0` (nothing committed yet).
+  trace.generation = live_src.generation;
 
   if (live_draw == app::LiveDraw::kMesh) {
     // grid's buffers, named rather than copied. LiveMesh owns nothing and
@@ -717,9 +721,8 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
     live.indirect = live_src.indirect;
     const vg::pipelines::HybridMeshDraw draw{live};
 
-    // The three fields that are genuinely about the mesh this frame drew.
+    // The two fields that are genuinely about the mesh this frame drew.
     trace.drew_mesh = true;
-    trace.generation = live_src.generation;
     trace.atlas_slot = _impl->atlas_slot;
 
     // Both ends clamped, not just the denominator. A zero *width* drawable is

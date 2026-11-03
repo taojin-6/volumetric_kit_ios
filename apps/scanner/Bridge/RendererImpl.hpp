@@ -153,8 +153,8 @@ struct RendererImpl {
   // destruction frees them before the allocator that produced them. The queue
   // drain that makes that safe is in ~RendererImpl, not in this ordering.
   vg::app::WindowedApp app;
-  // CPU-ahead depth, named rather than defaulted: kMeshSlots below is only
-  // correct relative to it.
+  // CPU-ahead depth, named rather than defaulted: kMeshSlots and the keyframe
+  // ring's depth below are only correct relative to it.
   static constexpr std::uint32_t kFramesInFlight = 2;
 
   vg::ShaderModule vertex_shader;
@@ -176,14 +176,17 @@ struct RendererImpl {
   // What binds gfx to kFramesInFlight is one assignment in a *different*
   // translation unit: `config.frames_in_flight = RendererImpl::kFramesInFlight`
   // in VolumetricRenderer.mm's -initWithLayer:. Deleting it as redundant hands
-  // the depth silently back to gfx's default, which this ring would then be
-  // too shallow for. The static_assert below keeps the keyframe ring as deep.
+  // the depth silently back to gfx's default: a deeper one has Fusion::start
+  // refuse this ring, and outgrows the keyframe ring the static_assert below
+  // checks against kFramesInFlight.
   static constexpr std::size_t kMeshSlots = kFramesInFlight + 1;
-  // AtlasRing.hpp declares its arrays and so has to state that depth; this is
-  // what stops the two drifting apart silently, in either direction.
-  static_assert(kMeshSlots == kRingSlots,
-                "the atlas ring holds a keyframe per mesh slot, so it must be "
-                "exactly as deep as the mesh ring");
+  // AtlasRing.hpp declares its arrays and so has to state its depth; this is
+  // what stops it falling below the frames in flight silently. Each commit
+  // binds the next slot, at most one a frame, so a slot is rebound only once
+  // the frames that sampled it have retired.
+  static_assert(kRingSlots >= kFramesInFlight,
+                "the keyframe ring is rebound one slot per commit, so it needs "
+                "a slot for every frame in flight");
 
   /// The keyframes the textured mesh samples, one per committed mesh round the
   /// ring, each holding its camera picture until the slot is rebound.

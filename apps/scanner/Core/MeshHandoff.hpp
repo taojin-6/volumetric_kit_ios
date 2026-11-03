@@ -4,19 +4,42 @@
 #pragma once
 
 /// @file MeshHandoff.hpp
-/// @brief The renderer's two rules on its side of grid's `MeshExchange`: what
-///        a frame draws for the live mesh, and how a committed mesh's keyframe
-///        lands in the keyframe ring.
+/// @brief The scanner's rules on top of grid's `MeshExchange`: how deep the
+///        mesh ring must be, what a frame draws for the live mesh, and how a
+///        committed mesh's keyframe lands in the keyframe ring.
 ///
-/// Pure, so both can be tested on the host: the renderer
-/// (Bridge/VolumetricRenderer.mm) instantiates them with grid's `DeviceMesh`
-/// and the bridge's `AtlasSlot`; a test with look-alikes.
+/// Pure, so all three can be tested on the host: Bridge/Fusion.mm checks the
+/// depth, and the renderer (Bridge/VolumetricRenderer.mm) instantiates the
+/// other two with grid's `DeviceMesh` and the bridge's `AtlasSlot`; a test
+/// with look-alikes.
 
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 
 namespace volumetric_kit::ios_app {
+
+/// @brief Why a mesh ring of @p mesh_slots cannot serve a renderer keeping
+///        @p frames_in_flight frames, or null if it can.
+///
+/// grid's `slot_count` rule for this producer, which never extracts while a
+/// mesh waits to be taken, and this consumer, which never drops one: one slot
+/// more than the frames in flight. A shallower ring is refused extracts while
+/// frames still draw every slot, so the scan meshes in fits.
+///
+/// @param mesh_slots        `FusionConfig::mesh_slots`.
+/// @param frames_in_flight  `MeshExchangeConfig::frames_in_flight`.
+inline const char* mesh_ring_refusal(std::uint32_t mesh_slots,
+                                     std::uint32_t frames_in_flight) noexcept {
+  if (frames_in_flight == 0) {
+    return "the renderer keeps no frame in flight";
+  }
+  // Not `mesh_slots < frames_in_flight + 1`, which wraps at the top.
+  if (mesh_slots <= frames_in_flight) {
+    return "the ring needs one slot more than the renderer's frames in flight";
+  }
+  return nullptr;
+}
 
 /// @brief What a frame draws for the exchange's live mesh.
 enum class LiveDraw : std::uint8_t {

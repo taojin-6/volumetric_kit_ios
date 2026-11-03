@@ -14,6 +14,7 @@
 #import "MemoryQuery.hpp"
 
 #include "FailureHandling.hpp"
+#include "MeshHandoff.hpp"
 
 namespace volumetric_kit::ios_app {
 namespace {
@@ -47,9 +48,6 @@ constexpr const char* kTextureStage = "texture";
 /// stage's own name. Seeded in that position so the sub-row sits directly under
 /// the row it decomposes.
 constexpr const char* kActiveSetStage = "  ..active set";
-
-/// The floor on `FusionConfig::mesh_slots`; see that field.
-constexpr std::uint32_t kMinMeshSlots = 2;
 
 /// The active blocks stamped changed after tick @p since, and how many blocks
 /// those put back to marching cubes: a cell reads its corners at
@@ -128,21 +126,20 @@ vkc::Result<ChangedBlocks> changed_since(
 
 vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
                           const FusionConfig& config) {
-  // Refused, not clamped, and refused here rather than trusted from the caller.
-  // At one slot grid reuses a single arena in place and `release_through`
-  // changes no behaviour -- so every DeviceMesh this class publishes would be
-  // valid only until the next extract, while the renderer draws it. The failure
-  // is a destroyed VkBuffer under a live draw, which raises no Status and no
-  // validation message on iOS; a start() that refuses is the only place it can
-  // still be said out loud. See FusionConfig::mesh_slots.
-  if (config.mesh_slots < kMinMeshSlots) {
+  // Refused, not clamped, and refused here rather than trusted from the caller,
+  // before anything is written. At one slot grid reuses a single arena in
+  // place, so a mesh the renderer draws is overwritten by the next extract --
+  // a destroyed VkBuffer under a live draw, which raises no Status and no
+  // validation message on iOS. Deeper but not past the frames in flight, grid
+  // refuses extracts while frames draw every slot. And no frame in flight
+  // aborts in the exchange's constructor below. See FusionConfig::mesh_slots.
+  if (const char* why = mesh_ring_refusal(config.mesh_slots,
+                                          config.consumer.frames_in_flight)) {
     return vkc::Status::invalid_argument(
         "FusionConfig::mesh_slots is " + std::to_string(config.mesh_slots) +
-        ", which switches grid's slot-release contract off; the renderer "
-        "draws the extractor's buffers in place, so it needs at least " +
-        std::to_string(kMinMeshSlots) +
-        " (and the consumer's frames in flight "
-        "plus one to actually pipeline).");
+        " for a renderer with " +
+        std::to_string(config.consumer.frames_in_flight) +
+        " frames in flight: " + why + ".");
   }
   // Refused here, beside the guard above and *before* anything is written.
   // Through the setter rather than stored directly, so a config carrying a
@@ -192,8 +189,10 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   // A new exchange, before the extractor it hands out is replaced below: the
   // last scan's pending and live meshes, its keyframes and its release mark
   // all name the old extractor's slots. Nothing may be in the renderer's
-  // begin_frame meanwhile; `start` runs once, from -initWithLayer:, before the
-  // first frame.
+  // begin_frame meanwhile, and a restart must first let the frames in flight
+  // retire (`app.wait_idle()`): replacing the extractor frees the buffers they
+  // draw, with no fence wait. `start` runs once, from -initWithLayer:, before
+  // the first frame.
   exchange_.emplace(config.consumer);
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a

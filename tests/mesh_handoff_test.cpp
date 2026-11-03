@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 /// @file mesh_handoff_test.cpp
-/// @brief A frame draws the live mesh only when it has buffers and triangles,
+/// @brief The mesh ring needs one slot more than the frames in flight; a
+///        frame draws the live mesh only when it has buffers and triangles,
 ///        and the bring-up triangle only before the first commit; a committed
 ///        mesh's keyframe lands in the next ring slot, and the mesh commits
 ///        even when its keyframe cannot be bound.
@@ -20,6 +21,27 @@
 namespace {
 
 namespace app = volumetric_kit::ios_app;
+
+TEST(MeshRingRefusal, NeedsOneSlotMoreThanTheFramesInFlight) {
+  // The scanner's own depths: 3 slots over 2 frames.
+  EXPECT_EQ(app::mesh_ring_refusal(3, 2), nullptr);
+  EXPECT_EQ(app::mesh_ring_refusal(2, 1), nullptr);
+  // As deep as the frames, or shallower, is refused: grid would refuse
+  // extracts while the frames draw every slot.
+  EXPECT_NE(app::mesh_ring_refusal(2, 2), nullptr);
+  EXPECT_NE(app::mesh_ring_refusal(3, 3), nullptr);
+  EXPECT_NE(app::mesh_ring_refusal(1, 2), nullptr);
+}
+
+TEST(MeshRingRefusal, NoFrameInFlightIsRefused) {
+  // grid's exchange aborts on it; start() has to say so as a Status first.
+  EXPECT_NE(app::mesh_ring_refusal(3, 0), nullptr);
+}
+
+TEST(MeshRingRefusal, TheFloorDoesNotWrap) {
+  EXPECT_NE(app::mesh_ring_refusal(0, UINT32_MAX), nullptr);
+  EXPECT_NE(app::mesh_ring_refusal(UINT32_MAX, UINT32_MAX), nullptr);
+}
 
 // A look-alike of grid's DeviceMesh: the members live_draw reads.
 struct Mesh {

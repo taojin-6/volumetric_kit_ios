@@ -36,7 +36,7 @@ namespace volumetric_kit::ios_app {
 struct FrameTrace {
   struct Entry {
     std::uint64_t frame = 0;
-    std::uint64_t generation = 0;  // grid generation this frame drew
+    std::uint64_t generation = 0;  // grid generation live, drawn or empty
     std::size_t atlas_slot = 0;    // keyframe ring slot it sampled
     std::uint32_t triangles = 0;
     std::uint32_t triangle_capacity = 0;

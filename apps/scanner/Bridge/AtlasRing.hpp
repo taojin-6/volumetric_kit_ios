@@ -4,15 +4,16 @@
 #pragma once
 
 /// @file AtlasRing.hpp
-/// @brief The keyframes the textured mesh samples, one per mesh slot.
+/// @brief The keyframes the textured mesh samples, one per commit round the
+///        ring.
 ///
 /// Each keyframe is the camera's picture where it is: ARKit's `capturedImage`,
 /// its two planes imported by sensor's `PixelBufferImporter` and sampled by
-/// gfx's texture set, with no copy. A ring rather than one set for the same
-/// reason the mesh slots are a ring: a slot's set is rewritten, and its old
-/// picture let go, only once no pending frame has bound it. Each committed
-/// mesh binds its keyframe into the next slot (`commit_keyframe`), since a
-/// mesh and the keyframe its `uv0` address are one value.
+/// gfx's texture set, with no copy. A ring rather than one set because a
+/// slot's set is rewritten, and its old picture let go, only once no pending
+/// frame has bound it. Each committed mesh binds its keyframe into the next
+/// slot (`commit_keyframe`), since a mesh and the keyframe its `uv0` address
+/// are one value.
 
 #include <cstddef>
 #include <memory>
@@ -27,18 +28,19 @@ namespace volumetric_kit::ios_app {
 
 namespace vkc = volumetric_kit::core;
 
-/// @brief How many keyframes the ring holds -- one per mesh slot.
+/// @brief How many keyframes the ring holds.
 ///
-/// The depth is the renderer's: one more than the frames the CPU runs ahead,
-/// so a slot rebound now was last bound by a frame that has retired.
-/// @ref RendererImpl static_asserts that its `kMeshSlots` agrees.
+/// At least the renderer's frames in flight: each commit binds the next slot,
+/// at most one commit a frame, so a slot rebound now was last sampled by
+/// frames that have retired. @ref RendererImpl static_asserts it against its
+/// `kFramesInFlight`. Three, one more than that needs.
 inline constexpr std::size_t kRingSlots = 3;
 
 /// @brief A keyframe: the camera picture's two plane images and how they code
 ///        R'G'B'. The images hold the picture's pixel buffer.
 using Keyframe = volumetric_kit::sensor::YuvImage;
 
-/// @brief One mesh slot's keyframe.
+/// @brief One ring slot's keyframe.
 struct AtlasSlot {
   /// The hybrid pipeline's set 0: made at bring-up over the white texture,
   /// rebound with every mesh that lands in the slot.

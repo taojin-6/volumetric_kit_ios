@@ -271,9 +271,9 @@ struct FusionConfig {
 
   /// @brief How many extracted meshes may be outstanding at once.
   ///
-  /// Passed through to `MarchingCubesConfig::slot_count`, and **two is the
-  /// floor**: @ref Fusion::start refuses anything lower rather than running
-  /// with it.
+  /// Passed through to `MarchingCubesConfig::slot_count`, and **the floor is
+  /// @ref consumer's frames in flight plus one**: @ref Fusion::start refuses
+  /// anything lower rather than running with it (`mesh_ring_refusal`).
   ///
   /// One is grid's own default and means a single arena reused in
   /// place, with `release_through` recording a number and changing no
@@ -284,13 +284,13 @@ struct FusionConfig {
   /// a GPU fault, raised as neither a Status nor a validation message, and it
   /// is not a state worth leaving one defaulted field away.
   ///
-  /// Two only *arms* the contract. A consumer drawing these buffers has to size
-  /// it to its own frames in flight plus one, which is what the renderer passes
-  /// (`RendererImpl::kMeshSlots`): this producer never extracts while a mesh
-  /// waits to be taken, so it needs no second extra slot
-  /// (`MeshExchangeConfig::frames_in_flight`). Each slot costs a full vertex
-  /// arena, so higher is not free -- see grid's `slot_count`.
-  std::uint32_t mesh_slots = 2;
+  /// Deeper, but not past the frames in flight, grid refuses extracts while
+  /// frames draw every slot. One more than them is enough because this
+  /// producer never extracts while a mesh waits to be taken, so it needs no
+  /// second extra slot (`MeshExchangeConfig::frames_in_flight`); the renderer
+  /// passes `RendererImpl::kMeshSlots`. Each slot costs a full vertex arena,
+  /// so higher is not free -- see grid's `slot_count`.
+  std::uint32_t mesh_slots = 3;
 
   /// @brief How the renderer reads the meshes: its frames in flight, whether
   ///        it reads them from another queue family than the compute one, and

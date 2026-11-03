@@ -355,10 +355,11 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
 - **LiDAR required** for the ARKit slice: iPhone 12 Pro and later Pro models,
   iPad Pro 2020 and later. Guard with
   `ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)`.
-- **The scanner's keyframes are ARKit's own pictures.** Each mesh slot samples
-  the `capturedImage` its mesh was textured from where ARKit left it, imported
-  by sensor's `PixelBufferImporter`, so the ring holds up to three of ARKit's
-  pixel buffers beyond the frames being captured and fused. Fusion still
+- **The scanner's keyframes are ARKit's own pictures.** Each committed mesh
+  samples the `capturedImage` it was textured from where ARKit left it,
+  imported by sensor's `PixelBufferImporter` into the next slot of a keyframe
+  ring at least as deep as the frames in flight, so the ring holds up to three
+  of ARKit's pixel buffers beyond the frames being captured and fused. Fusion still
   converts each frame's colour on the CPU.
 - **Shaders are compiled on the host** by `glslc` and embedded into the binary
   as constexpr byte arrays, so there is no runtime shader file and nothing to
@@ -388,8 +389,8 @@ to ARKit's 256×192 `sceneDepth`, rather than a desktop 640×480.
    `fuse_viewer` model. Then one shared `VkDevice`, the core's `SharedDevice`,
    built from the compute libraries' requirements ∪ `vg::device_requirements()`
    and handed to both sides via `adopt`. Starts on interop seam A (host mesh, as `fuse_viewer`
-   does) and moves to seam B (indirect draw over a mesh ring with a timeline
-   handoff) once it works.
+   does) and moves to seam B (indirect draw over a mesh ring, handed over on
+   the host through grid's `MeshExchange`) once it works.
 
 ## License
 
