@@ -55,7 +55,7 @@ parenthesised code) or in Xcode → Settings → Accounts.
 | Sibling | What the apps take from it |
 | --- | --- |
 | `volumetric_kit_core` | the shared device, `Status`, the scenario parser |
-| `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), and the `PixelBufferImporter` the keyframes use (`sensor_apple`) |
+| `volumetric_kit_sensor` | the camera parameters, colour encoding and conventions ARKitCapture fills (`sensor_interface`), the `PixelBufferImporter` the keyframes use (`sensor_apple`), and the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`) |
 | `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`) |
 | `volumetric_kit_recon` | TSDF fusion and the projective texturer (`recon_tsdf`, `recon_texture`) |
 | `volumetric_kit_gfx` | the renderer |
@@ -148,6 +148,34 @@ xcrun devicectl device process launch --console --device <id> \
 
 The device must be **unlocked** — mounting the developer disk image fails on a
 locked device.
+
+### `-self-test hevc`
+
+Launched with `-self-test hevc`, the scanner runs sensor's HEVC encoder check
+instead of scanning, and never opens the camera:
+
+```sh
+xcrun devicectl device process launch --console --device <id> \
+  io.taojin.volumetrickit.scanner -- -self-test hevc
+```
+
+It codes sensor's test pattern in IOSurface pixel buffers at ARKit's
+1920×1440 and writes no file and sends nothing. Its report, on the console
+and the screen, gives:
+
+- the device, the GPU and the encoder's own settings line, which says whether
+  it takes a QP a picture;
+- one line per run of sensor's encoder rules (`hevc_encoder_breach`, C1–C8 and
+  C10–C13), each decoded back on the GPU: BT.601 at either range, BT.709
+  centre-sited, QP 1 and 51, then every colour code and siting the encoder
+  accepts;
+- one session's timing, one picture in flight: `send` return time, send to
+  access unit, and access-unit bytes, at p50, p95 and max;
+- the thermal state before and after, and a PASS or FAIL line.
+
+The app exits when the report ends: 0 passed, 1 failed, 2 for an unknown test
+name. `Core/SelfTest.hpp` decides what the report says and whether it passed,
+and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
 ## Development
 

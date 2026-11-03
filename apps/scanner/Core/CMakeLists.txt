@@ -17,8 +17,14 @@
 # reasons about what it returned. Bridge/MemoryQuery.cpp is that split done
 # once: the syscall there, the meaning here.
 add_library(
-  vi_core STATIC AllocationStop.cpp FailureHandling.cpp GrowthPolicy.cpp
-                 MemoryBudget.cpp OrbitCamera.cpp ViewOrientation.cpp)
+  vi_core STATIC
+  AllocationStop.cpp
+  FailureHandling.cpp
+  GrowthPolicy.cpp
+  MemoryBudget.cpp
+  OrbitCamera.cpp
+  SelfTest.cpp
+  ViewOrientation.cpp)
 
 # The same warning set the sibling libraries build under, and here for a reason
 # beyond consistency: AllocationStop.cpp turns an enum into what four different
