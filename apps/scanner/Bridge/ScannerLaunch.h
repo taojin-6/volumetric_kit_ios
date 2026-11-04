@@ -4,8 +4,8 @@
 /// @file ScannerLaunch.h
 /// @brief What a scanner launch's arguments ask of the camera and its
 ///        stream: `-source camera|pattern`, `-minutes N`, `-record <name>`,
-///        `-connect <address>` and `-dry` (`Core/CaptureReport.hpp`'s
-///        `launch_options`).
+///        `-connect <address>`, `-dry` and `-fail-opens N`
+///        (`Core/CaptureReport.hpp`'s `launch_options`).
 
 #import <Foundation/Foundation.h>
 
@@ -42,6 +42,9 @@ typedef NS_ENUM(NSInteger, VolumetricCameraSource) {
 /// `-dry`: the stream codes and counts, writes no file and refuses every
 /// connect, the on-screen one too.
 @property(nonatomic, readonly) BOOL dry;
+/// `-fail-opens N`, with `-source pattern` alone: the first N opens come back
+/// `NotFound`, a test of the camera's retry; 0 when the flag is absent.
+@property(nonatomic, readonly) uint32_t failOpens;
 /// Why an argument was refused; empty when none was.
 @property(nonatomic, readonly, copy) NSString* refusal;
 

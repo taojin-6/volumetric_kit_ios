@@ -50,6 +50,10 @@ struct LaunchOptions {
   /// file and refuses every connect, the on-screen one too, so nothing the
   /// camera sees leaves the device.
   bool dry = false;
+  /// A test of the camera's retry (CameraOpen.hpp), with the pattern alone:
+  /// the first this many opens wait 1 s and come back `NotFound`, as a
+  /// camera that gave no frame in time does; 0 when the flag is absent.
+  std::uint32_t fail_opens = 0;
   /// Why an argument was refused, for the screen and the console; empty when
   /// none was.
   std::string refusal;
@@ -57,6 +61,9 @@ struct LaunchOptions {
 
 /// @brief The most minutes `-minutes` takes: a day.
 inline constexpr std::uint32_t kMaxRunMinutes = 24 * 60;
+
+/// @brief The most opens `-fail-opens` fails.
+inline constexpr std::uint32_t kMaxFailOpens = 9;
 
 /// @brief The longest `-record` name.
 inline constexpr std::size_t kMaxRecordName = 64;
@@ -68,10 +75,11 @@ inline constexpr std::size_t kMaxRecordName = 64;
 ///         `.`, `_` and `-`, not starting with `.`, ending `.vrst`, at most
 ///         @ref kMaxRecordName long (no file when absent);
 ///         `-connect <address>`, digits, `.` and `:` (no dial when absent);
-///         and `-dry`, which takes no value and neither of the last two.
-///         Another value, a flag with none after it, or `-dry` with
-///         `-record` or `-connect` is refused: `source` empty and `refusal`
-///         naming it.
+///         `-dry`, which takes no value and neither of the last two; and
+///         `-fail-opens N`, N from 1 to @ref kMaxFailOpens, with
+///         `-source pattern` alone. Another value, a flag with none after
+///         it, `-dry` with `-record` or `-connect`, or `-fail-opens` without
+///         the pattern is refused: `source` empty and `refusal` naming it.
 LaunchOptions launch_options(const std::vector<std::string>& arguments);
 
 /// @brief How often a run prints its @ref capture_report_line.

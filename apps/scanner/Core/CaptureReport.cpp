@@ -87,7 +87,7 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
       continue;
     }
     if (flag != "-source" && flag != "-minutes" && flag != "-record" &&
-        flag != "-connect") {
+        flag != "-connect" && flag != "-fail-opens") {
       continue;
     }
     if (i + 1 == arguments.size()) {
@@ -119,6 +119,14 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
         refuse("-connect takes a numeric address, a.b.c.d:port, not \"" +
                value + "\"");
       }
+    } else if (flag == "-fail-opens") {
+      if (value.size() == 1 && value[0] >= '1' &&
+          value[0] <= static_cast<char>('0' + kMaxFailOpens)) {
+        out.fail_opens = static_cast<std::uint32_t>(value[0] - '0');
+      } else {
+        refuse("-fail-opens takes a whole number from 1 to " +
+               std::to_string(kMaxFailOpens) + ", not \"" + value + "\"");
+      }
     } else if (const std::optional<std::uint32_t> minutes = minutes_of(value)) {
       out.minutes = *minutes;
     } else {
@@ -130,6 +138,10 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
     refuse(
         "-dry records and sends nothing, so it takes no -record or "
         "-connect");
+  }
+  // A test of the retry, never of a camera run.
+  if (out.fail_opens > 0 && out.source != CaptureSource::Pattern) {
+    refuse("-fail-opens is a test of the retry, with -source pattern alone");
   }
   return out;
 }

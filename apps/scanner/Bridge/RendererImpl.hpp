@@ -25,6 +25,7 @@
 ///          on @ref RendererImpl.
 
 #include "AtlasRing.hpp"
+#include "CameraOpen.hpp"
 #include "FrameTrace.hpp"
 #include "Fusion.hpp"
 #include "OrbitCamera.hpp"
@@ -105,6 +106,17 @@ namespace vg = volumetric_kit::gfx;
 namespace vgrid = volumetric_kit::grid;
 namespace sensor = volumetric_kit::sensor;
 
+/// @brief What each open of the camera opens, fixed at bring-up: the camera,
+///        and the stream on it once the camera is the renderer's.
+struct CameraPlan {
+  sensor::ArkitSensor::Options camera;
+  /// The stream's options; its session gets its id and time as it opens.
+  RgbdStreamSenderOptions stream;
+  /// `-fail-opens`: the first this many opens wait 1 s and come back
+  /// `NotFound`, as a camera that gave no frame in time (the pattern only).
+  std::uint32_t fail_opens = 0;
+};
+
 // Everything C++ lives here so the header stays Objective-C only and Swift
 // never sees a move-only type.
 //
@@ -151,21 +163,32 @@ struct RendererImpl {
   FrameSignal frame_signal;
   // ARKit, or its test pattern, as sensor's `IRgbdSensor`: it owns the
   // ARSession, withholds the frames ARKit did not track, and imports each
-  // picture on `compute_device`, shared with gfx's family. Opened at bring-up,
-  // started before the fuse thread and stopped after its join. After the
-  // compute device, which it must not outlive; before `fusion` and `atlas`,
-  // whose keyframes are its pictures, so they let them go first. Empty when it
-  // did not open, `camera_error` saying why. (`camera` is the orbit camera,
-  // below.)
+  // picture on `compute_device`, shared with gfx's family. Opened at bring-up
+  // or by a later open (`camera_open`), started before the fuse thread and
+  // stopped after its join. After the compute device, which it must not
+  // outlive; before `fusion` and `atlas`, whose keyframes are its pictures, so
+  // they let them go first. Empty until it opens. Set once, on the bring-up
+  // thread or in -startFusion on the main thread, while no fuse thread runs
+  // and no teardown does. (`camera` is the orbit camera, below.)
   std::optional<sensor::ArkitSensor> arkit;
-  std::string camera_error;
   bool camera_pattern = false;  ///< `ArkitSource::Pattern`: no camera opened.
+  // The camera's opens (Core/CameraOpen.hpp): which may begin, how they
+  // ended, why the last failed. Bring-up's thread, then the main thread.
+  CameraOpenPolicy camera_open;
+  CameraPlan camera_plan;
+  // A later open's camera, until -startFusion makes it `arkit` and opens its
+  // stream; paused while it waits. Main thread. Destroyed before the compute
+  // device above.
+  std::optional<sensor::ArkitSensor> camera_opened;
+  // -startFusion until -beginStopFusion: a later open's camera starts at once
+  // only then. Main thread.
+  bool fusion_wanted = false;
   CameraReadout camera_readout;
   // The camera's frames as a stream (Session/rgbd_stream_sender.hpp): the
   // fuse thread offers it every frame it takes, and its own thread copies the
   // taken frames' pictures into the encoder's own on `compute_device`, codes
   // them and writes them to the file and the live link, or counts them (the
-  // dry run). Opened at bring-up after the camera, whose
+  // dry run). Opened as the camera becomes `arkit`, whose
   // info it describes; kept across a stop and a start, so a scan's session
   // is one. After `arkit`, so it lets its frames' pictures go first;
   // ~RendererImpl finishes it, joining its thread, right after the fuse

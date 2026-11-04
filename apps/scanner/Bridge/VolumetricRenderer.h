@@ -493,18 +493,49 @@ typedef struct {
 /// @}
 @end
 
+/// @brief What the camera's open is doing: `Core/CameraOpen.hpp`'s
+///        `CameraOpenState`, value for value (VolumetricRenderer.mm checks).
+typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
+  /// No open yet.
+  VolumetricCameraOpenStateIdle = 0,
+  /// An open is in flight, the first or a retry: no other begins.
+  VolumetricCameraOpenStateOpening,
+  /// The camera opened.
+  VolumetricCameraOpenStateOpen,
+  /// The last open found no camera in time (`NotFound`: the iPad locked or
+  /// the app in the background during it, or the camera in use elsewhere):
+  /// it opens again at the next wake, or at the read-out's tick once the
+  /// backoff has passed.
+  VolumetricCameraOpenStateRetrying,
+  /// Refused for good (the camera not allowed, ARKit's session failed, no
+  /// LiDAR, a refused launch): @ref VolumetricCameraStatus.openError says
+  /// why, and nothing opens again.
+  VolumetricCameraOpenStateFailed,
+};
+
 /// @brief The camera now: sensor's `ArkitSensor`, its session's state and its
 ///        counters, read in one go for the read-out.
 ///
 /// The counters are the camera's since its last start (`SensorStats`,
 /// `ArkitStatus`). No field carries a pixel, a depth value, a pose or a path.
 @interface VolumetricCameraStatus : NSObject
-/// Whether the camera opened at bring-up. When not, @ref openError says why
-/// (no LiDAR, the camera not allowed, no depth in time, a refused launch) and
-/// every other field is its default.
+/// Whether the camera is the renderer's now: opened, at bring-up or by a
+/// later open that `-startFusion` has taken. When not, @ref openState and
+/// @ref openSummary say what the open is doing, and every field below
+/// @ref openSummary is its default.
 @property(nonatomic, readonly) BOOL opened;
-/// Why the camera did not open; empty when it did.
+/// What the open is doing.
+@property(nonatomic, readonly) VolumetricCameraOpenState openState;
+/// Opens begun after the first.
+@property(nonatomic, readonly) uint32_t openRetries;
+/// Why the last open failed, in the camera's own words (no LiDAR, the
+/// camera not allowed, no depth in time, a refused launch); empty before a
+/// failure, and once open.
 @property(nonatomic, readonly, copy) NSString* openError;
+/// The open's state as the read-out says it (`camera_open_text`): "opening",
+/// "opening again (retry 2) after: …", "…; retry 3 when the app is in front
+/// again, or in 8 s", the refusal, "open after 2 retries".
+@property(nonatomic, readonly, copy) NSString* openSummary;
 /// The test pattern (`-source pattern`): no camera is open.
 @property(nonatomic, readonly) BOOL pattern;
 /// What the sensor is (`SensorInfo::model`): "ARKit, " and the device's model.
@@ -567,13 +598,14 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                frame with depth, and the first time the app asks, for the
 ///                user's answer to the camera prompt: call this off the main
 ///                thread. A camera that does not open fails nothing else:
-///                @ref cameraStatus says why and nothing fuses until the app
-///                is launched again, since only bring-up opens it (a start
-///                does not retry the open). `VolumetricCameraSourceNone` opens
-///                none.
+///                @ref cameraStatus says why. One that found no camera in
+///                time (`NotFound`) opens again later (@ref
+///                retryCameraOnWake:, `-startFusion`); any other refusal is
+///                final. `VolumetricCameraSourceNone` opens none.
 /// @param recordPath  A new `.vrst` file the stream writes its session to
-///                    from the first frame, or nil for none. With a camera
-///                    open, its stream sender opens here
+///                    from the first frame, or nil for none. As the camera
+///                    becomes the renderer's, here or at the -startFusion
+///                    after a later open, its stream sender opens
 ///                    (Session/rgbd_stream_sender.hpp): every frame the fuse
 ///                    thread takes goes to it, and at 10 Hz each frame's
 ///                    picture is copied on the compute device into the
@@ -584,6 +616,10 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                    @ref streamError says why.
 /// @param dryRun  `-dry`: the stream stays a dry run, refusing every connect
 ///                (and so needs no @p recordPath, which it refuses).
+/// @param failOpens  `-fail-opens N`, a test of the retry with the pattern
+///                   alone: the first N opens wait 1 s and come back
+///                   `NotFound`, as a camera that gave no frame in time; 0
+///                   for none.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
@@ -591,6 +627,7 @@ NS_SWIFT_NAME(VolumetricRenderer)
                                 source:(VolumetricCameraSource)source
                             recordPath:(nullable NSString*)recordPath
                                 dryRun:(BOOL)dryRun
+                             failOpens:(uint32_t)failOpens
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
@@ -613,17 +650,44 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// The camera is the renderer's own, so nothing outside it is borrowed. Its
 /// counters and sequences start again from 0, and ARKit's world is kept
 /// across a stop and a start: frames are withheld until ARKit has found it
-/// again. A camera that did not open, or that will not start, starts nothing;
-/// @ref cameraStatus and the read-out's errors say why.
+/// again. A camera that will not start starts nothing; @ref cameraStatus and
+/// the read-out's errors say why.
+///
+/// Where the camera is not the renderer's yet: one that a later open opened
+/// becomes it here, with its stream, and starts; one whose last open found
+/// no camera in time opens again, as @ref retryCameraOnWake: with `YES`, and
+/// fusion starts when it opens; a refused one starts nothing. Fusion is
+/// wanted from here until @ref beginStopFusion. Main thread only.
 ///
 /// Call @ref stopFusion before tearing the renderer down, or on leaving the
 /// screen; a second call while fusion is already running does nothing.
 - (void)startFusion;
 
+/// @brief Open the camera again where its last open found none in time.
+///
+/// For the app's wakes, @p wake `YES`: in front or active again (a
+/// foreground, an unlock). For its read-out's tick while the scan runs,
+/// @p wake `NO`: only once the backoff since the last open has passed, 2 s
+/// doubling to 30 s (`Core/CameraOpen.hpp`), which is what finds a camera let
+/// go elsewhere. The open runs off the main thread, one at a time, so
+/// never beside one still waiting for the camera prompt's answer, which has
+/// no bound; it comes back on the main thread, where fusion starts on it if
+/// still wanted, and otherwise at the next @ref startFusion, the camera's
+/// session paused meanwhile. Each open's
+/// begin and end prints a `scanner: camera:` line. An open in flight keeps
+/// the renderer alive, as it opens on its device.
+///
+/// Nothing once the camera is open, after a refusal, while an open is in
+/// flight, or while fusion is not wanted (from @ref beginStopFusion until the
+/// next @ref startFusion). Main thread only.
+- (void)retryCameraOnWake:(BOOL)wake NS_SWIFT_NAME(retryCamera(wake:));
+
 /// @brief Ask the fuse thread to stop, without waiting for it.
 ///
 /// Clears the flag the loop tests between iterations and returns immediately.
-/// Idempotent, and safe on a renderer that never started.
+/// Idempotent, and safe on a renderer that never started. Fusion is no longer
+/// wanted: a camera that opens from here waits for the next
+/// @ref startFusion. Main thread only.
 ///
 /// Exists so a caller on the main thread can stop new work being submitted
 /// *now* and pay for the join somewhere else. @ref stopFusion has to wait out
@@ -661,13 +725,15 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @return The camera's stream sender, a
 ///         `volumetric_kit::ios_app::RgbdStreamSender`
 ///         (Session/rgbd_stream_sender.hpp), as an opaque pointer valid for
-///         the renderer's life; null when the camera or the sender did not
-///         open. For the bridge's C++ (the live link) alone: its `dial_to` and
-///         `stats` from any thread.
+///         the renderer's life once set; null while the camera is not the
+///         renderer's, or when the sender did not open. Read on the main
+///         thread. For the bridge's C++ (the live link) alone: its `dial_to`
+///         and `stats` from any thread.
 - (void* _Nullable)streamHandle NS_SWIFT_UNAVAILABLE("C++ interop only");
 
 /// Why the stream sender did not open, for the screen and the console;
-/// empty when it opened, and "no camera opened" when the camera did not.
+/// empty when it opened, and "no camera opened" while the camera is not the
+/// renderer's (it opens with the camera).
 @property(nonatomic, readonly, copy) NSString* streamError;
 
 /// @brief End the stream: the frame handed over is sent, the file gets its

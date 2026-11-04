@@ -146,6 +146,38 @@ TEST(LaunchOptions, AFlagWithNoValueIsRefused) {
   }
 }
 
+/// `-fail-opens N` is a test of the camera's retry on the pattern: with the
+/// camera, or with no source named (the camera), it is refused, so it cannot
+/// fail a camera run's opens.
+TEST(LaunchOptions, FailOpensIsForThePatternAlone) {
+  const LaunchOptions o = parse({"-fail-opens", "2", "-source", "pattern"});
+  ASSERT_TRUE(o.source.has_value());
+  EXPECT_EQ(*o.source, CaptureSource::Pattern);
+  EXPECT_EQ(o.fail_opens, 2u);
+  EXPECT_TRUE(o.refusal.empty());
+  EXPECT_EQ(parse({"-source", "pattern", "-fail-opens", "9"}).fail_opens, 9u);
+  EXPECT_EQ(parse({"-source", "pattern"}).fail_opens, 0u);
+
+  for (const std::vector<std::string>& camera :
+       {std::vector<std::string>{"-fail-opens", "1"},
+        std::vector<std::string>{"-source", "camera", "-fail-opens", "1"},
+        std::vector<std::string>{"-fail-opens", "1", "-source", "camera"}}) {
+    const LaunchOptions refused = parse(camera);
+    EXPECT_FALSE(refused.source.has_value()) << camera.size();
+    EXPECT_TRUE(has(refused.refusal, "with -source pattern alone"))
+        << refused.refusal;
+  }
+  for (const char* bad : {"0", "10", "-1", "two", ""}) {
+    const LaunchOptions refused =
+        parse({"-source", "pattern", "-fail-opens", bad});
+    EXPECT_FALSE(refused.source.has_value()) << bad;
+    EXPECT_TRUE(
+        has(refused.refusal, "-fail-opens takes a whole number from 1 to 9"))
+        << bad;
+  }
+  EXPECT_TRUE(has(parse({"-fail-opens"}).refusal, "needs a value"));
+}
+
 TEST(LaunchOptions, MinutesOutsideOneToADayAreRefused) {
   for (const char* bad : {"0", "1441", "-1", "2.5", "two", "", "99999"}) {
     const LaunchOptions o = parse({"-minutes", bad});
