@@ -12,6 +12,7 @@
 #import "AllocationStop.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
+#import "CaptureReport.hpp"
 #import "FrameTrace.hpp"
 #import "FuseLoop.hpp"
 #import "Fusion.hpp"
@@ -132,6 +133,11 @@ static_assert(offsetof(GridVertex, color) == offsetof(GfxVertex, color),
 static_assert(std::is_standard_layout<GridVertex>::value &&
                   std::is_standard_layout<GfxVertex>::value,
               "offsetof above requires standard-layout vertex types");
+
+// The stream's rate (RateGate), the session's tracks' rate.
+constexpr std::uint32_t kStreamHz = 10;
+// Every picture's slice QP, keys too.
+constexpr int kStreamQp = 22;
 }  // namespace
 
 NSErrorDomain const VolumetricRendererErrorDomain =
@@ -329,6 +335,7 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
                                 source:(VolumetricCameraSource)source
+                            recordPath:(nullable NSString*)recordPath
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
@@ -644,6 +651,38 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
       }
     } else {
       _impl->camera_error = opened.status().message();
+    }
+  }
+
+  // --- The stream, on the camera
+  // ---------------------------------------------- Opened once, for the
+  // renderer's life, so a scan is one session across a stop and a start, and a
+  // reconnect is the same session. A sender that does not open fails nothing:
+  // the scan goes on, and the read-out says why.
+  if (!_impl->arkit) {
+    _impl->stream_error = "no camera opened";
+  } else {
+    app::RgbdStreamSenderOptions stream;
+    if (recordPath != nil) {
+      _impl->record_path = recordPath.fileSystemRepresentation;
+      stream.session.path = _impl->record_path;
+    }
+    stream.session.fps = kStreamHz;
+    arc4random_buf(stream.session.session_id.data(),
+                   stream.session.session_id.size());
+    stream.session.session_id[0] |= 1;  // never all zero
+    stream.session.created_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    stream.qp = kStreamQp;
+    vkc::Result<std::unique_ptr<app::RgbdStreamSender>> sender =
+        app::RgbdStreamSender::open(stream, _impl->arkit->info());
+    if (sender) {
+      _impl->stream = std::move(sender).value();
+    } else {
+      _impl->stream_error =
+          app::without_path(sender.status().message(), _impl->record_path);
     }
   }
 
@@ -1119,8 +1158,23 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
   return [[VolumetricCameraStatus alloc] initWithImpl:*_impl];
 }
 
-- (const void*)sensorInfoHandle {
-  return _impl->arkit ? &_impl->arkit->info() : nullptr;
+- (void*)streamHandle {
+  return _impl->stream.get();
+}
+
+- (NSString*)streamError {
+  return app::to_ns_string(_impl->stream_error);
+}
+
+- (void)finishStream {
+  if (!_impl->stream) return;
+  const vkc::Status finished = _impl->stream->finish();
+  if (!finished.ok()) {
+    std::printf(
+        "scanner: the stream did not finish: %s\n",
+        app::without_path(finished.message(), _impl->record_path).c_str());
+    std::fflush(stdout);
+  }
 }
 
 // Written out rather than left to auto-synthesis. A `@property` with no

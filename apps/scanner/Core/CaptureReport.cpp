@@ -33,6 +33,35 @@ std::optional<std::uint32_t> minutes_of(const std::string& text) {
   return value;
 }
 
+bool ends_with(const std::string& text, const std::string& end) {
+  return text.size() >= end.size() &&
+         text.compare(text.size() - end.size(), end.size(), end) == 0;
+}
+
+// A plain file name: no directory, nothing hidden, a session's extension.
+bool record_name(const std::string& text) {
+  if (text.size() <= 5 || text.size() > kMaxRecordName || text[0] == '.' ||
+      !ends_with(text, ".vrst")) {
+    return false;
+  }
+  for (const char c : text) {
+    const bool word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                      c == '-';
+    if (!word) return false;
+  }
+  return true;
+}
+
+// What a numeric address and port can hold; the link checks the rest.
+bool connect_text(const std::string& text) {
+  if (text.empty() || text.size() > 21) return false;  // 255.255.255.255:65535
+  for (const char c : text) {
+    if (!((c >= '0' && c <= '9') || c == '.' || c == ':')) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 const char* to_string(CaptureSource source) noexcept {
@@ -53,7 +82,10 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
   };
   for (std::size_t i = 1; i < arguments.size(); ++i) {
     const std::string& flag = arguments[i];
-    if (flag != "-source" && flag != "-minutes") continue;
+    if (flag != "-source" && flag != "-minutes" && flag != "-record" &&
+        flag != "-connect") {
+      continue;
+    }
     if (i + 1 == arguments.size()) {
       refuse(flag + " needs a value after it");
       break;
@@ -66,6 +98,22 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
         if (out.refusal.empty()) out.source = CaptureSource::Pattern;
       } else {
         refuse("-source takes camera or pattern, not \"" + value + "\"");
+      }
+    } else if (flag == "-record") {
+      if (record_name(value)) {
+        out.record = value;
+      } else {
+        refuse(
+            "-record takes a file name ending .vrst (letters, digits, . _ "
+            "-, at most " +
+            std::to_string(kMaxRecordName) + "), not \"" + value + "\"");
+      }
+    } else if (flag == "-connect") {
+      if (connect_text(value)) {
+        out.connect = value;
+      } else {
+        refuse("-connect takes a numeric address, a.b.c.d:port, not \"" +
+               value + "\"");
       }
     } else if (const std::optional<std::uint32_t> minutes = minutes_of(value)) {
       out.minutes = *minutes;
@@ -126,6 +174,52 @@ std::string capture_report_line(const CaptureReport& r) {
     line += " | session failed: " + r.session_error;
   }
   return line;
+}
+
+std::string stream_report_line(const StreamReport& r) {
+  char head[64];
+  std::snprintf(head, sizeof head, "st%s %.1f s: ", r.stop ? " stop" : "",
+                r.seconds);
+  std::string line = head;
+  if (!r.on) {
+    return line + "off, " + (r.error.empty() ? "no sender" : r.error);
+  }
+  char counts[256];
+  std::snprintf(counts, sizeof counts,
+                "%s | taken %llu busy %llu coded %llu (keys %llu) failed %llu "
+                "written %llu refused %llu | map steps %llu",
+                r.session ? "session" : "dry",
+                static_cast<unsigned long long>(r.taken),
+                static_cast<unsigned long long>(r.busy),
+                static_cast<unsigned long long>(r.coded),
+                static_cast<unsigned long long>(r.keys),
+                static_cast<unsigned long long>(r.failed),
+                static_cast<unsigned long long>(r.written),
+                static_cast<unsigned long long>(r.refused),
+                static_cast<unsigned long long>(r.map_steps));
+  line += counts;
+  char rates[96];
+  std::snprintf(rates, sizeof rates, " | video %.2f depth %.2f Mbit/s",
+                r.video_bits_per_s * 1e-6, r.depth_bits_per_s * 1e-6);
+  line += rates;
+  line += " | send ms " + spread(r.send_ms, 2);
+  line += " | coded ms " + spread(r.coded_ms, 2);
+  if (r.session) {
+    line += " | viewers " + std::to_string(r.viewers) + " dial failures " +
+            std::to_string(r.dial_failures);
+  }
+  if (!r.error.empty()) line += " | last failure: " + r.error;
+  return line;
+}
+
+std::string without_path(std::string text, const std::string& path) {
+  if (path.empty()) return text;
+  static const std::string kSaid = "the session file";
+  for (std::size_t at = text.find(path); at != std::string::npos;
+       at = text.find(path, at + kSaid.size())) {
+    text.replace(at, path.size(), kSaid);
+  }
+  return text;
 }
 
 }  // namespace volumetric_kit::ios_app

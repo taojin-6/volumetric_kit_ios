@@ -29,6 +29,7 @@
 #include "Fusion.hpp"
 #include "OrbitCamera.hpp"
 #include "ViewOrientation.hpp"
+#include "rgbd_stream_sender.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -160,6 +161,19 @@ struct RendererImpl {
   std::string camera_error;
   bool camera_pattern = false;  ///< `ArkitSource::Pattern`: no camera opened.
   CameraReadout camera_readout;
+  // The camera's frames as a stream (Session/rgbd_stream_sender.hpp): the
+  // fuse thread offers it every frame it takes, and its own thread codes the
+  // taken frames' pictures and writes them to the file and the live link, or
+  // counts them (the dry run). Opened at bring-up after the camera, whose
+  // info it describes; kept across a stop and a start, so a scan's session
+  // is one. After `arkit`, so it lets its frames' pictures go first: its
+  // destructor finishes it, joining its thread. Null when it did not open,
+  // `stream_error` saying why.
+  std::unique_ptr<RgbdStreamSender> stream;
+  std::string stream_error;
+  /// The session file's path, empty for none: never said on the console or
+  /// the screen (`without_path`).
+  std::string record_path;
 
   // --- Reconstruction ------------------------------------------------------
   Fusion fusion;

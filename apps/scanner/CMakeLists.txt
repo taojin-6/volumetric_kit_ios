@@ -131,13 +131,16 @@ function(vi_add_scanner_bridge bridge_target)
   # recon_texture fuse and texture on them.
   #
   # vi_core is PUBLIC because the bridge's own headers expose it: the renderer
-  # holds an OrbitCamera by value and hands MemoryBudget across the seam. The
-  # core's vulkan tier is named too, not left to the siblings' links: the bridge
-  # builds the SharedDevice, adopts the compute Device and makes its Allocator
-  # itself.
+  # holds an OrbitCamera by value and hands MemoryBudget across the seam. So is
+  # vi_stream, the stream sender the renderer holds (RendererImpl.hpp), which
+  # the fuse thread offers every frame and the live link (VolumetricLink.mm)
+  # dials out; it brings vi_session's writer. The core's vulkan tier is named
+  # too, not left to the siblings' links: the bridge builds the SharedDevice,
+  # adopts the compute Device and makes its Allocator itself.
   target_link_libraries(
     ${bridge_target}
     PUBLIC vi_core
+           vi_stream
            volumetric_kit::core_vulkan
            volumetric_kit::gfx_app
            volumetric_kit::gfx_core
@@ -155,9 +158,6 @@ function(vi_add_scanner_bridge bridge_target)
             # rules, on the device's VideoToolbox.
             volumetric_kit::sensor_video
             volumetric_kit::sensor_video_testing
-            # The live link (Bridge/VolumetricLink.mm): the session writer,
-            # which dials the reader the on-screen entry names.
-            vi_session
             vi_scanner_shaders)
 endfunction()
 

@@ -4,15 +4,17 @@
 #pragma once
 
 /// @file CaptureReport.hpp
-/// @brief Which camera a scanner launch asks for (`-source`, `-minutes`), and
-///        the console line a run prints every @ref kReportEverySeconds:
-///        counts, times, states and colour codes, never a pixel, a depth
-///        value, a pose or a path.
+/// @brief What a scanner launch asks for (`-source`, `-minutes`, `-record`,
+///        `-connect`), and the console lines a run prints every
+///        @ref kReportEverySeconds: counts, times, states and colour codes,
+///        never a pixel, a depth value, a pose or a path.
 ///
-/// Pure, so the argument rule and the line are host tested. The bridge
+/// Pure, so the argument rule and the lines are host tested. The bridge
 /// (Bridge/FuseLoop.cpp) fills a @ref CaptureReport from `ArkitSensor`'s
-/// status and counters and the fuse thread's own timings, and prints it.
+/// status and counters and the fuse thread's own timings, and a
+/// @ref StreamReport from the stream sender's, and prints them.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -37,6 +39,13 @@ struct LaunchOptions {
   std::optional<CaptureSource> source = CaptureSource::Camera;
   /// Minutes the scanner runs before it stops and exits; 0 runs on.
   std::uint32_t minutes = 0;
+  /// The session file the stream writes, a plain name the app's Documents
+  /// holds it under; empty writes none.
+  std::string record;
+  /// The reader the stream dials once the scanner is up, as the on-screen
+  /// entry's address names one ("a.b.c.d:port", or the address alone for the
+  /// default port), which the link checks then; empty dials none.
+  std::string connect;
   /// Why an argument was refused, for the screen and the console; empty when
   /// none was.
   std::string refusal;
@@ -45,11 +54,18 @@ struct LaunchOptions {
 /// @brief The most minutes `-minutes` takes: a day.
 inline constexpr std::uint32_t kMaxRunMinutes = 24 * 60;
 
+/// @brief The longest `-record` name.
+inline constexpr std::size_t kMaxRecordName = 64;
+
 /// @return What @p arguments (the process's, the program first) ask for:
-///         `-source camera` or `-source pattern` (the camera when absent), and
+///         `-source camera` or `-source pattern` (the camera when absent);
 ///         `-minutes N` with N a whole number from 1 to @ref kMaxRunMinutes
-///         (run on when absent). Another value, or a flag with none after it,
-///         is refused: `source` empty and `refusal` naming it.
+///         (run on when absent); `-record <name>`, a name of letters, digits,
+///         `.`, `_` and `-`, not starting with `.`, ending `.vrst`, at most
+///         @ref kMaxRecordName long (no file when absent); and
+///         `-connect <address>`, digits, `.` and `:` (no dial when absent).
+///         Another value, or a flag with none after it, is refused: `source`
+///         empty and `refusal` naming it.
 LaunchOptions launch_options(const std::vector<std::string>& arguments);
 
 /// @brief How often a run prints its @ref capture_report_line.
@@ -106,5 +122,53 @@ struct CaptureReport {
 ///         with their counts; the colour codes; the contract; and, for the
 ///         pattern, the index check.
 std::string capture_report_line(const CaptureReport& report);
+
+/// @brief The stream's part of a window, as its console line says it: the
+///        sender's counts since it opened
+///        (Session/rgbd_stream_sender.hpp's `RgbdStreamSenderStats`, mirrored
+///        so this library includes no sibling) and this window's rates and
+///        times.
+struct StreamReport {
+  double seconds = 0.0;  ///< Since the run's start, as its `sa` line's.
+  bool stop = false;     ///< The line at a stop.
+  /// A sender is open; when not, @ref error says why and nothing else is
+  /// read.
+  bool on = false;
+  /// A session is open, a file, a link or both; otherwise the sender codes
+  /// and counts only (the dry run).
+  bool session = false;
+  std::uint64_t taken = 0;   ///< Frames the rate gate took.
+  std::uint64_t busy = 0;    ///< Due frames left while the sender was busy.
+  std::uint64_t coded = 0;   ///< Pictures coded.
+  std::uint64_t keys = 0;    ///< Of them, keys.
+  std::uint64_t failed = 0;  ///< Pictures not coded: their frames went nowhere.
+  std::uint64_t written = 0;    ///< Frames written whole to the session.
+  std::uint64_t refused = 0;    ///< Coded frames the session refused.
+  std::uint64_t map_steps = 0;  ///< Map steps taken out of the poses.
+  /// This window's access units and depth records, bits a second.
+  double video_bits_per_s = 0.0;
+  double depth_bits_per_s = 0.0;
+  /// This window's pictures, ms each: the send's return, and send to the
+  /// access unit back.
+  std::vector<double> send_ms;
+  std::vector<double> coded_ms;
+  std::size_t viewers = 0;          ///< Live readers connected now.
+  std::uint64_t dial_failures = 0;  ///< Dials failed in a row.
+  /// The sender's last failure, or why none is open; empty for none.
+  std::string error;
+};
+
+/// @return @p report as one line, "st <seconds> s: ..." ("st stop" at a
+///         stop): "dry" or "session"; the counts; video and depth Mbit/s;
+///         send and coded ms at p50 and p95 with their counts; the live
+///         readers and failed dials; the last failure. "st <seconds> s: off,
+///         <error>" with no sender.
+std::string stream_report_line(const StreamReport& report);
+
+/// @return @p text with each @p path in it, the session file's place on the
+///         device, said as "the session file", so a message the console or
+///         the screen shows never holds a path; @p text as it is for an empty
+///         @p path.
+std::string without_path(std::string text, const std::string& path);
 
 }  // namespace volumetric_kit::ios_app

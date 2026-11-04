@@ -71,8 +71,54 @@ TEST(LaunchOptions, AMistypedSourceOpensNoCamera) {
   }
 }
 
+TEST(LaunchOptions, RecordAndConnectAreRead) {
+  const LaunchOptions o =
+      parse({"-source", "pattern", "-record", "i1v_pattern-1.vrst", "-connect",
+             "192.168.1.20:7300"});
+  ASSERT_TRUE(o.source.has_value());
+  EXPECT_EQ(*o.source, CaptureSource::Pattern);
+  EXPECT_EQ(o.record, "i1v_pattern-1.vrst");
+  EXPECT_EQ(o.connect, "192.168.1.20:7300");
+  EXPECT_TRUE(o.refusal.empty());
+
+  const LaunchOptions none = parse({"-source", "camera"});
+  EXPECT_TRUE(none.record.empty());
+  EXPECT_TRUE(none.connect.empty());
+}
+
+/// A record name is a plain file in the app's own folder: no directory, no
+/// hidden file, nothing but a session's extension.
+TEST(LaunchOptions, ARecordNameThatIsNotAPlainSessionFileIsRefused) {
+  const std::string long_name = std::string(60, 'a') + ".vrst";  // 65
+  for (const std::string& bad :
+       {std::string("take"), std::string("take.mp4"), std::string(".vrst"),
+        std::string(".hidden.vrst"), std::string("takes/a.vrst"),
+        std::string("../a.vrst"), std::string("a b.vrst"), std::string(""),
+        long_name}) {
+    const LaunchOptions o = parse({"-record", bad});
+    EXPECT_FALSE(o.source.has_value()) << bad;
+    EXPECT_TRUE(o.record.empty()) << bad;
+    EXPECT_TRUE(has(o.refusal, "-record takes a file name ending .vrst"))
+        << bad;
+  }
+  EXPECT_TRUE(
+      parse({"-record", std::string(59, 'a') + ".vrst"}).source.has_value());
+}
+
+TEST(LaunchOptions, AConnectThatCannotBeAnAddressIsRefused) {
+  for (const char* bad : {"lab.local:7300", "-source", "", "10.0.0.1:7300 ",
+                          "1.2.3.4;80", "255.255.255.255:655350"}) {
+    const LaunchOptions o = parse({"-connect", bad});
+    EXPECT_FALSE(o.source.has_value()) << bad;
+    EXPECT_TRUE(o.connect.empty()) << bad;
+    EXPECT_TRUE(has(o.refusal, "-connect takes a numeric address")) << bad;
+  }
+  // The link checks the rest: the default port, and the parts' ranges.
+  EXPECT_EQ(parse({"-connect", "10.8.0.1"}).connect, "10.8.0.1");
+}
+
 TEST(LaunchOptions, AFlagWithNoValueIsRefused) {
-  for (const char* flag : {"-source", "-minutes"}) {
+  for (const char* flag : {"-source", "-minutes", "-record", "-connect"}) {
     const LaunchOptions o = parse({flag});
     EXPECT_FALSE(o.source.has_value()) << flag;
     EXPECT_TRUE(has(o.refusal, "needs a value")) << flag;
@@ -163,6 +209,68 @@ TEST(CaptureReportLine, TheCameraHasNoIndexCheck) {
   EXPECT_EQ(line.rfind("sa camera 10.0 s: tracking - | ", 0), 0u) << line;
   EXPECT_TRUE(has(line, "codes 6/1/1 limited loc 0")) << line;
   EXPECT_FALSE(has(line, "index")) << line;
+}
+
+app::StreamReport session_stream() {
+  app::StreamReport r;
+  r.seconds = 20.02;
+  r.on = true;
+  r.session = true;
+  r.taken = 200;
+  r.busy = 1;
+  r.coded = 199;
+  r.keys = 2;
+  r.failed = 1;
+  r.written = 198;
+  r.refused = 1;
+  r.map_steps = 3;
+  r.video_bits_per_s = 4.25e6;
+  r.depth_bits_per_s = 11.8e6;
+  r.send_ms = {0.1, 0.3, 0.2, 0.4};
+  r.coded_ms = {5.0, 7.0, 6.0, 9.0};
+  r.viewers = 1;
+  r.dial_failures = 0;
+  return r;
+}
+
+TEST(StreamReportLine, CarriesCountsRatesTimesAndTheLink) {
+  const std::string line = app::stream_report_line(session_stream());
+  EXPECT_EQ(line,
+            "st 20.0 s: session | taken 200 busy 1 coded 199 (keys 2) failed 1 "
+            "written 198 refused 1 | map steps 3 | video 4.25 depth 11.80 "
+            "Mbit/s | send ms p50 0.20 p95 0.40 (4) | coded ms p50 6.00 p95 "
+            "9.00 (4) | viewers 1 dial failures 0");
+}
+
+TEST(StreamReportLine, SaysDryOffAndTheLastFailure) {
+  app::StreamReport dry = session_stream();
+  dry.session = false;
+  dry.stop = true;
+  dry.send_ms.clear();
+  dry.coded_ms.clear();
+  dry.error = "HevcEncoder::receive: the picture was dropped";
+  const std::string line = app::stream_report_line(dry);
+  EXPECT_EQ(line.rfind("st stop 20.0 s: dry | taken 200", 0), 0u) << line;
+  EXPECT_TRUE(has(line, "send ms - (0) | coded ms - (0)")) << line;
+  EXPECT_FALSE(has(line, "viewers")) << line;  // no link in a dry run
+  EXPECT_TRUE(has(line,
+                  "| last failure: HevcEncoder::receive: the picture was "
+                  "dropped"))
+      << line;
+
+  app::StreamReport off;
+  off.seconds = 10.0;
+  // The file's place on the device is never said.
+  const std::string path = "/var/mobile/Containers/Data/X/Documents/a.vrst";
+  EXPECT_EQ(
+      app::without_path(
+          "StreamWriter::create: " + path + " exists; open " + path, path),
+      "StreamWriter::create: the session file exists; open the session "
+      "file");
+  EXPECT_EQ(app::without_path("no path here", ""), "no path here");
+  off.error = "the camera did not open";
+  EXPECT_EQ(app::stream_report_line(off),
+            "st 10.0 s: off, the camera did not open");
 }
 
 }  // namespace

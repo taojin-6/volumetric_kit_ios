@@ -15,13 +15,15 @@ final class LinkModel: ObservableObject {
   @Published private(set) var state: VolumetricLinkState = .off
   @Published private(set) var target = ""
   @Published private(set) var dialFailures: UInt64 = 0
+  /// Frames the session has sent whole.
+  @Published private(set) var frames: UInt64 = 0
   /// Why the last connect was refused, for under the fields; nil after one
   /// that was not.
   @Published private(set) var entryError: String?
 
   private let link = VolumetricLink()
-  /// Whose camera the session describes, at the first connect: set once the
-  /// renderer is up, nil before.
+  /// Whose stream the link dials out: set once the renderer is up, nil
+  /// before.
   weak var renderer: VolumetricRenderer?
   private var timer: Timer?
 
@@ -57,6 +59,7 @@ final class LinkModel: ObservableObject {
     let now = link.status
     if state != now.state { state = now.state }
     if dialFailures != now.dial_failures { dialFailures = now.dial_failures }
+    if frames != now.frames { frames = now.frames }
     let named = link.target
     if target != named { target = named }
   }
@@ -81,7 +84,7 @@ final class LinkModel: ObservableObject {
     case .dialing:
       return "Dialing \(target)…"
     case .connected:
-      return "Connected to \(target). This build sends the session, no frames."
+      return "Connected to \(target): \(frames) frames sent."
     case .retrying:
       return "Retrying \(target): \(dialFailures) dials failed."
     case .needsLocalNetwork:

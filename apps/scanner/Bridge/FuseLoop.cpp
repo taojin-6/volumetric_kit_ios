@@ -48,6 +48,11 @@ struct Window {
   // When the first frame came, since the start: after a lock, how soon the
   // camera is back.
   std::optional<double> first_frame_s;
+  // The stream's bytes at the window's start, and when it started: the
+  // window's rates.
+  std::uint64_t video_bytes = 0;
+  std::uint64_t depth_bytes = 0;
+  Clock::time_point since = Clock::now();
   void clear() {
     poll_ms.clear();
     fuse_ms.clear();
@@ -95,6 +100,9 @@ void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
       impl.camera_readout.codes_known = true;
     }
   }
+
+  // Before the fuse, so the picture codes on the sender's thread meanwhile.
+  if (impl.stream) impl.stream->offer(frame);
 
   if (const std::optional<FuseTimes> fused = impl.fusion.fuse(frame, poll_ms)) {
     ++window.fused;
@@ -148,6 +156,52 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   const std::string line = capture_report_line(r);
   std::fputs(line.c_str(), stdout);
   std::fputc('\n', stdout);
+
+  // The stream's line beside it: counts since the sender opened, this
+  // window's rates and picture times.
+  StreamReport st;
+  st.seconds = r.seconds;
+  st.stop = stop;
+  const Clock::time_point now = Clock::now();
+  if (impl.stream) {
+    const RgbdStreamSenderStats s = impl.stream->stats();
+    st.on = true;
+    st.session = s.session_open;
+    st.taken = s.taken;
+    st.busy = s.busy;
+    st.coded = s.coded;
+    st.keys = s.keys;
+    st.failed = s.failed;
+    st.written = s.written;
+    st.refused = s.refused;
+    st.map_steps = s.map_steps;
+    const double window_s =
+        std::chrono::duration<double>(now - window.since).count();
+    if (window_s > 0.0) {
+      st.video_bits_per_s =
+          8.0 * static_cast<double>(s.picture_bytes - window.video_bytes) /
+          window_s;
+      st.depth_bits_per_s =
+          8.0 *
+          static_cast<double>(s.session.depth_bytes - window.depth_bytes) /
+          window_s;
+    }
+    window.video_bytes = s.picture_bytes;
+    window.depth_bytes = s.session.depth_bytes;
+    for (const PictureTimes& t : impl.stream->take_times()) {
+      st.send_ms.push_back(t.send_ms);
+      st.coded_ms.push_back(t.coded_ms);
+    }
+    st.viewers = s.session.viewers;
+    st.dial_failures = s.session.dial_failures;
+    st.error = without_path(s.error, impl.record_path);
+  } else {
+    st.error = impl.stream_error;
+  }
+  window.since = now;
+  const std::string stream_line = stream_report_line(st);
+  std::fputs(stream_line.c_str(), stdout);
+  std::fputc('\n', stdout);
   std::fflush(stdout);
   window.clear();
 }
@@ -166,6 +220,14 @@ void run_fuse_loop(RendererImpl& impl) {
     impl.camera_readout.index_mismatches = 0;
   }
   Window window;
+  if (impl.stream) {
+    // The sender lives across starts: this run's rates count from here, and
+    // its times from this run's first frame.
+    const RgbdStreamSenderStats s = impl.stream->stats();
+    window.video_bytes = s.picture_bytes;
+    window.depth_bytes = s.session.depth_bytes;
+    (void)impl.stream->take_times();
+  }
   // A line's worth of samples at the camera's 60 Hz, so the hot path does not
   // grow them.
   window.poll_ms.reserve(1024);
