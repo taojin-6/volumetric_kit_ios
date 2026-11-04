@@ -41,7 +41,8 @@ using Clock = std::chrono::steady_clock;
 
 // A sensor on its own clock takes the session's clock 1; one sensor a session.
 constexpr std::uint16_t kDeviceClock = 1;
-// How often the dial thread looks whether the served reader is still there.
+// The longest the dial thread goes without looking whether the served reader
+// is still there.
 constexpr std::chrono::milliseconds kWatch{100};
 
 core::Status refuse(const char* api, const std::string& why) {
@@ -92,6 +93,9 @@ struct RgbdStreamWriter::Impl {
   // --- The link --------------------------------------------------------------
   stream::Session session;  // what a reader gets first
   networking::ServerOptions server_options;
+  std::chrono::milliseconds redial_wait = kRedialWait;  // the options'
+  std::chrono::milliseconds dial_limit = kDialLimit;
+  std::chrono::milliseconds watch = kWatch;  // from redial_wait
   // Set once, under link_mutex, and kept until the writer goes: append and
   // key_wanted read it without the lock.
   std::unique_ptr<networking::StreamServer> server;
@@ -169,12 +173,12 @@ void RgbdStreamWriter::Impl::dial_loop() noexcept try {
     if (reader.valid()) {
       if (server->viewers() == 0) {
         // The served reader has ended (left, refused the session, failed or
-        // stalled): its end goes now. One served for less than kRedialWait
+        // stalled): its end goes now. One served for less than redial_wait
         // counts as a failed dial, so a reader that refuses every connection
         // reads as retrying.
         let_go(&reader);
-        if (now - served_at < kRedialWait) ++dial_failures;
-      } else if (now - served_at >= kRedialWait) {
+        if (now - served_at < redial_wait) ++dial_failures;
+      } else if (now - served_at >= redial_wait) {
         dial_failures = 0;  // a reader that stays ends the failures' run
       }
     }
@@ -183,13 +187,13 @@ void RgbdStreamWriter::Impl::dial_loop() noexcept try {
       continue;
     }
     if (host.empty() || reader.valid() || server->viewers() > 0) {
-      link_wake.wait_for(lock, kWatch);  // a reader served, or going
+      link_wake.wait_for(lock, watch);  // a reader served, or going
       continue;
     }
-    // At most one dial a kRedialWait, however the last ended; a connect
+    // At most one dial a redial_wait, however the last ended; a connect
     // dials at once.
-    if (!dial_now && now < last_dial + kRedialWait) {
-      link_wake.wait_until(lock, last_dial + kRedialWait,
+    if (!dial_now && now < last_dial + redial_wait) {
+      link_wake.wait_until(lock, last_dial + redial_wait,
                            [&] { return stopping || dial_now; });
       continue;
     }
@@ -198,7 +202,7 @@ void RgbdStreamWriter::Impl::dial_loop() noexcept try {
     const std::uint16_t at = port;
     last_dial = now;
     lock.unlock();
-    core::Result<core::UniqueFd> fd = net::dial(to, at, kDialLimit);
+    core::Result<core::UniqueFd> fd = net::dial(to, at, dial_limit);
     lock.lock();
     // Stopped, or the target moved meanwhile: the socket closes unserved,
     // and the new target is dialled at once.
@@ -247,6 +251,10 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
                   [](std::uint8_t b) { return b == 0; })) {
     return refuse(kApi, "an all-zero session id, which names no session");
   }
+  // Read by a link, which dial_to can start later: checked with or without.
+  if (options.redial_wait.count() <= 0 || options.dial_limit.count() <= 0) {
+    return refuse(kApi, "a redial wait or dial limit of 0 or less");
+  }
   if (!options.dial_host.empty()) {
     VKC_TRY(check_target(kApi, options.dial_host, options.dial_port));
   }
@@ -294,6 +302,13 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
   serving.replay_gop = false;
   serving.max_viewers = 1;
   serving.max_gop_bytes = options.max_gop_bytes;
+  impl->redial_wait = options.redial_wait;
+  impl->dial_limit = options.dial_limit;
+  // A tenth of the redial wait, so a redial trails a leave by the same share
+  // of the wait; at most kWatch, and at least 1 ms, so a redial wait under
+  // 10 ms never spins.
+  impl->watch = std::clamp<std::chrono::milliseconds>(
+      options.redial_wait / 10, std::chrono::milliseconds{1}, kWatch);
 
   if (!options.path.empty()) {
     VKC_ASSIGN(impl->file, stream::StreamWriter::create(options.path, session));

@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -425,6 +426,18 @@ TEST(RgbdStreamWriter, OpenRefusesWhatItCannotWrite) {
   app::RgbdStreamOptions no_id = options;
   no_id.session_id = {};
   EXPECT_EQ(app::RgbdStreamWriter::open(no_id, info).status().domain(),
+            vkc::Status::Code::InvalidArgument);
+  EXPECT_FALSE(fs::exists(file.path()));
+
+  // The link's times, refused with or without a dial host: dial_to can start
+  // the link later.
+  app::RgbdStreamOptions no_wait = options;
+  no_wait.redial_wait = std::chrono::milliseconds{0};
+  EXPECT_EQ(app::RgbdStreamWriter::open(no_wait, info).status().domain(),
+            vkc::Status::Code::InvalidArgument);
+  app::RgbdStreamOptions no_limit = options;
+  no_limit.dial_limit = std::chrono::milliseconds{-1};
+  EXPECT_EQ(app::RgbdStreamWriter::open(no_limit, info).status().domain(),
             vkc::Status::Code::InvalidArgument);
   EXPECT_FALSE(fs::exists(file.path()));
 
