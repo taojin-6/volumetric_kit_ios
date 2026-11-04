@@ -33,13 +33,14 @@
 /// host that reaches the phone can connect to it. A thread of the writer's
 /// dials the reader (`core::net::dial`) and hands the socket to the server
 /// (`StreamServer::add_viewer`); while no reader is served it dials again,
-/// at most once a second (@ref kRedialWait). One reader at a time. A reader
-/// that joins waits for a key, and asks for one (@ref key_wanted); one that
-/// falls more than @ref RgbdStreamOptions::max_gop_bytes behind loses whole
-/// frames up to the next key, which the file keeps. The on-screen connect and
-/// disconnect move the target (@ref dial_to) while the session and the file
-/// go on, so the reader's next connection is the same session, which it
-/// accepts. The link serves a frame once the file holds it whole.
+/// at most once a @ref RgbdStreamOptions::redial_wait (the app's: a second,
+/// @ref kRedialWait). One reader at a time. A reader that joins waits for a
+/// key, and asks for one (@ref key_wanted); one that falls more than
+/// @ref RgbdStreamOptions::max_gop_bytes behind loses whole frames up to the
+/// next key, which the file keeps. The on-screen connect and disconnect move
+/// the target (@ref dial_to) while the session and the file go on, so the
+/// reader's next connection is the same session, which it accepts. The link
+/// serves a frame once the file holds it whole.
 ///
 /// @code
 /// namespace app = volumetric_kit::ios_app;
@@ -76,12 +77,9 @@
 
 namespace volumetric_kit::ios_app {
 
-/// The longest one dial waits for the reader to answer.
+/// @ref RgbdStreamOptions::dial_limit's default, the app's.
 inline constexpr std::chrono::milliseconds kDialLimit{2'000};
-/// The least time from one dial's start to the next's, while no reader is
-/// served: after a failed dial, or a reader that left at once (one that
-/// refuses the session), the next dial starts this long after the last
-/// began. A connect (`RgbdStreamWriter::dial_to`) dials at once.
+/// @ref RgbdStreamOptions::redial_wait's default, the app's.
 inline constexpr std::chrono::milliseconds kRedialWait{1'000};
 
 /// @brief A frame's colour as the caller coded it.
@@ -116,6 +114,16 @@ struct RgbdStreamOptions {
   /// How far behind the newest record a live reader may fall before it waits
   /// for the next key (`ServerOptions::max_gop_bytes`).
   std::uint64_t max_gop_bytes = std::uint64_t{4} << 20;
+  /// The least time from one dial's start to the next's, while no reader is
+  /// served: after a failed dial, or a reader that left at once (one that
+  /// refuses the session), the next dial starts this long after the last
+  /// began. A connect (`RgbdStreamWriter::dial_to`) dials at once. A reader
+  /// served this long ends a run of failed dials
+  /// (@ref RgbdStreamStats::dial_failures). Positive; tests shorten it.
+  std::chrono::milliseconds redial_wait = kRedialWait;
+  /// The longest one dial waits for the reader to answer. Positive; tests
+  /// shorten it.
+  std::chrono::milliseconds dial_limit = kDialLimit;
 };
 
 /// @brief What a @ref RgbdStreamWriter has written since it opened.
@@ -129,11 +137,11 @@ struct RgbdStreamStats {
   /// falls.
   std::uint64_t key_wanted = 0;
   std::size_t viewers = 0;  ///< Live readers connected now: 0 or 1.
-  /// Dials that failed in a row: a reader that left within @ref kRedialWait
-  /// of joining counts as one, and one served @ref kRedialWait or longer, or
-  /// a new target (@ref RgbdStreamWriter::dial_to), starts the count again
-  /// from 0. The screen's "retrying" while above 0 and no reader is
-  /// connected.
+  /// Dials that failed in a row: a reader that left within
+  /// @ref RgbdStreamOptions::redial_wait of joining counts as one, and one
+  /// served that long or longer, or a new target
+  /// (@ref RgbdStreamWriter::dial_to), starts the count again from 0. The
+  /// screen's "retrying" while above 0 and no reader is connected.
   std::uint64_t dial_failures = 0;
   /// The last dial failed with no route to the host (`is_no_route`,
   /// dial_entry.hpp): on iOS, the app's Local Network access not granted
@@ -148,9 +156,10 @@ class RgbdStreamWriter {
   /// @brief Write the session header, and start dialling with a dial host.
   /// @param info  The sensor's, from when it opened.
   /// @return The writer; with no file made, `Status::Code::InvalidArgument`
-  ///         for neither a path nor a dial host, an all-zero session id, or a
-  ///         dial host that is not one host's numeric IPv4 address or a dial
-  ///         port of 0 (`core::net::parse_endpoint`'s reason); a sensor
+  ///         for neither a path nor a dial host, an all-zero session id, a
+  ///         `redial_wait` or `dial_limit` of 0 or less, or a dial host that
+  ///         is not one host's numeric IPv4 address or a dial port of 0
+  ///         (`core::net::parse_endpoint`'s reason); a sensor
   ///         `sensor::wire::encode_sensor` refuses, as its code;
   ///         `StreamWriter::create`'s and `StreamServer::start`'s errors
   ///         otherwise, and `Status::Code::IoError` for a dial thread that
@@ -194,10 +203,10 @@ class RgbdStreamWriter {
   /// The session and the file go on: a reader dialled again, here or at the
   /// new target, gets the same session, from its next key. Another target
   /// lets the connected reader go first, and dials once the dial under way
-  /// ends (within @ref kDialLimit); the same one keeps a connected reader and
-  /// a dial under way, which answers it, and dials at once otherwise. Either
-  /// way @ref RgbdStreamStats::dial_failures starts again from 0. Returns
-  /// without waiting on a socket.
+  /// ends (within @ref RgbdStreamOptions::dial_limit); the same one keeps a
+  /// connected reader and a dial under way, which answers it, and dials at
+  /// once otherwise. Either way @ref RgbdStreamStats::dial_failures starts
+  /// again from 0. Returns without waiting on a socket.
   /// @param host  A numeric IPv4 address, or empty.
   /// @param port  Its port; not read with an empty @p host.
   /// @return OK; with the last target kept, `Status::Code::InvalidArgument`
@@ -208,9 +217,10 @@ class RgbdStreamWriter {
   core::Status dial_to(const std::string& host, std::uint16_t port);
 
   /// @brief End the session: the file's footer, then the link's end. The
-  ///        dialling stops, within the dial under way (@ref kDialLimit), and
-  ///        a live reader gets the records queued for it before its end
-  ///        (`StreamServer::finish`, within `kFinishLimit`). Idempotent.
+  ///        dialling stops, within the dial under way
+  ///        (@ref RgbdStreamOptions::dial_limit), and a live reader gets the
+  ///        records queued for it before its end (`StreamServer::finish`,
+  ///        within `kFinishLimit`). Idempotent.
   /// @return OK; the footer's write error, or the file's earlier one; a
   ///         later call returns the first's. `Status::Code::OutOfMemory`
   ///         leaves the session open, and a later call tries again.
