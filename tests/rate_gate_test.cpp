@@ -132,4 +132,24 @@ TEST(RateGate, ZeroTakesEveryFrame) {
   EXPECT_EQ(gate.hz(), 0u);
 }
 
+/// `due` says what `take` would and takes nothing, so a frame left while the
+/// sender is busy keeps the interval for the next one.
+TEST(RateGate, DueSaysWhatTakeWouldAndTakesNothing) {
+  const std::vector<std::uint64_t> t = steady(240, k60HzNs);
+  app::RateGate asked(10);
+  app::RateGate plain(10);
+  for (const std::uint64_t ns : t) {
+    const bool due = asked.due(ns);
+    EXPECT_EQ(asked.due(ns), due);  // asking twice changes nothing
+    EXPECT_EQ(asked.take(ns), due);
+    EXPECT_EQ(plain.take(ns), due);
+  }
+  // Frame 0 is due and left; frame 1 then takes the interval.
+  app::RateGate left(10);
+  EXPECT_TRUE(left.due(t[0]));
+  EXPECT_TRUE(left.take(t[1]));
+  EXPECT_FALSE(left.due(t[2]));
+  EXPECT_TRUE(left.due(t[7]));
+}
+
 }  // namespace

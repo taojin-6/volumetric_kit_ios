@@ -1,21 +1,25 @@
 name: test
 
-# The host tests for vi_core -- the scanner's pure logic -- and vi_session, the
-# session writer.
+# The host tests for vi_core -- the scanner's pure logic --, vi_session, the
+# session writer, and vi_stream, the stream sender.
 #
 # This is the only job in this repo that *runs* anything. The app targets are
 # build-only by nature: MoltenVK ships no simulator slice and ARKit scene depth
-# needs LiDAR, so nothing that touches ARKit or a GPU can execute anywhere but
+# needs LiDAR, so nothing that touches ARKit's camera can execute anywhere but
 # a real device. vi_core is the part that carries no such dependency, and it is
 # deliberately the part that decides things -- a sign, a threshold, whether a
 # kernel reading is trustworthy -- so it is where a test earns the most.
-# vi_session is host code on sensor's and grid's public types.
+# vi_session is host code on sensor's and grid's public types; vi_stream's
+# tests run sensor's ARKit test pattern (no camera) on this Mac's GPU and
+# VideoToolbox.
 #
-# It configures with -DVI_HOST_TESTS=ON, which builds vi_core, vi_session and
-# the tests, and of the siblings only the tiers they link: the core, sensor's
-# interface and wire form, grid's .vrst container and server. No recon, gfx,
-# MoltenVK release or Xcode project. That is why this leg is minutes rather
-# than the build leg's tens. The link's tests dial 127.0.0.1 only.
+# It configures with -DVI_HOST_TESTS=ON, which builds vi_core, vi_session,
+# vi_stream and the tests, and of the siblings only the tiers they link: the
+# core and its test fixtures, sensor's interface, wire form, ARKit driver,
+# encoder, decoder and frame prep, grid's .vrst container and server. No
+# recon, gfx, MoltenVK release or Xcode project. That is why this leg is
+# minutes rather than the build leg's tens. The link's tests dial 127.0.0.1
+# only.
 #
 # Invoked by ci.yml, which owns the triggers and the concurrency group.
 on:
@@ -68,6 +72,12 @@ jobs:
         run: cmake --build build-host --parallel 4
 
       # --output-on-failure so a red run carries the assertion in the log rather
-      # than only the case name.
+      # than only the case name. This Mac has a GPU and VideoToolbox's HEVC
+      # encoder and decoder, so the stream sender's tests fail rather than
+      # skip without them, as sensor's Mac leg runs its own.
       - name: Test
+        env:
+          VKC_REQUIRE_VULKAN_DEVICE: '1'
+          VS_TEST_HEVC_BACKEND: videotoolbox
+          VS_TEST_HEVC_ENCODER: videotoolbox
         run: ctest --test-dir build-host --output-on-failure --parallel 4
