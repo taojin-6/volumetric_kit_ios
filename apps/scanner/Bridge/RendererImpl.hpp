@@ -162,9 +162,10 @@ struct RendererImpl {
   bool camera_pattern = false;  ///< `ArkitSource::Pattern`: no camera opened.
   CameraReadout camera_readout;
   // The camera's frames as a stream (Session/rgbd_stream_sender.hpp): the
-  // fuse thread offers it every frame it takes, and its own thread codes the
-  // taken frames' pictures and writes them to the file and the live link, or
-  // counts them (the dry run). Opened at bring-up after the camera, whose
+  // fuse thread offers it every frame it takes, and its own thread copies the
+  // taken frames' pictures into the encoder's own on `compute_device`, codes
+  // them and writes them to the file and the live link, or counts them (the
+  // dry run). Opened at bring-up after the camera, whose
   // info it describes; kept across a stop and a start, so a scan's session
   // is one. After `arkit`, so it lets its frames' pictures go first;
   // ~RendererImpl finishes it, joining its thread, right after the fuse

@@ -4,25 +4,36 @@
 #pragma once
 
 /// @file rgbd_stream_sender.hpp
-/// @brief A camera's frames as an RGBD stream: each frame's picture coded on
-///        the hardware as it is, then the frame written whole to the session
-///        (rgbd_stream_writer.hpp) -- a `.vrst` file, a live link, both, or,
-///        with neither, nowhere (the dry run: it codes and counts).
+/// @brief A camera's frames as an RGBD stream: each frame's picture copied on
+///        the device into the hardware encoder's own and coded, then the
+///        frame written whole to the session (rgbd_stream_writer.hpp) -- a
+///        `.vrst` file, a live link, both, or, with neither, nowhere (the dry
+///        run: it codes and counts).
 ///
 /// Every frame offered has ARKit's map steps taken out of its pose
 /// (`MapSteps`), then the rate gate (`RateGate`, at the session's `fps`)
 /// picks the frames that go. A frame taken goes to a thread of the sender's
-/// own, which sends its picture to sensor's `HevcEncoder` as the camera
-/// left it (`send_pixel_buffer(encoder, pixel_buffer_of(frame.color), ...)`,
-/// no copy), takes its access unit back (`receive`), and appends the frame:
-/// its colour record, then its depth record (`RgbdStreamWriter::append`).
-/// One picture is in flight, which is enough at the stream's 10 Hz, and the
-/// thread that offers never waits on the encoder, the file or the link.
+/// own, which copies its picture's planes on the device into the next of
+/// sensor's `HevcEncoder` pictures (`HevcEncoder::target`, one copy of two
+/// planes, waited for), codes that (`send`), takes its access unit back
+/// (`receive`), and appends the frame: its colour record, then its depth
+/// record (`RgbdStreamWriter::append`). One picture is in flight, which is
+/// enough at the stream's 10 Hz, and the thread that offers never waits on
+/// the device, the encoder, the file or the link.
 ///
+/// - **The copy keeps the camera's pictures free.** VideoToolbox's
+///   low-latency session keeps the last picture it coded until it codes the
+///   next. Handed the camera's own, that is one of the camera's few pictures
+///   for the whole 100 ms between codings, beside those the scanner holds
+///   (its keyframe ring): on the pattern's 4 that stops the camera for good.
+///   With the copy the encoder keeps its own, and the frame's picture goes
+///   back once its frame is sent.
 /// - **The encoder opens at the first picture**, at its size and from its
-///   own tags (`color_codes_of`), an untagged matrix being BT.601, ARKit's,
-///   and codes every picture at @ref RgbdStreamSenderOptions::qp. The
-///   records state the colour the stream states (`HevcEncoder::Facts`).
+///   pixel buffer's tags (`pixel_buffer_of`, `color_codes_of`), an untagged
+///   matrix being BT.601, ARKit's, and codes every picture at
+///   @ref RgbdStreamSenderOptions::qp. The records state the colour the
+///   stream states (`HevcEncoder::Facts`); the copy moves the codes as they
+///   are.
 /// - **A key goes** when the encoder owes one (its first picture, and the
 ///   next after one it dropped or failed), as the session's first frame, and
 ///   when a live reader joined or fell back (`RgbdStreamWriter::key_wanted`).
@@ -36,9 +47,13 @@
 ///   sends late rather than queueing.
 /// - **The session** opens with the sender when its options name a path or a
 ///   reader to dial, and otherwise at the first @ref RgbdStreamSender::dial_to
-///   (the on-screen connect); until then the sender is a dry run. A frame's
-///   exposure, noise and pose go as the frame states them, its pose with the
-///   map steps out.
+///   (the on-screen connect); until then the sender is a dry run. A sender
+///   opened @ref RgbdStreamSenderOptions::dry stays one: it refuses every
+///   dial. A frame's exposure, noise and pose go as the frame states them,
+///   its pose with the map steps out.
+/// - **Map steps are found in the frames offered.** A frame the camera's
+///   poller let go unseen (`IRgbdSensor::poll` keeps the newest) is a gap to
+///   `MapSteps`, which finds no step across a gap of 100 ms or more.
 ///
 /// @code
 /// namespace app = volumetric_kit::ios_app;
@@ -46,6 +61,7 @@
 /// o.session.path = path;  // or empty: a dry run until a connect
 /// o.session.fps = 10;
 /// o.session.session_id = new_session_id();
+/// o.device = &device;  // the camera's (hevc_encoder_device_requirements())
 /// VKC_ASSIGN(auto sender, app::RgbdStreamSender::open(o, camera.info()));
 /// // The camera's poller, each frame:
 /// sender->offer(frame);  // at once; the picture codes on the sender's thread
@@ -67,6 +83,7 @@
 
 #include "rgbd_stream_writer.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/sensor/rgbd_frame.hpp"
 #include "volumetric_kit/sensor/rgbd_sensor.hpp"
 #include "volumetric_kit/sensor/video/hevc_encoder.hpp"
@@ -80,13 +97,24 @@ struct RgbdStreamSenderOptions {
   /// `fps` is also the rate frames are taken at (`RateGate`; 0 takes every
   /// frame); `color` is not read, since every frame goes with its picture.
   RgbdStreamOptions session;
-  /// Every picture's slice QP, keys too (`HevcEncoder::Options::qp`).
+  /// The stream's slice QP (`HevcEncoder::Options::qp`).
   int qp = 22;
+  /// The device the camera's pictures are on (`ArkitSensor::Options::
+  /// device`), made with `sensor::hevc_encoder_device_requirements()`: the
+  /// encoder's pictures are written there. Required. Borrowed: it must
+  /// outlive the sender.
+  const core::Device* device = nullptr;
+  /// A dry run for the sender's life: no file, no reader, and every
+  /// @ref RgbdStreamSender::dial_to that would open the session refused, so
+  /// nothing the camera sees leaves the device. It still codes and counts.
+  bool dry = false;
 };
 
 /// @brief One picture's host times, ms, both from the start of its send.
 struct PictureTimes {
-  double send_ms = 0.0;   ///< `send_pixel_buffer`'s return.
+  /// The picture copied into the encoder's own (`HevcEncoder::target`) and
+  /// sent (`HevcEncoder::send`).
+  double send_ms = 0.0;
   double coded_ms = 0.0;  ///< Its access unit back from `receive`.
 };
 
@@ -100,9 +128,9 @@ struct RgbdStreamSenderStats {
   std::uint64_t busy = 0;
   std::uint64_t coded = 0;  ///< Pictures coded.
   std::uint64_t keys = 0;   ///< Of them, keys.
-  /// Frames taken whose picture was not coded -- no pixel buffer, an encoder
-  /// that did not open, a send refused, a picture dropped or failed -- and
-  /// that therefore went nowhere.
+  /// Frames taken whose picture was not coded -- no NV12 planes or no pixel
+  /// buffer, an encoder that did not open, a copy or a send that failed, a
+  /// picture dropped or failed -- and that therefore went nowhere.
   std::uint64_t failed = 0;
   std::uint64_t written = 0;        ///< Frames written whole to the session.
   std::uint64_t refused = 0;        ///< Coded frames the session refused.
@@ -123,9 +151,12 @@ class RgbdStreamSender {
   /// @param info  The camera's, from when it opened: its colour camera is
   ///              the pictures'.
   /// @return The sender; `Status::Code::InvalidArgument` for a sensor without
-  ///         a colour camera or a QP outside 0 to 51;
-  ///         `RgbdStreamWriter::open`'s errors for the session, with nothing
-  ///         made; `Status::Code::IoError` for a thread that cannot start.
+  ///         a colour camera, a QP outside 0 to 51, no
+  ///         @ref RgbdStreamSenderOptions::device, or a dry run with a path or
+  ///         a reader; `RgbdStreamWriter::open`'s errors for the session, with
+  ///         nothing made; `Status::Code::IoError` for a thread that cannot
+  ///         start. The encoder's own errors come at the first frame
+  ///         (@ref RgbdStreamSenderStats::error).
   static core::Result<std::unique_ptr<RgbdStreamSender>> open(
       const RgbdStreamSenderOptions& options, const sensor::SensorInfo& info);
 
@@ -145,7 +176,7 @@ class RgbdStreamSender {
   ///        opens nothing.
   /// @return OK; `RgbdStreamWriter::open`'s or `dial_to`'s refusal, with the
   ///         last target kept; `Status::Code::InvalidArgument` once
-  ///         finished.
+  ///         finished, or for a host on a dry run.
   core::Status dial_to(const std::string& host, std::uint16_t port);
 
   /// @return The counts so far.

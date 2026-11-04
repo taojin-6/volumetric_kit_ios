@@ -576,17 +576,21 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                    open, its stream sender opens here
 ///                    (Session/rgbd_stream_sender.hpp): every frame the fuse
 ///                    thread takes goes to it, and at 10 Hz each frame's
-///                    picture is coded on the hardware and the frame written
+///                    picture is copied on the compute device into the
+///                    hardware encoder's own and coded, and the frame written
 ///                    to the file and the live link (@ref streamHandle), or,
 ///                    with neither, coded and counted only (the dry run). A
 ///                    sender that does not open fails nothing:
 ///                    @ref streamError says why.
+/// @param dryRun  `-dry`: the stream stays a dry run, refusing every connect
+///                (and so needs no @p recordPath, which it refuses).
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
                                 source:(VolumetricCameraSource)source
                             recordPath:(nullable NSString*)recordPath
+                                dryRun:(BOOL)dryRun
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 

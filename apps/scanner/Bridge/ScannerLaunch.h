@@ -3,8 +3,8 @@
 
 /// @file ScannerLaunch.h
 /// @brief What a scanner launch's arguments ask of the camera and its
-///        stream: `-source camera|pattern`, `-minutes N`, `-record <name>`
-///        and `-connect <address>` (`Core/CaptureReport.hpp`'s
+///        stream: `-source camera|pattern`, `-minutes N`, `-record <name>`,
+///        `-connect <address>` and `-dry` (`Core/CaptureReport.hpp`'s
 ///        `launch_options`).
 
 #import <Foundation/Foundation.h>
@@ -39,6 +39,9 @@ typedef NS_ENUM(NSInteger, VolumetricCameraSource) {
 /// The reader the stream dials once the scanner is up, as the on-screen
 /// address field takes it ("a.b.c.d:port"); empty for none.
 @property(nonatomic, readonly, copy) NSString* connect;
+/// `-dry`: the stream codes and counts, writes no file and refuses every
+/// connect, the on-screen one too.
+@property(nonatomic, readonly) BOOL dry;
 /// Why an argument was refused; empty when none was.
 @property(nonatomic, readonly, copy) NSString* refusal;
 

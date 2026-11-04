@@ -51,9 +51,30 @@ TEST(LaunchOptions, SourceAndMinutesAreRead) {
 TEST(LaunchOptions, OtherArgumentsAreLeftAlone) {
   // The program itself is never read as a flag, nor are other flags' words.
   const LaunchOptions o = app::launch_options(
-      {"-source", "-self-test", "hevc", "-dry", "-source", "pattern"});
+      {"-dry", "-self-test", "hevc", "-verbose", "-source", "pattern"});
   ASSERT_TRUE(o.source.has_value());
   EXPECT_EQ(*o.source, CaptureSource::Pattern);
+  EXPECT_FALSE(o.dry);
+}
+
+/// `-dry` takes no value, and no file or reader: a dry launch sends nothing.
+TEST(LaunchOptions, DryIsReadAndTakesNoRecordOrConnect) {
+  const LaunchOptions o = parse({"-dry", "-minutes", "10"});
+  ASSERT_TRUE(o.source.has_value());
+  EXPECT_EQ(*o.source, CaptureSource::Camera);
+  EXPECT_TRUE(o.dry);
+  EXPECT_EQ(o.minutes, 10u);
+  EXPECT_TRUE(o.refusal.empty());
+  EXPECT_FALSE(parse({"-source", "pattern"}).dry);
+
+  for (const std::vector<std::string>& with :
+       {std::vector<std::string>{"-dry", "-record", "a.vrst"},
+        std::vector<std::string>{"-connect", "10.8.0.1:7300", "-dry"}}) {
+    const LaunchOptions refused = parse(with);
+    EXPECT_FALSE(refused.source.has_value()) << with[0];
+    EXPECT_TRUE(has(refused.refusal, "-dry records and sends nothing"))
+        << refused.refusal;
+  }
 }
 
 /// A mistyped source opens no camera: it is refused, never read as the

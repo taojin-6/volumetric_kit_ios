@@ -16,9 +16,12 @@
 #include "MapSteps.hpp"
 #include "RateGate.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/image.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/sensor/apple/core_video_color.hpp"
 #include "volumetric_kit/sensor/apple/pixel_buffer_importer.hpp"
-#include "volumetric_kit/sensor/video/hevc_encoder_apple.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -40,6 +43,57 @@ core::Status refuse(const char* api, const std::string& why) {
 
 double ms(Clock::duration d) {
   return std::chrono::duration<double, std::milli>(d).count();
+}
+
+// Whether @p plane can be copied from (@p from) or into, as a plane of
+// @p format at least @p width x @p height.
+bool copyable(const std::shared_ptr<const core::Image>& plane, VkFormat format,
+              std::uint32_t width, std::uint32_t height, bool from) {
+  if (plane == nullptr || !plane->valid() || plane->format() != format ||
+      plane->width() < width || plane->height() < height) {
+    return false;
+  }
+  const VkImageUsageFlags usage =
+      from ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const VkImageLayout optimal = from ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  return (plane->usage() & usage) != 0 &&
+         (plane->layout() == VK_IMAGE_LAYOUT_GENERAL ||
+          plane->layout() == optimal);
+}
+
+// Records the copy of @p from's NV12 planes into @p to's, @p width x
+// @p height from their corners, and a barrier that makes the writes visible
+// to the host, as a CommandBatch's last one does.
+void record_copy(VkCommandBuffer cmd, const sensor::YuvImage& from,
+                 const sensor::YuvImage& to, std::uint32_t width,
+                 std::uint32_t height) {
+  VkMemoryBarrier before{};
+  before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  before.dstAccessMask =
+      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0,
+                       nullptr, 0, nullptr);
+  const VkExtent3D extent[2] = {{width, height, 1},
+                                {(width + 1) / 2, (height + 1) / 2, 1}};
+  for (int p = 0; p < 2; ++p) {
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = extent[p];
+    vkCmdCopyImage(cmd, from.image[p]->handle(), from.image[p]->layout(),
+                   to.image[p]->handle(), to.image[p]->layout(), 1, &region);
+  }
+  VkMemoryBarrier after{};
+  after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(
+      cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+      &after, 0, nullptr, 0, nullptr);
 }
 
 }  // namespace
@@ -77,6 +131,8 @@ struct RgbdStreamSender::Impl {
 
   // --- The sender's thread --------------------------------------------------
   std::optional<sensor::HevcEncoder> encoder;
+  std::uint32_t width = 0;  // the encoder's pictures', from the first
+  std::uint32_t height = 0;
   // A coded frame the session refused is not in its stream, so the next
   // picture, which would predict from it, must be a key.
   bool key_next = false;
@@ -97,8 +153,11 @@ struct RgbdStreamSender::Impl {
   // One frame: its picture coded, then the frame written to `out`, if any.
   void send(const sensor::RgbdFrame& frame, RgbdStreamWriter* out,
             std::optional<sensor::HevcEncoder::Fault> injected);
-  // The encoder, at @p picture's size and tags.
-  core::Status open_encoder(CVPixelBufferRef picture);
+  // The encoder, at @p picture's size and its pixel buffer's tags.
+  core::Status open_encoder(const sensor::YuvImage& picture);
+  // @p picture copied on the device into the encoder's next target, its
+  // copy done when this returns.
+  core::Status copy_to_target(const sensor::YuvImage& picture);
   // A frame taken that went nowhere.
   void fail(const core::Status& why) {
     const std::lock_guard<std::mutex> lock(mutex);
@@ -107,48 +166,85 @@ struct RgbdStreamSender::Impl {
   }
 };
 
-core::Status RgbdStreamSender::Impl::open_encoder(CVPixelBufferRef picture) {
-  core::Result<sensor::ColorCodes> tags = sensor::color_codes_of(picture);
+core::Status RgbdStreamSender::Impl::open_encoder(
+    const sensor::YuvImage& picture) {
+  CVPixelBufferRef pixels = sensor::pixel_buffer_of(picture);
+  if (pixels == nullptr) {
+    return refuse("send",
+                  "the first picture has no pixel buffer to read its tags "
+                  "from (pixel_buffer_of)");
+  }
+  core::Result<sensor::ColorCodes> tags = sensor::color_codes_of(pixels);
   if (!tags.ok()) {
     return tags.status().with_context("RgbdStreamSender: the first picture");
   }
   sensor::HevcEncoder::Options o;
-  o.width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(picture));
-  o.height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(picture));
+  o.width = picture.width;
+  o.height = picture.height;
   o.qp = options.qp;
   o.color = tags.value();
   if (o.color.matrix == kUntagged) o.color.matrix = kBt601;
-  // No device: the session codes pixel buffers only.
+  // The camera's device, which writes each target (copy_to_target).
+  o.device = options.device;
   core::Result<sensor::HevcEncoder> made = sensor::HevcEncoder::create(o);
   if (!made.ok()) return made.status().with_context("RgbdStreamSender");
   encoder.emplace(std::move(made).value());
+  width = o.width;
+  height = o.height;
   return {};
+}
+
+core::Status RgbdStreamSender::Impl::copy_to_target(
+    const sensor::YuvImage& picture) {
+  if (picture.layout != sensor::YuvLayout::Nv12 || picture.width != width ||
+      picture.height != height ||
+      !copyable(picture.image[0], VK_FORMAT_R8_UNORM, width, height, true) ||
+      !copyable(picture.image[1], VK_FORMAT_R8G8_UNORM, (width + 1) / 2,
+                (height + 1) / 2, true)) {
+    return refuse("send",
+                  "the frame's picture is not NV12 plane images at the "
+                  "stream's " +
+                      std::to_string(width) + "x" + std::to_string(height) +
+                      " that a copy reads");
+  }
+  core::CommandBatch batch(*options.device);
+  VKC_ASSIGN(const sensor::YuvImage target, encoder->target(batch));
+  if (!copyable(target.image[0], VK_FORMAT_R8_UNORM, width, height, false) ||
+      !copyable(target.image[1], VK_FORMAT_R8G8_UNORM, (width + 1) / 2,
+                (height + 1) / 2, false)) {
+    return refuse("send", "the encoder's target is not NV12 plane images");
+  }
+  // What the target's planes need before their writes: on VideoToolbox,
+  // nothing, so nothing is submitted.
+  VKC_TRY(batch.submit());
+  return options.device->submit_single_time([&](VkCommandBuffer cmd) {
+    record_copy(cmd, picture, target, width, height);
+  });
 }
 
 void RgbdStreamSender::Impl::send(
     const sensor::RgbdFrame& frame, RgbdStreamWriter* out,
     std::optional<sensor::HevcEncoder::Fault> injected) {
-  // ARKit's own buffer, as the camera left it: no copy.
-  CVPixelBufferRef picture = sensor::pixel_buffer_of(frame.color);
-  if (picture == nullptr) {
-    return fail(refuse("send",
-                       "the frame's picture has no pixel buffer "
-                       "(pixel_buffer_of)"));
-  }
   if (!encoder) {
-    const core::Status opened = open_encoder(picture);
+    const core::Status opened = open_encoder(frame.color);
     if (!opened.ok()) return fail(opened);
-  }
-  // A session's first frame is a key, as is the first after a reader asked.
-  bool key = encoder->key_owed() || key_next;
-  if (!key && out != nullptr) {
-    key = out->stats().frames == 0 || out->key_wanted();
   }
   if (injected) encoder->inject(*injected);
   const auto pts = static_cast<std::int64_t>(frame.timestamp_ns);
   const Clock::time_point t0 = Clock::now();
-  const core::Status sent =
-      sensor::send_pixel_buffer(*encoder, picture, key, pts);
+  // The camera's picture is copied into one of the encoder's own, which is
+  // what the encoder codes and keeps: it holds the last picture it coded
+  // until it codes the next, and the camera's few pictures must go back.
+  const core::Status copied = copy_to_target(frame.color);
+  if (!copied.ok()) return fail(copied);
+  // A session's first frame is a key, as is the first after a reader asked;
+  // decided after the target, which opens a lost session again.
+  bool key = encoder->key_owed() || key_next;
+  if (!key && out != nullptr) {
+    key = out->stats().frames == 0 || out->key_wanted();
+  }
+  // The copy is done: nothing for the encoder to wait for.
+  const core::Status sent = encoder->send(key, pts, {});
   const Clock::time_point t1 = Clock::now();
   if (!sent.ok()) return fail(sent);
   const core::Result<bool> got = encoder->receive(coded);
@@ -228,6 +324,13 @@ core::Result<std::unique_ptr<RgbdStreamSender>> RgbdStreamSender::open(
     return refuse("open",
                   "a QP of " + std::to_string(options.qp) + ", not 0 to 51");
   }
+  if (options.device == nullptr) {
+    return refuse("open", "no device to copy the pictures on");
+  }
+  if (options.dry &&
+      (!options.session.path.empty() || !options.session.dial_host.empty())) {
+    return refuse("open", "a dry run with a file or a reader to send to");
+  }
   auto impl = std::make_unique<Impl>();
   impl->options = options;
   impl->info = info;
@@ -286,6 +389,11 @@ core::Status RgbdStreamSender::dial_to(const std::string& host,
   }
   if (current != nullptr) return current->dial_to(host, port);
   if (host.empty()) return {};  // no session, and none wanted
+  if (s.options.dry) {
+    return refuse("dial_to",
+                  "this launch is a dry run (-dry): it records and sends "
+                  "nothing");
+  }
   // Opened outside the lock the camera's thread takes; finish waits for it.
   VKC_ASSIGN(std::unique_ptr<RgbdStreamWriter> opened,
              s.open_session(host, port));

@@ -46,6 +46,10 @@ struct LaunchOptions {
   /// entry's address names one ("a.b.c.d:port", or the address alone for the
   /// default port), which the link checks then; empty dials none.
   std::string connect;
+  /// A dry run for the launch's life: the stream codes and counts, writes no
+  /// file and refuses every connect, the on-screen one too, so nothing the
+  /// camera sees leaves the device.
+  bool dry = false;
   /// Why an argument was refused, for the screen and the console; empty when
   /// none was.
   std::string refusal;
@@ -62,10 +66,12 @@ inline constexpr std::size_t kMaxRecordName = 64;
 ///         `-minutes N` with N a whole number from 1 to @ref kMaxRunMinutes
 ///         (run on when absent); `-record <name>`, a name of letters, digits,
 ///         `.`, `_` and `-`, not starting with `.`, ending `.vrst`, at most
-///         @ref kMaxRecordName long (no file when absent); and
-///         `-connect <address>`, digits, `.` and `:` (no dial when absent).
-///         Another value, or a flag with none after it, is refused: `source`
-///         empty and `refusal` naming it.
+///         @ref kMaxRecordName long (no file when absent);
+///         `-connect <address>`, digits, `.` and `:` (no dial when absent);
+///         and `-dry`, which takes no value and neither of the last two.
+///         Another value, a flag with none after it, or `-dry` with
+///         `-record` or `-connect` is refused: `source` empty and `refusal`
+///         naming it.
 LaunchOptions launch_options(const std::vector<std::string>& arguments);
 
 /// @brief How often a run prints its @ref capture_report_line.

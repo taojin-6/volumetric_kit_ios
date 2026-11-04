@@ -43,14 +43,16 @@
 #include "session_test_support.hpp"
 #include "volumetric_kit/core/net/dial.hpp"
 #include "volumetric_kit/core/testing/vulkan_fixture.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/sync.hpp"
 #include "volumetric_kit/grid/networking/stream_client.hpp"
 #include "volumetric_kit/sensor/arkit/arkit_sensor.hpp"
-#include "volumetric_kit/sensor/frame/device_requirements.hpp"
 #include "volumetric_kit/sensor/testing/hevc_clip.hpp"
 #include "volumetric_kit/sensor/testing/index_band.hpp"
 #include "volumetric_kit/sensor/testing/pattern_reader.hpp"
 #include "volumetric_kit/sensor/testing/rgbd_pattern.hpp"
 #include "volumetric_kit/sensor/video/hevc_decoder.hpp"
+#include "volumetric_kit/sensor/video/hevc_encoder.hpp"
 #include "volumetric_kit/sensor/wire/rgbd_wire.hpp"
 
 namespace {
@@ -125,8 +127,9 @@ struct SentFrame {
 
 class RgbdStreamSenderTest : public vkc::test::VulkanDeviceTest {
  protected:
+  // The camera's device, which writes the encoder's pictures too.
   vkc::DeviceRequirements requirements() const override {
-    return sensor::device_requirements();
+    return sensor::hevc_encoder_device_requirements();
   }
 
   void SetUp() override {
@@ -285,10 +288,11 @@ class RgbdStreamSenderTest : public vkc::test::VulkanDeviceTest {
     return out;
   }
 
-  app::RgbdStreamSenderOptions options(const std::string& path) const {
+  app::RgbdStreamSenderOptions options(const std::string& path) {
     app::RgbdStreamSenderOptions o;
     o.session = ios_test::options_for(path);
     o.session.fps = 0;  // every frame offered
+    o.device = &device();
     return o;
   }
 
@@ -540,7 +544,8 @@ TEST_F(RgbdStreamSenderTest, AConnectOpensTheSessionAndAReaderGetsAKey) {
   EXPECT_TRUE(sender->finish().ok());
 }
 
-/// The sender refuses a sensor with no picture, and a QP past 51.
+/// The sender refuses a sensor with no picture, a QP past 51, no device to
+/// copy on, and a dry run with a file or a reader.
 TEST_F(RgbdStreamSenderTest, OpenRefusesWhatItCannotSend) {
   const sensor::ArkitSensor& pattern = camera();
   sensor::SensorInfo depth_only = pattern.info();
@@ -551,6 +556,165 @@ TEST_F(RgbdStreamSenderTest, OpenRefusesWhatItCannotSend) {
   o.qp = 52;
   auto past = app::RgbdStreamSender::open(o, pattern.info());
   EXPECT_EQ(past.status().domain(), vkc::Status::Code::InvalidArgument);
+  o = options("");
+  o.device = nullptr;
+  auto no_device = app::RgbdStreamSender::open(o, pattern.info());
+  EXPECT_EQ(no_device.status().domain(), vkc::Status::Code::InvalidArgument);
+  const TempFile file("sender_dry_file");
+  o = options(file.path());
+  o.dry = true;
+  auto dry_file = app::RgbdStreamSender::open(o, pattern.info());
+  EXPECT_EQ(dry_file.status().domain(), vkc::Status::Code::InvalidArgument);
+  EXPECT_FALSE(std::filesystem::exists(file.path()));
+  o = options("");
+  o.dry = true;
+  o.session.dial_host = "127.0.0.1";
+  auto dry_dial = app::RgbdStreamSender::open(o, pattern.info());
+  EXPECT_EQ(dry_dial.status().domain(), vkc::Status::Code::InvalidArgument);
+}
+
+/// A dry launch stays one: it codes and counts, and refuses every connect,
+/// so nothing it sees leaves the device.
+TEST_F(RgbdStreamSenderTest, ADryRunRefusesEveryConnect) {
+  camera();
+  app::RgbdStreamSenderOptions o = options("");
+  o.dry = true;
+  auto sender = open(o);
+  ASSERT_NE(sender, nullptr);
+  ASSERT_EQ(offer(*sender, 2).size(), 2u);
+  const vkc::Status dialled = sender->dial_to("127.0.0.1", 47801);
+  EXPECT_EQ(dialled.domain(), vkc::Status::Code::InvalidArgument);
+  EXPECT_NE(dialled.message().find("dry run"), std::string::npos)
+      << dialled.message();
+  EXPECT_TRUE(sender->dial_to("", 0).ok());  // nothing to let go
+  const app::RgbdStreamSenderStats stats = sender->stats();
+  EXPECT_EQ(stats.coded, 2u);
+  EXPECT_FALSE(stats.session_open);
+  EXPECT_TRUE(sender->finish().ok());
+}
+
+/// The scanner holds its last 3 frames (its keyframe ring) while the sender
+/// codes 1 frame in 12: the pattern's 4 pictures keep coming, since the
+/// encoder keeps a picture of its own after coding, not the camera's.
+TEST_F(RgbdStreamSenderTest, FramesHeldBesideTheStreamDoNotStopTheCamera) {
+  camera();
+  app::RgbdStreamSenderOptions o = options("");
+  o.session.fps = 10;
+  auto sender = open(o);
+  ASSERT_NE(sender, nullptr);
+  constexpr std::size_t kHeld = 3;
+  constexpr std::size_t kFrames = 40;  // a third of a second at 120 Hz
+  std::vector<sensor::RgbdFrame> ring;
+  for (std::size_t k = 0; k < kFrames; ++k) {
+    std::optional<sensor::RgbdFrame> frame = next();
+    ASSERT_TRUE(frame.has_value()) << "the camera stopped at frame " << k;
+    sender->offer(*frame);
+    ring.push_back(std::move(*frame));
+    if (ring.size() > kHeld) ring.erase(ring.begin());
+  }
+  sender->flush();
+  const app::RgbdStreamSenderStats stats = sender->stats();
+  EXPECT_GE(stats.coded, 3u);
+  EXPECT_EQ(stats.failed, 0u) << stats.error;
+  ring.clear();
+  EXPECT_TRUE(sender->finish().ok());
+}
+
+/// A frame due while the frame taken before still waits for the sender's
+/// thread is left (busy), and leaves the gate its interval: the next frame of
+/// that interval is taken. The device is held from the host so that the
+/// sender's thread waits on it with a frame in hand.
+TEST_F(RgbdStreamSenderTest, AFrameLeftWhileBusyLeavesTheGateItsInterval) {
+  TempFile file("sender_busy");
+  sensor::ArkitSensor& pattern = camera();
+  app::RgbdStreamSenderOptions o = options(file.path());
+  o.session.fps = 10;
+  auto sender = open(o);
+  ASSERT_NE(sender, nullptr);
+  std::optional<sensor::RgbdFrame> a = next();
+  std::optional<sensor::RgbdFrame> b = next();
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  pattern.stop();  // its frames are written on the device too
+  constexpr std::uint64_t kMs = 1'000'000;
+  const std::uint64_t t0 = a->timestamp_ns;
+  const auto at = [&](std::uint64_t ms) {
+    sensor::RgbdFrame f = *b;
+    f.timestamp_ns = t0 + ms * kMs;
+    return f;
+  };
+
+  vkc::Result<vkc::TimelineSemaphore> held =
+      vkc::TimelineSemaphore::create(device());
+  ASSERT_TRUE(held.ok()) << held.status().message();
+  vkc::Result<vkc::Device::PendingSubmit> hold =
+      device().submit_pending([](VkCommandBuffer) {}, {{&held.value(), 1}}, {});
+  ASSERT_TRUE(hold.ok()) << hold.status().message();
+  const std::uint64_t submits = device().counters().submits;
+  sender->offer(*a);  // the first: taken
+  // Until the sender's thread has it, and waits on the device for it.
+  const auto end = std::chrono::steady_clock::now() + 5s;
+  while (device().counters().submits == submits &&
+         std::chrono::steady_clock::now() < end) {
+    std::this_thread::yield();
+  }
+  ASSERT_GT(device().counters().submits, submits);
+  sender->offer(at(100));  // interval 1: taken, waiting
+  sender->offer(at(200));  // interval 2, due: busy
+  sender->offer(at(210));  // interval 2 still untaken: busy
+  const app::RgbdStreamSenderStats waiting = sender->stats();
+  EXPECT_EQ(waiting.taken, 2u);
+  EXPECT_EQ(waiting.busy, 2u);
+  ASSERT_TRUE(held.value().signal(1).ok());
+  ASSERT_TRUE(hold.value().wait().ok());
+  sender->flush();
+  sender->offer(at(220));  // interval 2, now free: taken
+  sender->flush();
+  const app::RgbdStreamSenderStats stats = sender->stats();
+  ASSERT_TRUE(sender->finish().ok());
+  EXPECT_EQ(stats.taken, 3u);
+  EXPECT_EQ(stats.busy, 2u);
+  EXPECT_EQ(stats.written, 3u) << stats.error;
+  const std::vector<SentFrame> sent = read_back(file.path());
+  ASSERT_EQ(sent.size(), 3u);
+  const std::uint64_t pts[3] = {t0, t0 + 100 * kMs, t0 + 220 * kMs};
+  for (std::size_t k = 0; k < sent.size(); ++k) {
+    EXPECT_EQ(sent[k].pts, pts[k]) << "set " << k;
+    EXPECT_TRUE(sent[k].picture_index.has_value()) << "set " << k;
+    EXPECT_EQ(sent[k].picture_index, sent[k].depth_index) << "set " << k;
+  }
+}
+
+/// A map step on a frame the gate does not take is still found: the next
+/// frame sent has it out. ARKit's 60 Hz through the 10 Hz gate.
+TEST_F(RgbdStreamSenderTest, AMapStepBetweenFramesSentIsOutOfTheNext) {
+  TempFile file("sender_gated_step");
+  camera();
+  app::RgbdStreamSenderOptions o = options(file.path());
+  o.session.fps = 10;
+  auto sender = open(o);
+  ASSERT_NE(sender, nullptr);
+  constexpr std::uint64_t kFrameNs = 16'666'667;  // 60 Hz
+  constexpr std::size_t kFrames = 8;              // the gate takes 0 and 6
+  std::uint64_t t0 = 0;
+  for (std::size_t k = 0; k < kFrames; ++k) {
+    std::optional<sensor::RgbdFrame> frame = next();
+    ASSERT_TRUE(frame.has_value());
+    if (k == 0) t0 = frame->timestamp_ns;
+    frame->timestamp_ns = t0 + k * kFrameNs;
+    if (k >= 4) frame->color_to_world[3][0] = 0.127;  // the map moved
+    sender->offer(*frame);
+    sender->flush();
+  }
+  const app::RgbdStreamSenderStats stats = sender->stats();
+  ASSERT_TRUE(sender->finish().ok());
+  EXPECT_EQ(stats.taken, 2u);
+  EXPECT_GE(stats.map_steps, 1u);
+  const std::vector<SentFrame> sent = read_back(file.path());
+  ASSERT_EQ(sent.size(), 2u);
+  EXPECT_EQ(sent[1].pts, t0 + 6 * kFrameNs);
+  for (const SentFrame& f : sent) {
+    EXPECT_NEAR(f.pose[3][0], 0.0, 1e-3) << "set " << f.set;
+  }
 }
 
 /// T2.7's form: the iPad's stream from this Mac, for session_check.

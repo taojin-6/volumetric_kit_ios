@@ -82,6 +82,10 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
   };
   for (std::size_t i = 1; i < arguments.size(); ++i) {
     const std::string& flag = arguments[i];
+    if (flag == "-dry") {
+      out.dry = true;
+      continue;
+    }
     if (flag != "-source" && flag != "-minutes" && flag != "-record" &&
         flag != "-connect") {
       continue;
@@ -121,6 +125,11 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
       refuse("-minutes takes a whole number from 1 to " +
              std::to_string(kMaxRunMinutes) + ", not \"" + value + "\"");
     }
+  }
+  if (out.dry && (!out.record.empty() || !out.connect.empty())) {
+    refuse(
+        "-dry records and sends nothing, so it takes no -record or "
+        "-connect");
   }
   return out;
 }

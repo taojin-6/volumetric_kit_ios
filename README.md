@@ -130,16 +130,22 @@ it is fed through are `vi_core`'s: `MapSteps` takes ARKit's map steps out of
 every pose and logs them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
 
 `vi_stream` (`Session/rgbd_stream_sender.hpp`) is what feeds it on the iPad:
-`RgbdStreamSender::offer` takes each camera frame through `MapSteps` and
-`RateGate`, and a thread of the sender's own codes each taken frame's picture
-on the hardware as ARKit left it (`send_pixel_buffer(pixel_buffer_of(...))`,
-one picture in flight), then appends the frame. A picture the encoder drops
-leaves its frame out whole, and the next is a key; so is the session's first
-frame and the next after a reader joins. The encoder opens at the first
-picture from its own tags. With neither a file nor a reader the sender codes
-and counts only: the dry run. Its tests run sensor's `ArkitSensor` pattern
-through it on the Mac, decode every picture on VideoToolbox and check, on the
-GPU, that each frame carries its own picture. With `VI_TEST_SESSION_OUT=<path>`
+`RgbdStreamSender::offer` takes each frame the fuse loop polls through
+`MapSteps` and `RateGate`, and a thread of the sender's own copies each taken
+frame's picture on the compute device into one of the hardware encoder's own
+(`HevcEncoder::target`), codes it (one picture in flight), then appends the
+frame. The copy is because VideoToolbox's low-latency session keeps the last
+picture it coded until it codes the next: with ARKit's own, one of the
+camera's few pictures would be out for the 100 ms between codings, beside the
+scanner's keyframe ring, which on the pattern's 4 stops the camera for good.
+A frame the fuse loop let go unseen is a gap to `MapSteps`, which finds no
+step across 100 ms or more. A picture the encoder drops leaves its frame out
+whole, and the next is a key; so is the session's first frame and the next
+after a reader joins. The encoder opens at the first picture from its own
+tags. With neither a file nor a reader the sender codes and counts only: the
+dry run. Its tests run sensor's `ArkitSensor` pattern through it on the Mac,
+decode every picture on VideoToolbox and check, on the GPU, that each frame
+carries its own picture. With `VI_TEST_SESSION_OUT=<path>`
 or `VI_TEST_LAB_HOST=<a.b.c.d:port>` (or `VI_TEST_DRY=1`),
 `PatternSessionForTheLab` sends the iPad's own stream, 1920×1440 at 10 Hz, for
 `VI_TEST_FRAMES` frames, for recon's `tools/session_check`.
@@ -223,7 +229,7 @@ passed, 1 failed, 2 for an unknown test name, so `--console` returns about 20 s
 after the last line. `Core/SelfTest.hpp` decides what the report says and
 whether it passed, and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
-### `-source pattern`, `-minutes N`, `-record <name>`, `-connect <address>`
+### `-source pattern`, `-minutes N`, `-record <name>`, `-connect <address>`, `-dry`
 
 Launched with `-source pattern`, the scanner scans sensor's test pattern
 (`ArkitSource::Pattern`) instead of the camera, which never opens: each
@@ -235,8 +241,10 @@ stop's lines, finishes the stream, and exits; the minutes count from launch.
 name ending `.vrst`; an existing file is never overwritten), and
 `-connect <a.b.c.d:port>` connects the live link once the scanner is up, as
 the on-screen Connect does. Without either, and until a Connect, the stream
-codes and counts only. An argument it cannot read is refused, and then no
-camera opens at all.
+codes and counts only. `-dry` keeps it so for the whole launch: no file, and
+every connect refused, the on-screen one too, so nothing the camera sees
+leaves the iPad; it takes no `-record` or `-connect`. An argument it cannot
+read is refused, and then no camera opens at all.
 
 ```sh
 xcrun devicectl device process launch --console --device <id> \
@@ -262,9 +270,10 @@ and writes both lines, and is host-tested.
 The pattern has 4 pictures, and a tick that finds all 4 held is skipped and
 counted `missed`. The scanner and the camera's queue hold up to 8 (3 in the
 keyframe ring, the published keyframe, the frame being fused, the frame
-waiting to be polled, and the stream's frame coding and the one waiting
-behind it), so a pattern run skips ticks by design: `received + missed` is the
-pattern's 60 Hz, and `received` alone is not.
+waiting to be polled, and the stream's frame being copied and coded and the
+one waiting behind it), so a pattern run skips ticks by design: `received +
+missed` is the pattern's 60 Hz, and `received` alone is not. The stream's
+encoder holds none: it codes and keeps pictures of its own.
 
 ## Development
 
@@ -380,7 +389,8 @@ sender's (`vi_stream`), opened at launch with `-record` or else at the first
 connect, and lasts while the app runs, so a reconnect, to the same reader or
 another, is the same session. It describes the camera as `ArkitSensor` opened
 it (`SensorInfo`), and its frames are the camera's at 10 Hz, each its HEVC
-picture then its depth; the line says how many frames the session holds.
+picture then its depth; the line says how many frames it has sent, which a
+reader that stalls has not all read. A `-dry` launch refuses the connect.
 
 #### The shared device
 

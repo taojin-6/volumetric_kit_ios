@@ -14,7 +14,8 @@ final class ScannerViewController: UIViewController {
   private var metalView: MetalView!
   private var renderer: VolumetricRenderer?
   /// What the launch asks of the camera and its stream: `-source
-  /// camera|pattern`, `-minutes N`, `-record <name>` and `-connect <address>`.
+  /// camera|pattern`, `-minutes N`, `-record <name>`, `-connect <address>`
+  /// and `-dry`.
   private let launch = ScannerLaunch(arguments: ProcessInfo.processInfo.arguments)
   private var displayLink: CADisplayLink?
   /// What the dashboard draws. Populated in `updateStatus`, at the display
@@ -461,6 +462,8 @@ final class ScannerViewController: UIViewController {
     bringUpInFlight = true
     let layer = metalView.metalLayer
     let source = launch.source
+    // `-dry`: the stream stays a dry run, refusing every connect.
+    let dry = launch.dry
     // `-record <name>`: the stream's session file, in the app's own Documents.
     let recordPath: String? =
       launch.record.isEmpty
@@ -492,7 +495,7 @@ final class ScannerViewController: UIViewController {
         }
         return try VolumetricRenderer(
           layer: layer, configurationPath: url.path, source: source,
-          recordPath: recordPath)
+          recordPath: recordPath, dryRun: dry)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
