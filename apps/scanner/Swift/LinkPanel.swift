@@ -15,7 +15,7 @@ final class LinkModel: ObservableObject {
   @Published private(set) var state: VolumetricLinkState = .off
   @Published private(set) var target = ""
   @Published private(set) var dialFailures: UInt64 = 0
-  /// Frames the session has sent whole.
+  /// Frames the session holds whole, from its start.
   @Published private(set) var frames: UInt64 = 0
   /// Why the last connect was refused, for under the fields; nil after one
   /// that was not.
@@ -84,7 +84,7 @@ final class LinkModel: ObservableObject {
     case .dialing:
       return "Dialing \(target)…"
     case .connected:
-      return "Connected to \(target): \(frames) frames sent."
+      return "Connected to \(target). The session holds \(frames) frames."
     case .retrying:
       return "Retrying \(target): \(dialFailures) dials failed."
     case .needsLocalNetwork:

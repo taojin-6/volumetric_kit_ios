@@ -166,9 +166,9 @@ struct RendererImpl {
   // taken frames' pictures and writes them to the file and the live link, or
   // counts them (the dry run). Opened at bring-up after the camera, whose
   // info it describes; kept across a stop and a start, so a scan's session
-  // is one. After `arkit`, so it lets its frames' pictures go first: its
-  // destructor finishes it, joining its thread. Null when it did not open,
-  // `stream_error` saying why.
+  // is one. After `arkit`, so it lets its frames' pictures go first;
+  // ~RendererImpl finishes it, joining its thread, right after the fuse
+  // thread. Null when it did not open, `stream_error` saying why.
   std::unique_ptr<RgbdStreamSender> stream;
   std::string stream_error;
   /// The session file's path, empty for none: never said on the console or
@@ -333,6 +333,12 @@ struct RendererImpl {
     // to be stopped while everything it touches is still alive. A joinable
     // std::thread reaching a member destructor would be std::terminate.
     stop_fusing();
+    // Then the stream, which nothing offers frames to now: its thread ends
+    // and lets its frames' pictures go while every member is alive, and the
+    // file gets its footer.
+    if (stream) {
+      (void)stream->finish();
+    }
     // Then drain. gfx idles only the queues it was assigned and the compute
     // Device exposes no wait at all, so the bootstrap -- which owns both -- is
     // what makes this cover the whole device.

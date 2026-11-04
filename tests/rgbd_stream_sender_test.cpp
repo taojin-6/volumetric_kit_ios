@@ -416,6 +416,37 @@ TEST_F(RgbdStreamSenderTest, ADroppedPictureLeavesItsFrameOutWhole) {
   }
 }
 
+/// A coded frame the session refuses is not in the stream, so the next
+/// picture, which would predict from it, is a key.
+TEST_F(RgbdStreamSenderTest, ARefusedFrameMakesTheNextPictureAKey) {
+  TempFile file("sender_refused");
+  camera();
+  auto sender = open(options(file.path()));
+  ASSERT_NE(sender, nullptr);
+  constexpr std::size_t kFrames = 6;
+  constexpr std::size_t kRefused = 2;
+  for (std::size_t k = 0; k < kFrames; ++k) {
+    std::optional<sensor::RgbdFrame> frame = next();
+    ASSERT_TRUE(frame.has_value());
+    // A depth camera of another size: encode_depth refuses the frame.
+    if (k == kRefused) frame->depth_camera.size.width /= 2;
+    sender->offer(*frame);
+    sender->flush();
+  }
+  const app::RgbdStreamSenderStats stats = sender->stats();
+  ASSERT_TRUE(sender->finish().ok());
+  EXPECT_EQ(stats.coded, kFrames);
+  EXPECT_EQ(stats.refused, 1u);
+  EXPECT_EQ(stats.written, kFrames - 1);
+  EXPECT_EQ(stats.keys, 2u);
+  const std::vector<SentFrame> sent = read_back(file.path());
+  ASSERT_EQ(sent.size(), kFrames - 1);
+  for (std::size_t k = 0; k < sent.size(); ++k) {
+    EXPECT_EQ(sent[k].key, k == 0 || k == kRefused) << "set " << k;
+    EXPECT_EQ(sent[k].picture_index, sent[k].depth_index) << "set " << k;
+  }
+}
+
 /// With neither a file nor a reader the sender codes and counts every frame
 /// taken and writes nothing (the dry run).
 TEST_F(RgbdStreamSenderTest, TheDryRunCodesAndCountsAndWritesNothing) {

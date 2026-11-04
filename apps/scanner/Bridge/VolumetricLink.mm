@@ -55,9 +55,10 @@ std::string utf8(NSString* text) {
   app::DialTarget _target;  // the reader named; an empty host names none
 }
 
-// The renderer's stream sender; null without one.
-- (app::RgbdStreamSender*)sender {
-  VolumetricRenderer* renderer = _renderer;
+// @p renderer's stream sender; null without either. Valid while the caller
+// holds @p renderer strongly.
+static app::RgbdStreamSender* sender_of(
+    VolumetricRenderer* _Nullable renderer) {
   return renderer != nil
              ? static_cast<app::RgbdStreamSender*>([renderer streamHandle])
              : nullptr;
@@ -91,8 +92,7 @@ std::string utf8(NSString* text) {
                          "shows frames"));
     return NO;
   }
-  app::RgbdStreamSender* sender =
-      static_cast<app::RgbdStreamSender*>([renderer streamHandle]);
+  app::RgbdStreamSender* sender = sender_of(renderer);
   if (sender == nullptr) {
     set_error(error,
               vkc::Status::invalid_argument("there is no stream to send: " +
@@ -112,7 +112,8 @@ std::string utf8(NSString* text) {
 }
 
 - (void)disconnect {
-  if (app::RgbdStreamSender* sender = [self sender]) {
+  VolumetricRenderer* renderer = _renderer;  // held through the call
+  if (app::RgbdStreamSender* sender = sender_of(renderer)) {
     (void)sender->dial_to("", 0);
   }
   _target = app::DialTarget{};
@@ -124,12 +125,15 @@ std::string utf8(NSString* text) {
 }
 
 - (VolumetricLinkStatus)status {
-  app::RgbdStreamSender* sender = [self sender];
+  VolumetricRenderer* renderer = _renderer;  // held through the call
+  app::RgbdStreamSender* sender = sender_of(renderer);
   const app::RgbdStreamStats s =
       sender != nullptr ? sender->stats().session : app::RgbdStreamStats{};
   VolumetricLinkStatus out{};
-  out.state = static_cast<VolumetricLinkState>(app::link_state(
-      !_target.host.empty(), s.viewers, s.dial_failures, s.no_route));
+  // A target with no stream left to dial it is off, not dialing.
+  out.state = static_cast<VolumetricLinkState>(
+      app::link_state(!_target.host.empty() && sender != nullptr, s.viewers,
+                      s.dial_failures, s.no_route));
   out.dial_failures = s.dial_failures;
   out.key_wanted = s.key_wanted;
   out.frames = s.frames;

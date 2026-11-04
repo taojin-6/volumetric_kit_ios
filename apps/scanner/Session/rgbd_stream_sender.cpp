@@ -52,8 +52,7 @@ struct RgbdStreamSender::Impl {
   MapSteps steps;
   RateGate gate{0};
 
-  // --- Shared, under `mutex`
-  // --------------------------------------------------
+  // --- Shared, under `mutex` ------------------------------------------------
   mutable std::mutex mutex;
   std::condition_variable wake;           // a frame handed over, or the stop
   std::condition_variable idle;           // nothing handed over is left
@@ -69,13 +68,18 @@ struct RgbdStreamSender::Impl {
   RgbdStreamSenderStats counts;  // less `session`, read from the writer
   std::vector<PictureTimes> times;
 
-  // One dial_to or finish at a time: a session opened by one is never made
-  // twice, nor after the finish.
+  // One dial_to at a time, and none once the finish has begun: a session
+  // opened by one is never made twice, nor after the finish. A finish holds
+  // it only to begin, so a dial_to never waits out a finish.
   std::mutex dial_mutex;
+  // One finish at a time: a second waits for the first's result.
+  std::mutex finish_mutex;
 
-  // --- The sender's thread
-  // ----------------------------------------------------
+  // --- The sender's thread --------------------------------------------------
   std::optional<sensor::HevcEncoder> encoder;
+  // A coded frame the session refused is not in its stream, so the next
+  // picture, which would predict from it, must be a key.
+  bool key_next = false;
   sensor::HevcEncoder::CodedPicture coded;
   std::thread thread;
 
@@ -136,7 +140,7 @@ void RgbdStreamSender::Impl::send(
     if (!opened.ok()) return fail(opened);
   }
   // A session's first frame is a key, as is the first after a reader asked.
-  bool key = encoder->key_owed();
+  bool key = encoder->key_owed() || key_next;
   if (!key && out != nullptr) {
     key = out->stats().frames == 0 || out->key_wanted();
   }
@@ -159,12 +163,17 @@ void RgbdStreamSender::Impl::send(
     ++counts.coded;
     if (coded.key) ++counts.keys;
     counts.picture_bytes += coded.access_unit.size();
-    if (times.size() < kMaxTimes) times.push_back({ms(t1 - t0), ms(t2 - t0)});
+    if (times.size() == kMaxTimes) times.erase(times.begin());  // the last
+    times.push_back({ms(t1 - t0), ms(t2 - t0)});
   }
+  if (coded.key) key_next = false;
   if (out == nullptr) return;  // the dry run: coded and counted
   const CodedColor color{coded.access_unit.data(), coded.access_unit.size(),
                          coded.key, encoder->facts().color};
   const core::Status written = out->append(frame, &color);
+  // A frame the session refused is not in its stream: the next picture
+  // cannot predict from it.
+  if (!written.ok()) key_next = true;
   const std::lock_guard<std::mutex> lock(mutex);
   if (written.ok()) {
     ++counts.written;
@@ -307,8 +316,11 @@ std::vector<PictureTimes> RgbdStreamSender::take_times() {
 
 core::Status RgbdStreamSender::finish() {
   Impl& s = *impl_;
-  const std::lock_guard<std::mutex> dialing(s.dial_mutex);
+  const std::lock_guard<std::mutex> finishing(s.finish_mutex);
   {
+    // Past a dial_to under way, which may still open the session; every
+    // later one is refused at once.
+    const std::lock_guard<std::mutex> dialing(s.dial_mutex);
     const std::lock_guard<std::mutex> lock(s.mutex);
     if (s.finished) return s.finish_status;
     s.stopping = true;

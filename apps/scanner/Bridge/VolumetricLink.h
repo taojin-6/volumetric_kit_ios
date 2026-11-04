@@ -56,8 +56,9 @@ typedef struct {
   uint64_t dial_failures;
   /// Readers that joined or fell back and so asked for a key.
   uint64_t key_wanted;
-  /// Frames the session has sent whole: to the file, and to a reader while
-  /// one is connected.
+  /// Frames the session holds whole, from its start: the file's, and those a
+  /// reader connected then was served (one that joins later starts at the
+  /// next key).
   uint64_t frames;
 } VolumetricLinkStatus;
 

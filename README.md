@@ -380,7 +380,7 @@ sender's (`vi_stream`), opened at launch with `-record` or else at the first
 connect, and lasts while the app runs, so a reconnect, to the same reader or
 another, is the same session. It describes the camera as `ArkitSensor` opened
 it (`SensorInfo`), and its frames are the camera's at 10 Hz, each its HEVC
-picture then its depth, the line counting the frames sent.
+picture then its depth; the line says how many frames the session holds.
 
 #### The shared device
 
