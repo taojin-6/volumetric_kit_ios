@@ -112,8 +112,7 @@ struct CameraPlan {
   sensor::ArkitSensor::Options camera;
   /// The stream's options; its session gets its id and time as it opens.
   RgbdStreamSenderOptions stream;
-  /// `-fail-opens`: the first this many opens wait 1 s and come back
-  /// `NotFound`, as a camera that gave no frame in time (the pattern only).
+  /// `-fail-opens` (`LaunchOptions::fail_opens`); 0 unless the pattern.
   std::uint32_t fail_opens = 0;
 };
 

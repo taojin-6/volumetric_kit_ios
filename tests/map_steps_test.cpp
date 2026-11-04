@@ -285,11 +285,10 @@ glm::dmat4 as_arkit_gives(const glm::dmat4& pose, std::uint32_t frame) {
 }
 
 /// Many steps on ARKit's slightly non-orthonormal rotations: each logged
-/// raw_from_sent stays rigid, within 1e-6 of orthonormal (it grew about
-/// threefold a step, 9.1e-6 after six on a recorded take, when the steps
-/// were composed as given), and the step math holds: every step found where
-/// it happened, every pose sent within 1 mm and 0.05 deg of the hand, and
-/// the log rebuilding every pose ARKit gave.
+/// raw_from_sent stays rigid to rounding, within 1e-12 of orthonormal, and
+/// the step math holds: every step found where it happened, every pose sent
+/// within 1 mm and 0.05 deg of the hand, and the log rebuilding every pose
+/// ARKit gave.
 TEST(MapSteps, ManyStepsStayRigid) {
   constexpr std::size_t kSteps = 40;
   constexpr std::size_t kEvery = 90;  // a step each 1.5 s
@@ -317,7 +316,7 @@ TEST(MapSteps, ManyStepsStayRigid) {
   for (std::size_t k = 0; k < kSteps; ++k) {
     EXPECT_EQ(steps.steps()[k].pts_ns, time_of((k + 1) * kEvery)) << k;
     worst = std::max(worst, off_orthonormal(steps.steps()[k].raw_from_sent));
-    ASSERT_LT(off_orthonormal(steps.steps()[k].raw_from_sent), 1e-6)
+    ASSERT_LT(off_orthonormal(steps.steps()[k].raw_from_sent), 1e-12)
         << "step " << k;
   }
   EXPECT_LT(distance_mm(steps.steps().back().raw_from_sent, world[kSteps]),

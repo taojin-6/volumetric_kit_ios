@@ -20,12 +20,15 @@
 ///   CameraOpenPolicy::kMaxBackoffNs. A camera let go elsewhere wakes
 ///   nothing, so this is what finds it again, within about half a minute;
 /// - never while an open is in flight. An open waits without bound for the
-///   user's answer to the camera prompt, so none starts beside it.
+///   user's answer to the camera prompt, so none starts beside it. A wake
+///   that comes meanwhile is kept: if that open finds no camera, the next
+///   tick opens at once.
 ///
-/// Any other failure is final, since it comes back for the same options on
-/// the same device: `IoError` (the camera not allowed, ARKit's session
-/// failed, a first frame of the wrong size), `Unsupported` (no LiDAR) and
-/// `InvalidArgument`. The read-out says why and nothing opens again. Once
+/// Any other failure is final. `IoError` (the camera not allowed, ARKit's
+/// session failed, a first frame of the wrong size), `Unsupported` (no
+/// LiDAR) and `InvalidArgument` come back for the same options on the same
+/// device; `OutOfMemory` and `Backend` might pass, but are not retried: a
+/// relaunch opens again. The read-out says why and nothing opens again. Once
 /// open, the camera is the renderer's for its life, and no open follows.
 ///
 /// Pure, so the rule is host tested; the bridge (Bridge/VolumetricRenderer.mm)
@@ -101,13 +104,15 @@ class CameraOpenPolicy {
   /// @return true when @ref state is Idle, or Retrying and @p cause a wake or
   ///         a tick at or after @ref retry_at_ns: the state is then Opening,
   ///         and the caller opens and says how it ended through @ref end.
-  ///         false otherwise, the state as it was: never while Opening.
+  ///         false otherwise, the state as it was: never while Opening,
+  ///         where a wake is kept for @ref end.
   bool begin(CameraOpenCause cause, std::uint64_t now_ns) noexcept;
 
   /// @brief The open begun last ended. Nothing unless Opening.
   /// @param end     How.
   /// @param error   Why it failed: the open's message; ignored when opened.
-  /// @param now_ns  Now, on @ref begin's clock: the backoff counts from it.
+  /// @param now_ns  Now, on @ref begin's clock: the backoff counts from it,
+  ///                or, after a wake kept while Opening, a tick is due at it.
   void end(CameraOpenEnd end, std::string error, std::uint64_t now_ns);
 
   /// @brief No camera is to open, as when the launch's arguments were
@@ -133,13 +138,14 @@ class CameraOpenPolicy {
   std::uint32_t opens_ = 0;
   std::uint32_t failed_ = 0;  // opens in a row that found no camera
   std::uint64_t retry_at_ns_ = 0;
+  bool woken_ = false;  // a wake came while Opening
   std::string error_;
 };
 
 /// @return The read-out's words for @p policy at @p now_ns: "not opened yet";
 ///         "opening"; "opening again (retry 2) after: <error>"; "<error>;
-///         retry 3 when the app is in front again, or in 8 s"; "<error>" when
-///         refused; "open", or "open after 2 retries".
+///         retry 3 at the next wake, or in 8 s"; "<error>" when refused;
+///         "open", or "open after 2 retries".
 std::string camera_open_text(const CameraOpenPolicy& policy,
                              std::uint64_t now_ns);
 

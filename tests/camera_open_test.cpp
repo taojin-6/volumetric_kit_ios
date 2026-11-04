@@ -114,6 +114,46 @@ TEST(CameraOpen, TheBackoffDoublesToThirtySeconds) {
   EXPECT_EQ(policy.retries(), 107u);
 }
 
+/// A wake while an open is in flight begins nothing, but is kept: if that
+/// open finds no camera, the next tick opens at once, without the backoff.
+/// The kept wake serves that one open; a tick in flight is never kept.
+TEST(CameraOpen, AWakeDuringAnOpenIsKept) {
+  CameraOpenPolicy policy;
+  std::uint64_t now = kT0;
+  ASSERT_TRUE(policy.begin(CameraOpenCause::Wake, now));
+  for (int i = 0; i < 5; ++i) {  // five opens found no camera: 30 s next
+    now += 5 * kS;
+    policy.end(CameraOpenEnd::NotFound, kNotFound, now);
+    now = policy.retry_at_ns();
+    ASSERT_TRUE(policy.begin(CameraOpenCause::Tick, now));
+  }
+  // The sixth is in flight. 3 s in, the app is in front again: both wakes
+  // (the foreground's -startFusion, then active again) begin nothing.
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Wake, now + 3 * kS));
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Wake, now + 3 * kS));
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Tick, now + 3 * kS));
+  EXPECT_EQ(policy.state(), CameraOpenState::Opening);
+  now += 5 * kS;
+  policy.end(CameraOpenEnd::NotFound, kNotFound, now);
+  EXPECT_EQ(policy.retry_at_ns(), now);
+  ASSERT_TRUE(policy.begin(CameraOpenCause::Tick, now));
+  EXPECT_EQ(policy.retries(), 6u);
+
+  // No wake during this one: the backoff again, as it stood.
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Tick, now + 2 * kS));
+  now += 5 * kS;
+  policy.end(CameraOpenEnd::NotFound, kNotFound, now);
+  EXPECT_EQ(policy.retry_at_ns(), now + CameraOpenPolicy::kMaxBackoffNs);
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Tick, now + kS));
+
+  // A wake kept during an open that opens leaves nothing behind.
+  ASSERT_TRUE(policy.begin(CameraOpenCause::Wake, now + kS));
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Wake, now + 2 * kS));
+  policy.end(CameraOpenEnd::Opened, "", now + 3 * kS);
+  EXPECT_EQ(policy.state(), CameraOpenState::Open);
+  EXPECT_FALSE(policy.begin(CameraOpenCause::Tick, now + 3 * kS));
+}
+
 /// IoError, Unsupported, InvalidArgument: final. The reason stays for the
 /// read-out and nothing opens again.
 TEST(CameraOpen, ARefusalIsFinal) {
@@ -169,16 +209,16 @@ TEST(CameraOpen, TheReadOutSaysTheStateAndTheRetries) {
   EXPECT_EQ(camera_open_text(policy, kT0), "opening");
   policy.end(CameraOpenEnd::NotFound, "no frame", kT0 + 5 * kS);
   EXPECT_EQ(camera_open_text(policy, kT0 + 5 * kS),
-            "no frame; retry 1 when the app is in front again, or in 2 s");
+            "no frame; retry 1 at the next wake, or in 2 s");
   EXPECT_EQ(camera_open_text(policy, kT0 + 5 * kS + kS / 2),
-            "no frame; retry 1 when the app is in front again, or in 2 s")
+            "no frame; retry 1 at the next wake, or in 2 s")
       << "rounded up";
   ASSERT_TRUE(policy.begin(CameraOpenCause::Tick, kT0 + 7 * kS));
   EXPECT_EQ(camera_open_text(policy, kT0 + 7 * kS),
             "opening again (retry 1) after: no frame");
   policy.end(CameraOpenEnd::NotFound, "no frame", kT0 + 12 * kS);
   EXPECT_EQ(camera_open_text(policy, kT0 + 13 * kS),
-            "no frame; retry 2 when the app is in front again, or in 3 s");
+            "no frame; retry 2 at the next wake, or in 3 s");
   ASSERT_TRUE(policy.begin(CameraOpenCause::Wake, kT0 + 13 * kS));
   policy.end(CameraOpenEnd::Opened, "", kT0 + 14 * kS);
   EXPECT_EQ(camera_open_text(policy, kT0 + 14 * kS), "open after 2 retries");

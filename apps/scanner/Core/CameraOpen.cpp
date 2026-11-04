@@ -10,6 +10,12 @@ namespace volumetric_kit::ios_app {
 
 bool CameraOpenPolicy::begin(CameraOpenCause cause,
                              std::uint64_t now_ns) noexcept {
+  if (state_ == CameraOpenState::Opening) {
+    // The camera may be back since this open began: not a tick, which comes
+    // at 2 Hz and would undo the backoff.
+    woken_ = woken_ || cause == CameraOpenCause::Wake;
+    return false;
+  }
   const bool due = state_ == CameraOpenState::Idle ||
                    (state_ == CameraOpenState::Retrying &&
                     (cause == CameraOpenCause::Wake || now_ns >= retry_at_ns_));
@@ -22,6 +28,7 @@ bool CameraOpenPolicy::begin(CameraOpenCause cause,
 void CameraOpenPolicy::end(CameraOpenEnd end, std::string error,
                            std::uint64_t now_ns) {
   if (state_ != CameraOpenState::Opening) return;
+  const bool woken = std::exchange(woken_, false);
   switch (end) {
     case CameraOpenEnd::Opened:
       state_ = CameraOpenState::Open;
@@ -30,11 +37,12 @@ void CameraOpenPolicy::end(CameraOpenEnd end, std::string error,
       return;
     case CameraOpenEnd::NotFound: {
       state_ = CameraOpenState::Retrying;
-      // 2 s, 4 s, 8 s, 16 s, then 30 s: the shift stops before it could pass
-      // the cap, however many opens failed.
+      // The shift stops before it could pass the cap, however many opens
+      // failed.
       const std::uint32_t doublings = std::min<std::uint32_t>(failed_, 5);
-      retry_at_ns_ =
-          now_ns + std::min(kFirstBackoffNs << doublings, kMaxBackoffNs);
+      retry_at_ns_ = woken ? now_ns
+                           : now_ns + std::min(kFirstBackoffNs << doublings,
+                                               kMaxBackoffNs);
       ++failed_;
       error_ = std::move(error);
       return;
@@ -72,8 +80,7 @@ std::string camera_open_text(const CameraOpenPolicy& policy,
       const std::uint64_t left_s =
           at > now_ns ? (at - now_ns + 999'999'999) / 1'000'000'000 : 0;
       return policy.error() + "; retry " + std::to_string(retries + 1) +
-             " when the app is in front again, or in " +
-             std::to_string(left_s) + " s";
+             " at the next wake, or in " + std::to_string(left_s) + " s";
     }
     case CameraOpenState::Failed:
       return policy.error();

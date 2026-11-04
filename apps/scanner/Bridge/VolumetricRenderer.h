@@ -502,14 +502,11 @@ typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
   VolumetricCameraOpenStateOpening,
   /// The camera opened.
   VolumetricCameraOpenStateOpen,
-  /// The last open found no camera in time (`NotFound`: the iPad locked or
-  /// the app in the background during it, or the camera in use elsewhere):
-  /// it opens again at the next wake, or at the read-out's tick once the
-  /// backoff has passed.
+  /// The last open found no camera in time (`NotFound`): it opens again at
+  /// the next wake, or at the read-out's tick once the backoff has passed.
   VolumetricCameraOpenStateRetrying,
-  /// Refused for good (the camera not allowed, ARKit's session failed, no
-  /// LiDAR, a refused launch): @ref VolumetricCameraStatus.openError says
-  /// why, and nothing opens again.
+  /// Refused for good, or a refused launch: @ref
+  /// VolumetricCameraStatus.openError says why, and nothing opens again.
   VolumetricCameraOpenStateFailed,
 };
 
@@ -616,10 +613,9 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                    @ref streamError says why.
 /// @param dryRun  `-dry`: the stream stays a dry run, refusing every connect
 ///                (and so needs no @p recordPath, which it refuses).
-/// @param failOpens  `-fail-opens N`, a test of the retry with the pattern
-///                   alone: the first N opens wait 1 s and come back
-///                   `NotFound`, as a camera that gave no frame in time; 0
-///                   for none.
+/// @param failOpens  `-fail-opens N` (`Core/CaptureReport.hpp`'s
+///                   `LaunchOptions::fail_opens`), the pattern alone; 0 for
+///                   none.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
@@ -667,19 +663,16 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///
 /// For the app's wakes, @p wake `YES`: in front or active again (a
 /// foreground, an unlock). For its read-out's tick while the scan runs,
-/// @p wake `NO`: only once the backoff since the last open has passed, 2 s
-/// doubling to 30 s (`Core/CameraOpen.hpp`), which is what finds a camera let
-/// go elsewhere. The open runs off the main thread, one at a time, so
-/// never beside one still waiting for the camera prompt's answer, which has
-/// no bound; it comes back on the main thread, where fusion starts on it if
-/// still wanted, and otherwise at the next @ref startFusion, the camera's
-/// session paused meanwhile. Each open's
+/// @p wake `NO`. Which of them opens is `Core/CameraOpen.hpp`'s rule. The
+/// open runs off the main thread, one at a time; it comes back on the main
+/// thread, where fusion starts on it if still wanted, and otherwise at the
+/// next @ref startFusion, the camera's session paused meanwhile. Each open's
 /// begin and end prints a `scanner: camera:` line. An open in flight keeps
 /// the renderer alive, as it opens on its device.
 ///
-/// Nothing once the camera is open, after a refusal, while an open is in
-/// flight, or while fusion is not wanted (from @ref beginStopFusion until the
-/// next @ref startFusion). Main thread only.
+/// Opens nothing once the camera is open, after a refusal, while an open is
+/// in flight, or while fusion is not wanted (from @ref beginStopFusion until
+/// the next @ref startFusion). Main thread only.
 - (void)retryCameraOnWake:(BOOL)wake NS_SWIFT_NAME(retryCamera(wake:));
 
 /// @brief Ask the fuse thread to stop, without waiting for it.

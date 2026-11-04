@@ -115,10 +115,8 @@ glm::dmat4 MapSteps::take(std::uint64_t timestamp_ns,
   expected[3] = glm::dvec4(predicted, 1.0);
   // sent = step * expected: the step is on the world's side, so it moves
   // every later pose alike, and raw = (the steps before) * step * expected.
-  // Made rigid again before it is logged and inverted: ARKit's float
-  // rotations are a little off orthonormal, and composed by transposes the
-  // error grew about threefold a step (1.6e-7 after one, 9.1e-6 after six on
-  // a recorded take); kept rigid, the transpose is its inverse.
+  // Made rigid before it is logged and inverted, so the transpose is its
+  // inverse (MapSteps.hpp).
   const glm::dmat4 step = sent * rigid_inverse(expected);
   const glm::dmat4 raw_from_sent = orthonormalized(
       (steps_.empty() ? glm::dmat4(1.0) : steps_.back().raw_from_sent) * step);

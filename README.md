@@ -380,18 +380,14 @@ Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the nativ
 #### The camera's open
 
 Bring-up opens the camera last (`ArkitSensor::open`), with its stream on it.
-An open that gets no frame with depth in time is `NotFound`: the iPad was
-locked or the app sent to the background during it, or the camera is in use
-elsewhere (Split View, Stage Manager). The scanner then opens again, one open
-at a time, so never beside one still waiting for the camera prompt's answer:
-at once when the app is in front or active again and at `-startFusion`, and
-while the scan runs once a backoff has passed, 2 s doubling to 30 s, which
-finds a camera let go elsewhere. Fusion and the stream start when it opens. Any
-other failure (the camera not allowed, ARKit's session failed, no LiDAR) is
-final. The read-out's `camera:` line says what the open is doing (opening, why
-the last found no camera with the retry count and when the next opens, or the
-refusal), and each open's begin and end prints a `scanner: camera:` line on
-the console. `Core/CameraOpen.hpp` decides, and is host-tested.
+An open that gets no frame with depth in time (`NotFound`) is opened again,
+one open at a time: at the app's wakes and, while the scan runs, at the
+read-out's tick once a backoff has passed. Fusion and the stream start when it
+opens; any other failure is final. `Core/CameraOpen.hpp` decides which open
+begins and when, and is host-tested. The read-out's `camera:` line says what
+the open is doing (opening, why the last found no camera with the retry count
+and when the next opens, or the refusal), and each open's begin and end prints
+a `scanner: camera:` line on the console.
 
 #### The live link
 
