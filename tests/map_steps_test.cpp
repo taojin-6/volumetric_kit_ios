@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -240,6 +241,120 @@ TEST(MapSteps, FramesItCannotPredictGoOutAsGiven) {
   EXPECT_EQ(steps.take(time_of(1), hand(2, false)), hand(2, false));
   EXPECT_EQ(steps.take(time_of(1), far), far);
   EXPECT_TRUE(steps.steps().empty());
+}
+
+// How far @p m's rotation is from orthonormal: the largest entry of
+// R^T R - I, as a recorded take's log was measured.
+double off_orthonormal(const glm::dmat4& m) {
+  const glm::dmat3 r(m);
+  const glm::dmat3 rtr = glm::transpose(r) * r;
+  double worst = 0.0;
+  for (int c = 0; c < 3; ++c) {
+    for (int k = 0; k < 3; ++k) {
+      worst = std::max(worst, std::abs(rtr[c][k] - (c == k ? 1.0 : 0.0)));
+    }
+  }
+  return worst;
+}
+
+// The largest difference of two rotations' entries: an angle's acos reads
+// off-orthonormal noise of 1e-7 as a turn of 0.05 deg.
+double rotation_entry(const glm::dmat4& a, const glm::dmat4& b) {
+  double worst = 0.0;
+  for (int c = 0; c < 3; ++c) {
+    for (int r = 0; r < 3; ++r) {
+      worst = std::max(worst, std::abs(a[c][r] - b[c][r]));
+    }
+  }
+  return worst;
+}
+
+// @p pose as ARKit hands one over: each rotation entry off by up to 4.4e-7
+// (a fixed pseudo-random pattern per frame), as its float rotations are.
+glm::dmat4 as_arkit_gives(const glm::dmat4& pose, std::uint32_t frame) {
+  std::uint32_t state = frame * 2654435761u + 1u;
+  glm::dmat4 out = pose;
+  for (int c = 0; c < 3; ++c) {
+    for (int r = 0; r < 3; ++r) {
+      state = state * 1664525u + 1013904223u;
+      const double unit = static_cast<double>(state >> 8) / 16777216.0;
+      out[c][r] += (unit * 2.0 - 1.0) * 4.4e-7;
+    }
+  }
+  return out;
+}
+
+/// Many steps on ARKit's slightly non-orthonormal rotations: each logged
+/// raw_from_sent stays rigid to rounding, within 1e-12 of orthonormal, and
+/// the step math holds: every step found where it happened, every pose sent
+/// within 1 mm and 0.05 deg of the hand, and the log rebuilding every pose
+/// ARKit gave.
+TEST(MapSteps, ManyStepsStayRigid) {
+  constexpr std::size_t kSteps = 40;
+  constexpr std::size_t kEvery = 90;  // a step each 1.5 s
+  constexpr std::size_t kFrames = (kSteps + 1) * kEvery;
+  // The world as ARKit has it after each step: steps of 40-80 mm and
+  // 0.6-1.4 deg, turning one way then the other.
+  std::vector<glm::dmat4> world(kSteps + 1, glm::dmat4(1.0));
+  for (std::size_t k = 1; k <= kSteps; ++k) {
+    const double sign = k % 2 == 0 ? 1.0 : -1.0;
+    world[k] = world_step(40.0 + 20.0 * static_cast<double>(k % 3),
+                          sign * (0.6 + 0.4 * static_cast<double>(k % 3))) *
+               world[k - 1];
+  }
+  app::MapSteps steps;
+  std::vector<glm::dmat4> raw;
+  std::vector<glm::dmat4> sent;
+  for (std::size_t i = 0; i < kFrames; ++i) {
+    raw.push_back(as_arkit_gives(world[i / kEvery] * hand(i, false),
+                                 static_cast<std::uint32_t>(i)));
+    sent.push_back(steps.take(time_of(i), raw.back()));
+  }
+
+  ASSERT_EQ(steps.steps().size(), kSteps);
+  double worst = 0.0;
+  for (std::size_t k = 0; k < kSteps; ++k) {
+    EXPECT_EQ(steps.steps()[k].pts_ns, time_of((k + 1) * kEvery)) << k;
+    worst = std::max(worst, off_orthonormal(steps.steps()[k].raw_from_sent));
+    ASSERT_LT(off_orthonormal(steps.steps()[k].raw_from_sent), 1e-12)
+        << "step " << k;
+  }
+  EXPECT_LT(distance_mm(steps.steps().back().raw_from_sent, world[kSteps]),
+            1.0);
+  EXPECT_LT(angle_deg(steps.steps().back().raw_from_sent, world[kSteps]), 0.05);
+  // 0.05 deg is 8.7e-4 rad: a rotation entry off by no more than that.
+  double worst_mm = 0.0;
+  double worst_entry = 0.0;
+  double worst_rebuilt_mm = 0.0;
+  double worst_rebuilt_entry = 0.0;
+  glm::dmat4 raw_from_sent(1.0);
+  std::size_t next = 0;
+  for (std::size_t i = 0; i < kFrames; ++i) {
+    worst_mm = std::max(worst_mm, distance_mm(sent[i], hand(i, false)));
+    worst_entry =
+        std::max(worst_entry, rotation_entry(sent[i], hand(i, false)));
+    while (next < steps.steps().size() &&
+           steps.steps()[next].pts_ns <= time_of(i)) {
+      raw_from_sent = steps.steps()[next++].raw_from_sent;
+    }
+    worst_rebuilt_mm = std::max(worst_rebuilt_mm,
+                                distance_mm(raw_from_sent * sent[i], raw[i]));
+    worst_rebuilt_entry = std::max(
+        worst_rebuilt_entry, rotation_entry(raw_from_sent * sent[i], raw[i]));
+  }
+  EXPECT_LT(worst_mm, 1.0);
+  EXPECT_LT(worst_entry, 8.7e-4);
+  // A step's own frame is rebuilt only as well as ARKit's rotations are
+  // rigid: 4.4e-7 off, 30 m from the world's origin, is 0.013 mm.
+  EXPECT_LT(worst_rebuilt_mm, 0.1);
+  EXPECT_LT(worst_rebuilt_entry, 1e-5);
+  char margins[160];
+  std::snprintf(margins, sizeof margins,
+                "off orthonormal %.2e, sent %.3f mm %.2e, rebuilt %.4f mm "
+                "%.2e",
+                worst, worst_mm, worst_entry, worst_rebuilt_mm,
+                worst_rebuilt_entry);
+  RecordProperty("worst", margins);
 }
 
 /// Over a gap the bound grows with the gap, as a hand's reach does: 200 ms of

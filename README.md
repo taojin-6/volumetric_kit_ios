@@ -229,7 +229,7 @@ passed, 1 failed, 2 for an unknown test name, so `--console` returns about 20 s
 after the last line. `Core/SelfTest.hpp` decides what the report says and
 whether it passed, and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
-### `-source pattern`, `-minutes N`, `-record <name>`, `-connect <address>`, `-dry`
+### `-source pattern`, `-minutes N`, `-record <name>`, `-connect <address>`, `-dry`, `-fail-opens N`
 
 Launched with `-source pattern`, the scanner scans sensor's test pattern
 (`ArkitSource::Pattern`) instead of the camera, which never opens: each
@@ -243,8 +243,11 @@ name ending `.vrst`; an existing file is never overwritten), and
 the on-screen Connect does. Without either, and until a Connect, the stream
 codes and counts only. `-dry` keeps it so for the whole launch: no file, and
 every connect refused, the on-screen one too, so nothing the camera sees
-leaves the iPad; it takes no `-record` or `-connect`. An argument it cannot
-read is refused, and then no camera opens at all.
+leaves the iPad; it takes no `-record` or `-connect`. `-fail-opens N` (1 to
+9, with `-source pattern` alone) tests the camera's retry: the first N opens
+wait 1 s and come back `NotFound`, as a camera that gave no frame in time,
+and the next opens the pattern. An argument it cannot read is refused, and
+then no camera opens at all.
 
 ```sh
 xcrun devicectl device process launch --console --device <id> \
@@ -374,6 +377,18 @@ compute path; this proves the render path.
 Verified on an iPad Pro M5: Vulkan 1.3 instance, 3 swapchain images at the native
 2420×1668, triangle on screen.
 
+#### The camera's open
+
+Bring-up opens the camera last (`ArkitSensor::open`), with its stream on it.
+An open that gets no frame with depth in time (`NotFound`) is opened again,
+one open at a time: at the app's wakes and, while the scan runs, at the
+read-out's tick once a backoff has passed. Fusion and the stream start when it
+opens; any other failure is final. `Core/CameraOpen.hpp` decides which open
+begins and when, and is host-tested. The read-out's `camera:` line says what
+the open is doing (opening, why the last found no camera with the retry count
+and when the next opens, or the refusal), and each open's begin and end prints
+a `scanner: camera:` line on the console.
+
 #### The live link
 
 The dashboard's first card, on iPad and iPhone, names the reader the scanner
@@ -385,8 +400,8 @@ asked, or check the address. iOS answers a connect to the local network so
 until the person allows it. The link dials again at most once a second, also
 after a reader that refuses the session; Connect dials at once. A refused
 entry shows the core's reason under the fields. The session is the stream
-sender's (`vi_stream`), opened at launch with `-record` or else at the first
-connect, and lasts while the app runs, so a reconnect, to the same reader or
+sender's (`vi_stream`), opened with the camera with `-record` or else at the
+first connect, and lasts while the app runs, so a reconnect, to the same reader or
 another, is the same session. It describes the camera as `ArkitSensor` opened
 it (`SensorInfo`), and its frames are the camera's at 10 Hz, each its HEVC
 picture then its depth; the line says how many frames it has sent, which a

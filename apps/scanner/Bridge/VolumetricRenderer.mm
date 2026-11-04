@@ -35,9 +35,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-// <cstdio> and <cstdarg> were here for `fusionSummary` and the read-out's cell
-// builders, which now live in Readout.mm and name them there. Nothing in this
-// file formats any more.
+// The console's lines (the camera's opens, the stream's finish). The read-out's
+// row builders live in Readout.mm and name their own.
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -261,6 +261,110 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
          std::to_string(codes.chroma_location);
 }
 
+// --- The camera's opens ------------------------------------------------------
+static_assert(static_cast<NSInteger>(VolumetricCameraOpenStateIdle) ==
+              static_cast<NSInteger>(app::CameraOpenState::Idle));
+static_assert(static_cast<NSInteger>(VolumetricCameraOpenStateOpening) ==
+              static_cast<NSInteger>(app::CameraOpenState::Opening));
+static_assert(static_cast<NSInteger>(VolumetricCameraOpenStateOpen) ==
+              static_cast<NSInteger>(app::CameraOpenState::Open));
+static_assert(static_cast<NSInteger>(VolumetricCameraOpenStateRetrying) ==
+              static_cast<NSInteger>(app::CameraOpenState::Retrying));
+static_assert(static_cast<NSInteger>(VolumetricCameraOpenStateFailed) ==
+              static_cast<NSInteger>(app::CameraOpenState::Failed));
+
+/// The policy's clock: steady, so a wall-clock change moves no backoff.
+std::uint64_t steady_ns() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+/// The open's state on the console, one line at each begin and end, for
+/// `devicectl --console`.
+void say_camera(const app::RendererImpl& impl) {
+  std::printf("scanner: camera: %s\n",
+              app::camera_open_text(impl.camera_open, steady_ns()).c_str());
+  std::fflush(stdout);
+}
+
+/// One open of the camera, as @p plan says. Off the main thread: the open
+/// waits for ARKit's first frame with depth, and the first time the app
+/// asks, for the user's answer to the camera prompt.
+/// @param fail  `-fail-opens` owes this open a failure: it waits 1 s and is
+///              `NotFound`, opening nothing.
+vkc::Result<sensor::ArkitSensor> open_camera(const app::CameraPlan& plan,
+                                             bool fail) {
+  if (fail) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    return vkc::Status::not_found(
+        "ArkitSensor: no frame in time (-fail-opens: a test of the retry)");
+  }
+  return sensor::ArkitSensor::open(plan.camera);
+}
+
+/// The open begun last ended as @p opened: the policy told, the console
+/// line, and an opened camera kept in `camera_opened` -- only where the
+/// policy took the end, so a kept camera is always an open one.
+/// @return Whether a camera is kept.
+bool end_open(app::RendererImpl& impl,
+              vkc::Result<sensor::ArkitSensor>&& opened) {
+  const std::uint64_t now = steady_ns();
+  if (opened) {
+    impl.camera_open.end(app::CameraOpenEnd::Opened, {}, now);
+    if (impl.camera_open.state() == app::CameraOpenState::Open) {
+      impl.camera_opened.emplace(std::move(opened).value());
+    }
+  } else {
+    impl.camera_open.end(opened.status().domain() == vkc::Status::Code::NotFound
+                             ? app::CameraOpenEnd::NotFound
+                             : app::CameraOpenEnd::Refused,
+                         opened.status().message(), now);
+  }
+  say_camera(impl);
+  return impl.camera_opened.has_value();
+}
+
+/// `camera_opened` becomes the renderer's camera, and its stream opens on it.
+/// On the bring-up thread, or on the main thread while no fuse thread and no
+/// teardown runs: those are the camera's and the stream's other users.
+void take_camera(app::RendererImpl& impl) {
+  impl.arkit.emplace(std::move(*impl.camera_opened));
+  impl.camera_opened.reset();
+  // The fuse thread waits on this rather than polling at a fixed rate. The
+  // impl outlives the camera, which calls it from its own queue, and the
+  // signal is declared before it, so it outlives every call.
+  app::RendererImpl* p = &impl;
+  const vkc::Status notified =
+      impl.arkit->set_frame_notify([p] { p->frame_signal.notify(); });
+  if (!notified) {
+    impl.fusion.note_error(notified.message(), "camera notify: ");
+  }
+
+  // The stream, on the camera: opened once, here, so a scan is one session
+  // across a stop and a start, and a reconnect is the same session. A sender
+  // that does not open fails nothing: the scan goes on, and the read-out says
+  // why.
+  app::RgbdStreamSenderOptions stream = impl.camera_plan.stream;
+  arc4random_buf(stream.session.session_id.data(),
+                 stream.session.session_id.size());
+  stream.session.session_id[0] |= 1;  // never all zero
+  stream.session.created_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  vkc::Result<std::unique_ptr<app::RgbdStreamSender>> sender =
+      app::RgbdStreamSender::open(stream, impl.arkit->info());
+  if (sender) {
+    impl.stream = std::move(sender).value();
+    impl.stream_error.clear();
+  } else {
+    impl.stream_error =
+        app::without_path(sender.status().message(), impl.record_path);
+  }
+}
+
 }  // namespace
 
 @interface VolumetricCameraStatus ()
@@ -275,7 +379,11 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
     return nil;
   }
   _pattern = impl.camera_pattern ? YES : NO;
-  _openError = app::to_ns_string(impl.camera_error);
+  _openState = static_cast<VolumetricCameraOpenState>(impl.camera_open.state());
+  _openRetries = impl.camera_open.retries();
+  _openError = app::to_ns_string(impl.camera_open.error());
+  _openSummary =
+      app::to_ns_string(app::camera_open_text(impl.camera_open, steady_ns()));
   _model = @"";
   _tracking = @"";
   _sessionError = @"";
@@ -337,6 +445,7 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
                                 source:(VolumetricCameraSource)source
                             recordPath:(nullable NSString*)recordPath
                                 dryRun:(BOOL)dryRun
+                             failOpens:(uint32_t)failOpens
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
@@ -623,74 +732,45 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
   // cameras the sensor's are -- and, the first time the app asks, for the
   // user's answer to the camera prompt. This whole method runs off the main
   // thread already. A camera that does not open fails nothing: the read-out
-  // says why, and nothing fuses.
+  // says why, and nothing fuses until it opens. Where it found no camera in
+  // time, it opens again later (-retryCameraOnWake:, Core/CameraOpen.hpp).
+  //
+  // What every open opens, here and later: the camera, then its stream on it.
   _impl->camera_pattern = source == VolumetricCameraSourcePattern;
-  if (source == VolumetricCameraSourceNone) {
-    _impl->camera_error =
-        "no camera opened: the launch's arguments were refused";
-  } else {
-    sensor::ArkitSensor::Options camera;
-    camera.source = _impl->camera_pattern ? sensor::ArkitSource::Pattern
-                                          : sensor::ArkitSource::Camera;
-    // ARKit's medium and high: its low-confidence samples are frequently
-    // metres wrong at depth discontinuities, and a TSDF carves free space
-    // along every ray it believes. The floor the scanner has always fused at;
-    // the frame prep applies it on the GPU.
-    camera.min_confidence = 1;
-    camera.device = &*_impl->compute_device;
-    camera.color_queue_families[0] = _impl->shared->compute_family();
-    camera.color_queue_families[1] = _impl->shared->graphics_family();
-    camera.color_queue_family_count = 2;
-    vkc::Result<sensor::ArkitSensor> opened = sensor::ArkitSensor::open(camera);
-    if (opened) {
-      _impl->arkit.emplace(std::move(opened).value());
-      // The fuse thread waits on this rather than polling at a fixed rate.
-      // The impl outlives the camera, which calls it from its own queue, and
-      // the signal is declared before it, so it outlives every call.
-      app::RendererImpl* impl = _impl.get();
-      const vkc::Status notified = _impl->arkit->set_frame_notify(
-          [impl] { impl->frame_signal.notify(); });
-      if (!notified) {
-        _impl->fusion.note_error(notified.message(), "camera notify: ");
-      }
-    } else {
-      _impl->camera_error = opened.status().message();
-    }
+  app::CameraPlan& plan = _impl->camera_plan;
+  plan.camera.source = _impl->camera_pattern ? sensor::ArkitSource::Pattern
+                                             : sensor::ArkitSource::Camera;
+  // ARKit's medium and high: its low-confidence samples are frequently metres
+  // wrong at depth discontinuities, and a TSDF carves free space along every
+  // ray it believes. The floor the scanner has always fused at; the frame prep
+  // applies it on the GPU.
+  plan.camera.min_confidence = 1;
+  plan.camera.device = &*_impl->compute_device;
+  plan.camera.color_queue_families[0] = _impl->shared->compute_family();
+  plan.camera.color_queue_families[1] = _impl->shared->graphics_family();
+  plan.camera.color_queue_family_count = 2;
+  if (recordPath != nil) {
+    _impl->record_path = recordPath.fileSystemRepresentation;
+    plan.stream.session.path = _impl->record_path;
   }
+  plan.stream.session.fps = kStreamHz;
+  plan.stream.qp = kStreamQp;
+  // The camera's device, on which each picture is copied into the encoder's
+  // own.
+  plan.stream.device = &*_impl->compute_device;
+  plan.stream.dry = dryRun == YES;
+  plan.fail_opens = _impl->camera_pattern ? failOpens : 0;
+  _impl->stream_error = "no camera opened";
 
-  // --- The stream, on the camera
-  // ---------------------------------------------- Opened once, for the
-  // renderer's life, so a scan is one session across a stop and a start, and a
-  // reconnect is the same session. A sender that does not open fails nothing:
-  // the scan goes on, and the read-out says why.
-  if (!_impl->arkit) {
-    _impl->stream_error = "no camera opened";
-  } else {
-    app::RgbdStreamSenderOptions stream;
-    if (recordPath != nil) {
-      _impl->record_path = recordPath.fileSystemRepresentation;
-      stream.session.path = _impl->record_path;
-    }
-    stream.session.fps = kStreamHz;
-    arc4random_buf(stream.session.session_id.data(),
-                   stream.session.session_id.size());
-    stream.session.session_id[0] |= 1;  // never all zero
-    stream.session.created_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    stream.qp = kStreamQp;
-    // The camera's device, on which each picture is copied into the
-    // encoder's own.
-    stream.device = &*_impl->compute_device;
-    stream.dry = dryRun == YES;
-    vkc::Result<std::unique_ptr<app::RgbdStreamSender>> sender =
-        app::RgbdStreamSender::open(stream, _impl->arkit->info());
-    if (sender) {
-      _impl->stream = std::move(sender).value();
-    } else {
-      _impl->stream_error =
-          app::without_path(sender.status().message(), _impl->record_path);
+  if (source == VolumetricCameraSourceNone) {
+    _impl->camera_open.refuse(
+        "no camera opened: the launch's arguments were refused");
+  } else if (_impl->camera_open.begin(app::CameraOpenCause::Wake,
+                                      steady_ns())) {
+    say_camera(*_impl);
+    if (end_open(*_impl, open_camera(plan, _impl->camera_open.opens() <=
+                                               plan.fail_opens))) {
+      take_camera(*_impl);
     }
   }
 
@@ -1108,14 +1188,24 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
 }
 
 - (void)startFusion {
+  _impl->fusion_wanted = true;
   // A stop request can clear the flag before the old thread finishes. Do not
   // start the camera again until stopFusion has joined it.
   if (_impl->fusing.load() || _impl->fuse_thread.joinable()) {
     return;
   }
-  // No camera, nothing to fuse: the read-out already says why it did not open.
   if (!_impl->arkit) {
-    return;
+    if (!_impl->camera_opened) {
+      // No camera yet. Where the last open found none in time it opens
+      // again, and fusion starts when it opens; otherwise the read-out says
+      // why it did not.
+      [self retryCameraOnWake:YES];
+      return;
+    }
+    // A later open's camera: the renderer's from here. No fuse thread runs
+    // (there was no camera to poll) and no teardown does (Swift starts
+    // fusion only once one has finished).
+    take_camera(*_impl);
   }
   // Before the thread, which polls it: frames go out from here, the counters
   // and sequences from 0. A session that failed stays failed.
@@ -1145,8 +1235,43 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
   }
 }
 
+- (void)retryCameraOnWake:(BOOL)wake {
+  app::RendererImpl& impl = *_impl;
+  if (!impl.fusion_wanted || impl.arkit || impl.camera_opened) return;
+  if (!impl.camera_open.begin(
+          wake ? app::CameraOpenCause::Wake : app::CameraOpenCause::Tick,
+          steady_ns())) {
+    return;
+  }
+  say_camera(impl);
+  const app::CameraPlan plan = impl.camera_plan;
+  const bool fail = impl.camera_open.opens() <= plan.fail_opens;
+  // `self` strongly, in both blocks: the open borrows the renderer's device,
+  // so the renderer outlives it, and its end is applied to this renderer.
+  VolumetricRenderer* renderer = self;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    auto opened = std::make_shared<vkc::Result<sensor::ArkitSensor>>(
+        open_camera(plan, fail));
+    dispatch_async(dispatch_get_main_queue(), ^{
+      app::RendererImpl& ended = *renderer->_impl;
+      if (!end_open(ended, std::move(*opened))) return;
+      if (ended.fusion_wanted) {
+        [renderer startFusion];
+        return;
+      }
+      // Kept for the next -startFusion, its session paused meanwhile so the
+      // camera goes: an open leaves it running, and a stop pauses only a
+      // started sensor. The start then runs it again, its world kept.
+      if (ended.camera_opened->start().ok()) {
+        ended.camera_opened->stop();
+      }
+    });
+  });
+}
+
 - (void)beginStopFusion {
   if (_impl) {
+    _impl->fusion_wanted = false;
     // The flag only, and a nudge to a thread waiting for a frame. The thread
     // stays joinable and the camera started -- -stopFusion is still what
     // makes either of those untrue.

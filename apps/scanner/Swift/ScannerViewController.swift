@@ -64,6 +64,9 @@ final class ScannerViewController: UIViewController {
   /// Set once a `-minutes N` run is over: the loop never starts again, and the
   /// app exits once it has wound down.
   private var runEnded = false
+  /// Set once the stream's state has been said and the launch's `-connect`
+  /// dialled; see `announceStream`.
+  private var streamAnnounced = false
 
   /// Everything that must hold before the loop may run.
   private var isRunnable: Bool {
@@ -115,6 +118,12 @@ final class ScannerViewController: UIViewController {
     center.addObserver(
       self, selector: #selector(appWillEnterForeground),
       name: UIApplication.willEnterForegroundNotification, object: nil)
+    // Active again without a trip to the background -- Control Center, an
+    // alert, the notification shade -- is a wake too, for a camera that did
+    // not open (see `retryCamera`).
+    center.addObserver(
+      self, selector: #selector(appDidBecomeActive),
+      name: UIApplication.didBecomeActiveNotification, object: nil)
 
     // The dashboard, hosted rather than laid out here.
     //
@@ -285,6 +294,20 @@ final class ScannerViewController: UIViewController {
     // drawable size has not changed, so `onDrawableSizeChange` does not either.
     startRendererIfNeeded()
     resume()
+  }
+
+  @objc private func appDidBecomeActive() {
+    retryCamera(wake: true)
+  }
+
+  /// Open the camera again where its last open found none in time: at a wake
+  /// at once, at the read-out's tick once the backoff has passed (the
+  /// renderer's `retryCamera(wake:)`). Only while the loop runs, so never in
+  /// the background and never beside a teardown; a foreground's `resume`
+  /// does the same through `startFusion`.
+  private func retryCamera(wake: Bool) {
+    guard isCapturing, !teardownInFlight, let renderer else { return }
+    renderer.retryCamera(wake: wake)
   }
 
   /// Start capture, fusion and the draw loop, if everything is ready for them.
@@ -464,6 +487,8 @@ final class ScannerViewController: UIViewController {
     let source = launch.source
     // `-dry`: the stream stays a dry run, refusing every connect.
     let dry = launch.dry
+    // `-fail-opens N`: the pattern's first N opens fail, a test of the retry.
+    let failOpens = launch.failOpens
     // `-record <name>`: the stream's session file, in the app's own Documents.
     let recordPath: String? =
       launch.record.isEmpty
@@ -495,7 +520,7 @@ final class ScannerViewController: UIViewController {
         }
         return try VolumetricRenderer(
           layer: layer, configurationPath: url.path, source: source,
-          recordPath: recordPath, dryRun: dry)
+          recordPath: recordPath, dryRun: dry, failOpens: failOpens)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
@@ -521,17 +546,7 @@ final class ScannerViewController: UIViewController {
     renderer = brought
     cameraGestures?.renderer = brought
     link.renderer = brought
-    // The stream's state, once, on the console: why it did not open, or the
-    // launch's own connect, through the on-screen entry's path.
-    if !brought.streamError.isEmpty {
-      print("scanner: no stream: \(brought.streamError)")
-    }
-    if !launch.connect.isEmpty {
-      link.connect(address: launch.connect, port: "")
-      if let refused = link.entryError {
-        print("scanner: -connect refused: \(refused)")
-      }
-    }
+    announceStream(brought, camera: brought.cameraStatus)
     // Cleared, because bring-up has a documented retry path: a first layout
     // reporting a zero dimension fails, `onDrawableSizeChange` tries again, and
     // the second attempt succeeds. Nothing used to clear this, so the banner
@@ -553,6 +568,38 @@ final class ScannerViewController: UIViewController {
     // The view may have appeared, or been backgrounded, or both, while bring-up
     // was in flight. `resume` is what reconciles that rather than assuming.
     resume()
+  }
+
+  /// The stream's state, once, on the console: why it did not open, or the
+  /// launch's own connect, through the on-screen entry's path. The stream
+  /// opens with the camera, so this waits while the camera is still to open
+  /// (opening, retrying, or opened and not yet started), and comes from the
+  /// read-out once it is open or refused.
+  private func announceStream(
+    _ renderer: VolumetricRenderer, camera cam: VolumetricCameraStatus
+  ) {
+    guard !streamAnnounced, cam.opened || cam.openState == .failed else {
+      return
+    }
+    streamAnnounced = true
+    if !renderer.streamError.isEmpty {
+      print("scanner: no stream: \(renderer.streamError)")
+    }
+    if !launch.connect.isEmpty {
+      link.connect(address: launch.connect, port: "")
+      if let refused = link.entryError {
+        print("scanner: -connect refused: \(refused)")
+      }
+    }
+  }
+
+  /// The tracking chip's words while the camera is not open.
+  private static func openChip(_ state: VolumetricCameraOpenState) -> String {
+    switch state {
+    case .failed: return "no camera"
+    case .retrying: return "camera retrying"
+    default: return "opening camera"
+    }
   }
 
   /// The SoC side of the device identity: the model identifier and its core
@@ -715,6 +762,15 @@ final class ScannerViewController: UIViewController {
     // one frame rather than two.
     let snapshot = renderer.dashboardSnapshot
 
+    // The tick of the camera's retry, while it is not open: the renderer opens
+    // again only once the backoff has passed, so a camera let go elsewhere
+    // is found without a wake. Then the stream, once the camera is open or
+    // refused.
+    if !cam.opened {
+      retryCamera(wake: false)
+    }
+    announceStream(renderer, camera: cam)
+
     // Built as lines, once, then joined for stdout -- rather than appended to a
     // string the panel cannot read. The `Capture` card rendered an array
     // nothing ever assigned, so every figure below reached the transcript and
@@ -748,14 +804,18 @@ final class ScannerViewController: UIViewController {
     var counterLines: [String] = []
 
     if !cam.opened {
-      // The reason the camera did not open -- no LiDAR, the camera not
-      // allowed, no depth in time -- in the camera's own words, and the
-      // launch's refusal where that was the reason.
-      sessionLines.append("camera: \(cam.openError)")
+      // What the open is doing: opening; why the last found no camera in
+      // time, with the retry count and when the next opens; or why it was
+      // refused -- no LiDAR, the camera not allowed -- in the camera's own
+      // words, and the launch's refusal where that was the reason.
+      sessionLines.append("camera: \(cam.openSummary)")
       if !launch.refusal.isEmpty {
         sessionLines.append("launch: \(launch.refusal)")
       }
     } else {
+      if cam.openRetries > 0 {
+        sessionLines.append("camera: \(cam.openSummary)")
+      }
       if !cam.sessionError.isEmpty {
         // Alongside the counters, not instead of them, so a failure does not
         // hide what the camera did before it.
@@ -815,7 +875,7 @@ final class ScannerViewController: UIViewController {
     dashboard.scanning = isCapturing && !renderFailed
     dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
     dashboard.fps = fps
-    dashboard.trackingText = cam.opened ? cam.tracking : "no camera"
+    dashboard.trackingText = cam.opened ? cam.tracking : Self.openChip(cam.openState)
     // Normal is the one tracking whose frames go out; anything else -- limited,
     // initializing, relocalizing -- means frames are being withheld from
     // fusion, which is exactly when this chip should stop being quiet.
