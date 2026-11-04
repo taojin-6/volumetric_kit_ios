@@ -39,6 +39,9 @@ namespace app = volumetric_kit::ios_app;
     }
   }
   _minutes = options.minutes;
+  _record = app::to_ns_string(options.record);
+  _connect = app::to_ns_string(options.connect);
+  _dry = options.dry ? YES : NO;
   _refusal = app::to_ns_string(options.refusal);
   return self;
 }

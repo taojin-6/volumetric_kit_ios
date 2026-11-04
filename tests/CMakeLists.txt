@@ -70,6 +70,29 @@ target_link_libraries(
           GTest::gtest_main)
 gtest_discover_tests(vi_session_tests)
 
+# vi_stream's sender on this Mac's GPU and VideoToolbox: sensor's ArkitSensor
+# with its test pattern (no camera) through the sender into a session, read back
+# with grid's reader, each picture decoded on VideoToolbox and its index read on
+# the GPU (sensor_prep's PatternReader); the live link on 127.0.0.1. Skips
+# without a device or an encoder unless the run promises them.
+if(APPLE)
+  add_executable(vi_stream_tests rgbd_stream_sender_test.cpp)
+  target_link_libraries(
+    vi_stream_tests
+    PRIVATE vi_stream
+            vi_session
+            volumetric_kit::sensor_arkit
+            volumetric_kit::sensor_prep
+            volumetric_kit::sensor_video
+            volumetric_kit::sensor_wire
+            volumetric_kit::grid_stream
+            volumetric_kit::grid_networking
+            volumetric_kit::core_net
+            volumetric_kit::core_test_support
+            GTest::gtest_main)
+  gtest_discover_tests(vi_stream_tests)
+endif()
+
 add_executable(vi_config_tests scanner_config_test.cpp)
 target_link_libraries(vi_config_tests PRIVATE volumetric_kit::core_config
                                               GTest::gtest_main)

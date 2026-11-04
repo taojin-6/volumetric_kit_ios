@@ -12,6 +12,7 @@
 #import "AllocationStop.hpp"
 #import "AtlasRing.hpp"
 #import "BridgeStrings.hpp"
+#import "CaptureReport.hpp"
 #import "FrameTrace.hpp"
 #import "FuseLoop.hpp"
 #import "Fusion.hpp"
@@ -88,7 +89,7 @@
 #include "volumetric_kit/grid/base/device_requirements.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/sensor/camera_conventions.hpp"
-#include "volumetric_kit/sensor/frame/device_requirements.hpp"
+#include "volumetric_kit/sensor/video/hevc_encoder.hpp"
 
 namespace vkc = volumetric_kit::core;
 
@@ -132,6 +133,11 @@ static_assert(offsetof(GridVertex, color) == offsetof(GfxVertex, color),
 static_assert(std::is_standard_layout<GridVertex>::value &&
                   std::is_standard_layout<GfxVertex>::value,
               "offsetof above requires standard-layout vertex types");
+
+// The stream's rate (RateGate), the session's tracks' rate.
+constexpr std::uint32_t kStreamHz = 10;
+// The stream's slice QP (HevcEncoder::Options::qp).
+constexpr int kStreamQp = 22;
 }  // namespace
 
 NSErrorDomain const VolumetricRendererErrorDomain =
@@ -329,6 +335,8 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
                                 source:(VolumetricCameraSource)source
+                            recordPath:(nullable NSString*)recordPath
+                                dryRun:(BOOL)dryRun
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
@@ -366,7 +374,9 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
   // No library is consulted about another: each states its needs, and the
   // shared device satisfies the union. gfx presents; sensor, grid and recon
   // compute, and sensor's list carries the optional extensions its picture
-  // importer takes where offered.
+  // importer takes where offered. sensor's encoder list is its frame list and
+  // the R8 and R8G8 storage images the stream's encoder pictures are, written
+  // on this device (rgbd_stream_sender.hpp).
   vkc::Result<vkc::DeviceRequirements> compute_requirements =
       []() -> vkc::Result<vkc::DeviceRequirements> {
     vkc::Result<vkc::DeviceRequirements> fusion =
@@ -374,7 +384,8 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
     if (!fusion) {
       return fusion;
     }
-    return vkc::merge(fusion.value(), sensor::device_requirements());
+    return vkc::merge(fusion.value(),
+                      sensor::hevc_encoder_device_requirements());
   }();
   if (!compute_requirements) {
     app::set_error(error, compute_requirements.status(),
@@ -644,6 +655,42 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
       }
     } else {
       _impl->camera_error = opened.status().message();
+    }
+  }
+
+  // --- The stream, on the camera
+  // ---------------------------------------------- Opened once, for the
+  // renderer's life, so a scan is one session across a stop and a start, and a
+  // reconnect is the same session. A sender that does not open fails nothing:
+  // the scan goes on, and the read-out says why.
+  if (!_impl->arkit) {
+    _impl->stream_error = "no camera opened";
+  } else {
+    app::RgbdStreamSenderOptions stream;
+    if (recordPath != nil) {
+      _impl->record_path = recordPath.fileSystemRepresentation;
+      stream.session.path = _impl->record_path;
+    }
+    stream.session.fps = kStreamHz;
+    arc4random_buf(stream.session.session_id.data(),
+                   stream.session.session_id.size());
+    stream.session.session_id[0] |= 1;  // never all zero
+    stream.session.created_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    stream.qp = kStreamQp;
+    // The camera's device, on which each picture is copied into the
+    // encoder's own.
+    stream.device = &*_impl->compute_device;
+    stream.dry = dryRun == YES;
+    vkc::Result<std::unique_ptr<app::RgbdStreamSender>> sender =
+        app::RgbdStreamSender::open(stream, _impl->arkit->info());
+    if (sender) {
+      _impl->stream = std::move(sender).value();
+    } else {
+      _impl->stream_error =
+          app::without_path(sender.status().message(), _impl->record_path);
     }
   }
 
@@ -1119,8 +1166,23 @@ std::string color_codes_text(const sensor::ColorCodes& codes) {
   return [[VolumetricCameraStatus alloc] initWithImpl:*_impl];
 }
 
-- (const void*)sensorInfoHandle {
-  return _impl->arkit ? &_impl->arkit->info() : nullptr;
+- (void*)streamHandle {
+  return _impl->stream.get();
+}
+
+- (NSString*)streamError {
+  return app::to_ns_string(_impl->stream_error);
+}
+
+- (void)finishStream {
+  if (!_impl->stream) return;
+  const vkc::Status finished = _impl->stream->finish();
+  if (!finished.ok()) {
+    std::printf(
+        "scanner: the stream did not finish: %s\n",
+        app::without_path(finished.message(), _impl->record_path).c_str());
+    std::fflush(stdout);
+  }
 }
 
 // Written out rather than left to auto-synthesis. A `@property` with no

@@ -6,22 +6,20 @@
 ///        it: connect to the address and port typed, disconnect, and what the
 ///        link is doing now.
 ///
-/// The phone dials and listens on nothing: the session writer
-/// (`Session/rgbd_stream_writer.hpp`) serves its session to the reader it
-/// dials, and dials again while none is served. The session is opened at the
-/// first connect and kept until the link goes, so a reconnect, here or to
-/// another address, is the same session.
+/// The phone dials and listens on nothing: the renderer's stream sender
+/// (`Session/rgbd_stream_sender.hpp`, through `streamHandle`) serves its
+/// session to the reader it dials, and dials again while none is served.
+/// The session is the renderer's for its life, opened at bring-up with a
+/// `-record` file or at the first connect, so a reconnect, here or to another
+/// address, is the same session.
 ///
-/// The session describes the camera as it opened (`ArkitSensor::info()`,
-/// through the renderer): its depth camera and picture, tracked, on the
-/// host's clock. **It sends the session alone, with no frames, and no
-/// pictures (`RgbdStreamOptions::color` off)** until the scanner hands the
-/// camera's frames to the writer.
+/// The session describes the camera as it opened (`ArkitSensor::info()`):
+/// its depth camera and picture, tracked, on the host's clock. Its frames are
+/// the camera's at 10 Hz, each its picture coded on the hardware (HEVC), then
+/// its depth; a reader that joins gets a key next.
 ///
-/// @warning Main thread only. Releasing the link ends its session there,
-///          which waits for the dial under way and the reader's last records
-///          (up to about 3 s); the scanner's view controller keeps it for
-///          the app's life, so that wait does not arise today.
+/// @warning Main thread only. The session is the renderer's, so releasing the
+///          link lets its target go and ends nothing.
 
 #import <Foundation/Foundation.h>
 
@@ -58,6 +56,10 @@ typedef struct {
   uint64_t dial_failures;
   /// Readers that joined or fell back and so asked for a key.
   uint64_t key_wanted;
+  /// Frames the session holds whole, from its start: the file's, and those a
+  /// reader connected then was served (one that joins later starts at the
+  /// next key).
+  uint64_t frames;
 } VolumetricLinkStatus;
 
 @interface VolumetricLink : NSObject
@@ -70,12 +72,14 @@ typedef struct {
 /// @brief Dial the reader the entry names, from now on: the address field
 ///        (a numeric IPv4 address, or one with ":port") and the port field
 ///        (empty for @ref defaultPort). An empty address disconnects.
-/// @param renderer  The renderer whose camera the session describes, at the
-///                  first connect; nil while it is still coming up.
+/// @param renderer  The renderer whose stream the link drives, kept (weakly)
+///                  for @ref disconnect and @ref status; nil while it is still
+///                  coming up.
 /// @return `YES`; `NO` with @p error for an entry the core's checks refuse,
 ///         its description the core's sentence for the screen, no renderer
-///         or a camera that did not open at the first connect, or a session
-///         that could not start. The last target is kept on a refusal.
+///         or no stream (the camera or the sender did not open, as
+///         `streamError` says), or a session that could not start. The last
+///         target is kept on a refusal.
 - (BOOL)connectToAddress:(NSString*)address
                     port:(NSString*)port
                 renderer:(nullable VolumetricRenderer*)renderer

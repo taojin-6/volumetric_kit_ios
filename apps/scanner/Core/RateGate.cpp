@@ -37,4 +37,9 @@ bool RateGate::take(std::uint64_t timestamp_ns) noexcept {
   return true;
 }
 
+bool RateGate::due(std::uint64_t timestamp_ns) const noexcept {
+  RateGate trial = *this;
+  return trial.take(timestamp_ns);
+}
+
 }  // namespace volumetric_kit::ios_app

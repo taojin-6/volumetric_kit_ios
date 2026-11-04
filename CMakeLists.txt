@@ -114,6 +114,13 @@ set(VKC_WITH_CONFIG ON)
 set(VKC_WITH_VULKAN
     ON
     CACHE BOOL "" FORCE)
+# The host tests of the stream sender run on the Mac's GPU, through the core's
+# GoogleTest fixtures (core_test_support).
+if(VI_HOST_TESTS)
+  set(VKC_BUILD_TEST_SUPPORT
+      ON
+      CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
@@ -184,12 +191,14 @@ vkc_require_sibling(
   volumetric_kit::grid_stream
   volumetric_kit::grid_networking)
 
-# --- Host mode: pure scanner logic, the session writer, configuration tests --
+# --- Host mode: pure scanner logic, the session writer and sender, config ----
 # vi_core is plain C++ over glm; vi_session is host code on sensor's and grid's
-# public types. Neither needs recon, gfx, MoltenVK or a device, so the host
+# public types; vi_stream, the sender, codes pictures on VideoToolbox, and its
+# tests run on the Mac's GPU (sensor's ArkitSensor pattern, its decoder and
+# PatternReader). None needs recon, gfx or a MoltenVK release, so the host
 # configure stops here. It builds only what the tests link: the siblings'
-# directories are left out of `all`, so their other tiers (shaders, Metal,
-# VideoToolbox) are configured and not compiled.
+# directories are left out of `all`, so their other tiers are configured and not
+# compiled.
 if(NOT VI_IOS)
   foreach(_vi_sibling volumetric_kit_core volumetric_kit_sensor
                       volumetric_kit_grid)

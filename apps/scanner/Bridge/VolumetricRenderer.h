@@ -571,11 +571,26 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                is launched again, since only bring-up opens it (a start
 ///                does not retry the open). `VolumetricCameraSourceNone` opens
 ///                none.
+/// @param recordPath  A new `.vrst` file the stream writes its session to
+///                    from the first frame, or nil for none. With a camera
+///                    open, its stream sender opens here
+///                    (Session/rgbd_stream_sender.hpp): every frame the fuse
+///                    thread takes goes to it, and at 10 Hz each frame's
+///                    picture is copied on the compute device into the
+///                    hardware encoder's own and coded, and the frame written
+///                    to the file and the live link (@ref streamHandle), or,
+///                    with neither, coded and counted only (the dry run). A
+///                    sender that does not open fails nothing:
+///                    @ref streamError says why.
+/// @param dryRun  `-dry`: the stream stays a dry run, refusing every connect
+///                (and so needs no @p recordPath, which it refuses).
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
                      configurationPath:(NSString*)configurationPath
                                 source:(VolumetricCameraSource)source
+                            recordPath:(nullable NSString*)recordPath
+                                dryRun:(BOOL)dryRun
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
@@ -643,12 +658,25 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// at the read-out's rate; each read is a new object.
 @property(nonatomic, readonly) VolumetricCameraStatus* cameraStatus;
 
-/// @return The camera's `volumetric_kit::sensor::SensorInfo`
-///         (sensor/rgbd_sensor.hpp), fixed from when it opened, as an opaque
-///         pointer valid for the renderer's life; null when the camera did
-///         not open. For the bridge's C++ (the live link's session) alone.
-- (const void* _Nullable)
-    sensorInfoHandle NS_SWIFT_UNAVAILABLE("C++ interop only");
+/// @return The camera's stream sender, a
+///         `volumetric_kit::ios_app::RgbdStreamSender`
+///         (Session/rgbd_stream_sender.hpp), as an opaque pointer valid for
+///         the renderer's life; null when the camera or the sender did not
+///         open. For the bridge's C++ (the live link) alone: its `dial_to` and
+///         `stats` from any thread.
+- (void* _Nullable)streamHandle NS_SWIFT_UNAVAILABLE("C++ interop only");
+
+/// Why the stream sender did not open, for the screen and the console;
+/// empty when it opened, and "no camera opened" when the camera did not.
+@property(nonatomic, readonly, copy) NSString* streamError;
+
+/// @brief End the stream: the frame handed over is sent, the file gets its
+///        footer and a live reader its end (`RgbdStreamSender::finish`).
+///        Frames offered after it go nowhere. Idempotent; call it after
+///        @ref stopFusion, as a timed run's end does before the app exits.
+///        Blocks until the sender's thread ends, within a picture's coding
+///        and the link's last records (a few seconds at most).
+- (void)finishStream;
 
 /// Draw the reconstructed mesh rather than the bring-up triangle. The triangle
 /// stays reachable because when the mesh first renders wrong, being able to A/B

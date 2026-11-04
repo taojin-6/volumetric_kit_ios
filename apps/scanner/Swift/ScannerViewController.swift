@@ -13,16 +13,17 @@ import UIKit
 final class ScannerViewController: UIViewController {
   private var metalView: MetalView!
   private var renderer: VolumetricRenderer?
-  /// What the launch asks of the camera: `-source camera|pattern` and
-  /// `-minutes N`.
+  /// What the launch asks of the camera and its stream: `-source
+  /// camera|pattern`, `-minutes N`, `-record <name>`, `-connect <address>`
+  /// and `-dry`.
   private let launch = ScannerLaunch(arguments: ProcessInfo.processInfo.arguments)
   private var displayLink: CADisplayLink?
   /// What the dashboard draws. Populated in `updateStatus`, at the display
   /// cadence -- the *history* it charts is sampled per fused frame on the
   /// fusion thread, which is a different rate on purpose (see DashboardModel).
   private let dashboard = DashboardModel()
-  /// The live link the dashboard's entry drives. It describes the renderer's
-  /// camera at its first connect, and lives as long as this controller, so a
+  /// The live link the dashboard's entry drives: it dials the renderer's
+  /// stream to the reader typed, and the session is the renderer's, so a
   /// reconnect is the same session.
   private let link = LinkModel()
   private var dashboardHost: UIHostingController<DashboardView>?
@@ -215,8 +216,8 @@ final class ScannerViewController: UIViewController {
 
   /// `-minutes N`'s end, for a measurement run that needs no one to stop it:
   /// the loop winds down as it does on backgrounding -- the fuse thread prints
-  /// the stop's console line as it ends, then the camera stops -- and the app
-  /// exits.
+  /// the stop's console lines as it ends, then the camera stops -- the stream
+  /// finishes (the file's footer, the reader's end), and the app exits.
   private func endTimedRun() {
     runEnded = true
     print("scanner: the \(launch.minutes)-minute run is over; stopping")
@@ -231,6 +232,7 @@ final class ScannerViewController: UIViewController {
     DispatchQueue.global(qos: .userInitiated).async {
       renderer?.stopFusion()
       renderer?.waitIdle()
+      renderer?.finishStream()
       fflush(stdout)
       exit(0)
     }
@@ -355,10 +357,15 @@ final class ScannerViewController: UIViewController {
         guard let self else { return }
         self.teardownInFlight = false
         // A `-minutes N` run that ended during this teardown left its exit
-        // here; see endTimedRun.
+        // here; see endTimedRun. The stream's finish waits for its thread
+        // and the link's end, so off the main thread.
         if self.runEnded {
-          fflush(stdout)
-          exit(0)
+          DispatchQueue.global(qos: .userInitiated).async {
+            renderer.finishStream()
+            fflush(stdout)
+            exit(0)
+          }
+          return
         }
         // Reconciled rather than assumed: the app may have been foregrounded,
         // or the view re-appeared, while the drain was running. `resume` is
@@ -455,6 +462,14 @@ final class ScannerViewController: UIViewController {
     bringUpInFlight = true
     let layer = metalView.metalLayer
     let source = launch.source
+    // `-dry`: the stream stays a dry run, refusing every connect.
+    let dry = launch.dry
+    // `-record <name>`: the stream's session file, in the app's own Documents.
+    let recordPath: String? =
+      launch.record.isEmpty
+      ? nil
+      : FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        .first?.appendingPathComponent(launch.record).path
     // The layer itself crosses to another thread, where MoltenVK reads and sets
     // properties on it for the length of the swapchain build -- so the main
     // thread stops touching it until bring-up hands it back. Snapshotting
@@ -479,7 +494,8 @@ final class ScannerViewController: UIViewController {
             userInfo: [NSLocalizedDescriptionKey: "Missing bundled scanner.json"])
         }
         return try VolumetricRenderer(
-          layer: layer, configurationPath: url.path, source: source)
+          layer: layer, configurationPath: url.path, source: source,
+          recordPath: recordPath, dryRun: dry)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
@@ -505,6 +521,17 @@ final class ScannerViewController: UIViewController {
     renderer = brought
     cameraGestures?.renderer = brought
     link.renderer = brought
+    // The stream's state, once, on the console: why it did not open, or the
+    // launch's own connect, through the on-screen entry's path.
+    if !brought.streamError.isEmpty {
+      print("scanner: no stream: \(brought.streamError)")
+    }
+    if !launch.connect.isEmpty {
+      link.connect(address: launch.connect, port: "")
+      if let refused = link.entryError {
+        print("scanner: -connect refused: \(refused)")
+      }
+    }
     // Cleared, because bring-up has a documented retry path: a first layout
     // reporting a zero dimension fails, `onDrawableSizeChange` tries again, and
     // the second attempt succeeds. Nothing used to clear this, so the banner

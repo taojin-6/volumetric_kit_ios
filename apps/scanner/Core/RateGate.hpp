@@ -43,6 +43,11 @@ class RateGate {
   ///         the last frame taken, which a gate cannot place.
   bool take(std::uint64_t timestamp_ns) noexcept;
 
+  /// @return What @ref take would return for @p timestamp_ns, with nothing
+  ///         taken: a sender that cannot send a frame now leaves the gate as
+  ///         it was, so the next frame takes the interval.
+  bool due(std::uint64_t timestamp_ns) const noexcept;
+
   /// @return The rate it was made with.
   std::uint32_t hz() const noexcept { return hz_; }
 

@@ -55,7 +55,7 @@ parenthesised code) or in Xcode → Settings → Accounts.
 | Sibling | What the apps take from it |
 | --- | --- |
 | `volumetric_kit_core` | the shared device, `Status`, the scenario parser, and the address checks and dial the live link uses (`core_net`) |
-| `volumetric_kit_sensor` | the camera, `ArkitSensor`, which owns the ARSession and hands out `RgbdFrame`s (`sensor_arkit`, `sensor_interface`); the GPU pass that prepares each frame for fusion (`sensor_prep`); a picture's own buffer and tags (`sensor_apple`); the HEVC encoder and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`); and the frames' wire form the session writer writes (`sensor_wire`) |
+| `volumetric_kit_sensor` | the camera, `ArkitSensor`, which owns the ARSession and hands out `RgbdFrame`s (`sensor_arkit`, `sensor_interface`); the GPU pass that prepares each frame for fusion (`sensor_prep`); a picture's own buffer and tags (`sensor_apple`); the HEVC encoder the stream codes each picture on, and its rules that `-self-test hevc` runs (`sensor_video`, `sensor_video_testing`); and the frames' wire form the session writer writes (`sensor_wire`) |
 | `volumetric_kit_grid` | the voxel block grid and Marching Cubes (`grid_volume`, `grid_mesh`), the `.vrst` container (`grid_stream`), and the server that serves it live (`grid_networking`) |
 | `volumetric_kit_recon` | TSDF fusion and the projective texturer (`recon_tsdf`, `recon_texture`) |
 | `volumetric_kit_gfx` | the renderer |
@@ -91,8 +91,9 @@ app.
 
 ### The host tests
 
-`vi_core` (the scanner's pure logic), `vi_session` (the session writer) and
-the bundled configuration test build and run on the host:
+`vi_core` (the scanner's pure logic), `vi_session` (the session writer),
+`vi_stream` (the stream sender) and the bundled configuration test build and
+run on the host:
 
 ```sh
 brew install glm molten-vk vulkan-headers vulkan-loader shaderc  # once
@@ -105,10 +106,13 @@ No toolchain file, no MoltenVK release, no recon or gfx, no Xcode project —
 that mode short-circuits before any of them. It fetches the core, sensor, grid
 and the test framework, and builds only the tiers the tests link: the core's,
 sensor's interface and wire form (`sensor_wire`), grid's `.vrst` container
-and its server (`grid_stream`, `grid_networking`). Sensor's interface reaches
-the Vulkan headers through its frame tier, so the mode takes the Vulkan SDK and
-glm from Homebrew; nothing in it opens a device. CI runs it on the family's
-self-hosted Mac (label `mac`).
+and its server (`grid_stream`, `grid_networking`), and for `vi_stream`'s
+tests sensor's ARKit driver, encoder, decoder and frame prep (`sensor_arkit`,
+`sensor_video`, `sensor_prep`) and the core's GoogleTest fixtures. It takes the
+Vulkan SDK and glm from Homebrew. Only `vi_stream_tests` opens a device, the
+Mac's GPU and VideoToolbox, and skips without them unless
+`VKC_REQUIRE_VULKAN_DEVICE` or `VS_TEST_HEVC_ENCODER` says they are there. CI
+runs it on the family's self-hosted Mac (label `mac`).
 
 `apps/scanner/Session/` is `vi_session`: `RgbdStreamWriter` writes any
 `IRgbdSensor`'s frames as one `.vrst` session, each frame its colour record
@@ -124,6 +128,27 @@ back with grid's reader, and read the link on 127.0.0.1 through grid's
 `StreamClient` on a core `Listener`, as the lab does. The pose and rate rules
 it is fed through are `vi_core`'s: `MapSteps` takes ARKit's map steps out of
 every pose and logs them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
+
+`vi_stream` (`Session/rgbd_stream_sender.hpp`) is what feeds it on the iPad:
+`RgbdStreamSender::offer` takes each frame the fuse loop polls through
+`MapSteps` and `RateGate`, and a thread of the sender's own copies each taken
+frame's picture on the compute device into one of the hardware encoder's own
+(`HevcEncoder::target`), codes it (one picture in flight), then appends the
+frame. The copy is because VideoToolbox's low-latency session keeps the last
+picture it coded until it codes the next: with ARKit's own, one of the
+camera's few pictures would be out for the 100 ms between codings, beside the
+scanner's keyframe ring, which on the pattern's 4 stops the camera for good.
+A frame the fuse loop let go unseen is a gap to `MapSteps`, which finds no
+step across 100 ms or more. A picture the encoder drops leaves its frame out
+whole, and the next is a key; so is the session's first frame and the next
+after a reader joins. The encoder opens at the first picture from its own
+tags. With neither a file nor a reader the sender codes and counts only: the
+dry run. Its tests run sensor's `ArkitSensor` pattern through it on the Mac,
+decode every picture on VideoToolbox and check, on the GPU, that each frame
+carries its own picture. With `VI_TEST_SESSION_OUT=<path>`
+or `VI_TEST_LAB_HOST=<a.b.c.d:port>` (or `VI_TEST_DRY=1`),
+`PatternSessionForTheLab` sends the iPad's own stream, 1920×1440 at 10 Hz, for
+`VI_TEST_FRAMES` frames, for recon's `tools/session_check`.
 
 It exists because **everything else here is build-only by nature**: MoltenVK
 ships no simulator slice and ARKit scene depth needs LiDAR, so nothing that
@@ -204,19 +229,27 @@ passed, 1 failed, 2 for an unknown test name, so `--console` returns about 20 s
 after the last line. `Core/SelfTest.hpp` decides what the report says and
 whether it passed, and is host-tested; `Bridge/HevcSelfTest.cpp` runs it.
 
-### `-source pattern` and `-minutes N`
+### `-source pattern`, `-minutes N`, `-record <name>`, `-connect <address>`, `-dry`
 
 Launched with `-source pattern`, the scanner scans sensor's test pattern
 (`ArkitSource::Pattern`) instead of the camera, which never opens: each
 frame's index coded in its depth and its picture, at the camera's sizes and
 rate, through the same queue, frame prep and fusion. `-source camera` is the
 default. `-minutes N` (1 to 1440) stops the scan after N minutes, prints the
-stop's line, and exits; the minutes count from launch. An argument it cannot
+stop's lines, finishes the stream, and exits; the minutes count from launch.
+`-record <name>` writes the stream's session to `Documents/<name>` (a plain
+name ending `.vrst`; an existing file is never overwritten), and
+`-connect <a.b.c.d:port>` connects the live link once the scanner is up, as
+the on-screen Connect does. Without either, and until a Connect, the stream
+codes and counts only. `-dry` keeps it so for the whole launch: no file, and
+every connect refused, the on-screen one too, so nothing the camera sees
+leaves the iPad; it takes no `-record` or `-connect`. An argument it cannot
 read is refused, and then no camera opens at all.
 
 ```sh
 xcrun devicectl device process launch --console --device <id> \
-  io.taojin.volumetrickit.scanner -- -source pattern -minutes 2
+  io.taojin.volumetrickit.scanner -- -source pattern -minutes 2 \
+  -record pattern.vrst -connect 192.168.1.20:47801
 ```
 
 Every 10 s the fuse thread prints one `sa` line of counts, times, states and
@@ -228,14 +261,19 @@ frame contract (`testing::RgbdContract`), and for the pattern how many frames
 carried their own index. Each stop prints an `sa stop` line, a lock or
 backgrounding as well as the run's end; the next start counts its seconds and
 counters from 0 again, so its first frame says how soon the camera came back.
-`Core/CaptureReport.hpp` reads the arguments and writes the line, and is
-host-tested.
+Beside it an `st` line says what the stream did: `dry` or `session`; frames
+taken, coded (keys), failed, written and refused since launch; this window's
+video and depth Mbit/s, send and send-to-access-unit ms at p50 and p95; the
+live readers and failed dials. `Core/CaptureReport.hpp` reads the arguments
+and writes both lines, and is host-tested.
 
 The pattern has 4 pictures, and a tick that finds all 4 held is skipped and
-counted `missed`. The scanner and the camera's queue hold up to 6 (3 in the
+counted `missed`. The scanner and the camera's queue hold up to 8 (3 in the
 keyframe ring, the published keyframe, the frame being fused, the frame
-waiting to be polled), so a pattern run skips ticks by design:
-`received + missed` is the pattern's 60 Hz, and `received` alone is not.
+waiting to be polled, and the stream's frame being copied and coded and the
+one waiting behind it), so a pattern run skips ticks by design: `received +
+missed` is the pattern's 60 Hz, and `received` alone is not. The stream's
+encoder holds none: it codes and keeps pictures of its own.
 
 ## Development
 
@@ -261,8 +299,8 @@ Two configuration notes specific to here:
   siblings lint on Linux.
 
 CI (`.github/workflows/`) cross-compiles every app target for iOS arm64, runs
-the same hooks, and runs the `vi_core` and `vi_session` host tests on the
-self-hosted Mac. The build is **unsigned**
+the same hooks, and runs the `vi_core`, `vi_session` and `vi_stream` host
+tests on the self-hosted Mac. The build is **unsigned**
 (`CODE_SIGNING_ALLOWED=NO`), so no certificate or provisioning secret is needed,
 and **build-only**: MoltenVK ships no simulator slice and ARKit scene depth needs
 LiDAR, so no *app* target is runnable in CI. The test leg is the one that
@@ -295,7 +333,8 @@ Swift          app shell, UI, lifecycle (later: ARSession config, permissions)
     ↓ bridging header
 Obj-C++ (.mm)  VolumetricRenderer — CAMetalLayer → VkSurfaceKHR, ARFrame → PODs
     ↓
-C++            vi_core (pure, host tested), vi_session (host tested)
+C++            vi_core (pure, host tested), vi_session and vi_stream
+               (host tested)
                + volumetric_kit_sensor, _grid, _recon and _gfx
 ```
 
@@ -345,11 +384,13 @@ failed count, or, on "No route to host", allow Local Network access if iOS
 asked, or check the address. iOS answers a connect to the local network so
 until the person allows it. The link dials again at most once a second, also
 after a reader that refuses the session; Connect dials at once. A refused
-entry shows the core's reason under the fields. The session
-opens at the first connect and lasts while the app runs, so a reconnect, to
-the same reader or another, is the same session. This build sends the session
-alone: it describes the camera as `ArkitSensor` opened it
-(`SensorInfo`), and no frames go out yet.
+entry shows the core's reason under the fields. The session is the stream
+sender's (`vi_stream`), opened at launch with `-record` or else at the first
+connect, and lasts while the app runs, so a reconnect, to the same reader or
+another, is the same session. It describes the camera as `ArkitSensor` opened
+it (`SensorInfo`), and its frames are the camera's at 10 Hz, each its HEVC
+picture then its depth; the line says how many frames it has sent, which a
+reader that stalls has not all read. A `-dry` launch refuses the connect.
 
 #### The shared device
 
