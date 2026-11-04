@@ -360,13 +360,15 @@ TEST(RgbdStreamLink, AReaderThatLeavesAtOnceIsDialledOnceARedialWait) {
   auto reader = take_reader(*listener);  // one that stays
   ASSERT_NE(reader, nullptr);
   ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
-  EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures == 0; }));
+  // The reset is due a redial wait after the join; one keyed on the app's
+  // wait (app::kRedialWait) would come ten redial waits after it.
+  EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures == 0; },
+                         5 * kRedial));
   EXPECT_EQ(writer->stats().viewers, 1u);
 }
 
 /// A connect to the target already served keeps its reader, which goes on
-/// reading every record. (A dial while a reader is served fails the redial
-/// cases above, so no window here waits for a second dial.)
+/// reading every record, and dials no second time.
 TEST(RgbdStreamLink, DialToTheServedTargetKeepsTheReader) {
   auto listener = listen_or_fail();
   ASSERT_NE(listener, nullptr);
@@ -394,6 +396,9 @@ TEST(RgbdStreamLink, DialToTheServedTargetKeepsTheReader) {
     ASSERT_EQ(got.size(), 1u) << "record " << k;
     EXPECT_EQ(got[0].info.seq, k);
   }
+  // A connect dials at once, so a second dial would be waiting by now.
+  EXPECT_EQ(take_reader(*listener, 100ms), nullptr);
+  EXPECT_EQ(writer->stats().dial_failures, 0u);
   EXPECT_EQ(writer->stats().viewers, 1u);
 }
 

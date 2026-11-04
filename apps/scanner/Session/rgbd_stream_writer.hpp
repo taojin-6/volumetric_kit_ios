@@ -117,9 +117,8 @@ struct RgbdStreamOptions {
   /// The least time from one dial's start to the next's, while no reader is
   /// served: after a failed dial, or a reader that left at once (one that
   /// refuses the session), the next dial starts this long after the last
-  /// began. A connect (`RgbdStreamWriter::dial_to`) dials at once. A reader
-  /// served this long ends a run of failed dials
-  /// (@ref RgbdStreamStats::dial_failures). Positive; tests shorten it.
+  /// began. A connect (`RgbdStreamWriter::dial_to`) dials at once. Positive;
+  /// tests shorten it.
   std::chrono::milliseconds redial_wait = kRedialWait;
   /// The longest one dial waits for the reader to answer. Positive; tests
   /// shorten it.

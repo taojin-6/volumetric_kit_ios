@@ -41,9 +41,8 @@ using Clock = std::chrono::steady_clock;
 
 // A sensor on its own clock takes the session's clock 1; one sensor a session.
 constexpr std::uint16_t kDeviceClock = 1;
-// How often, at most, the dial thread looks whether the served reader is still
-// there: a tenth of a redial wait under a second, so a redial trails a leave by
-// the same share of the wait.
+// The longest the dial thread goes without looking whether the served reader
+// is still there.
 constexpr std::chrono::milliseconds kWatch{100};
 
 core::Status refuse(const char* api, const std::string& why) {
@@ -305,7 +304,9 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
   serving.max_gop_bytes = options.max_gop_bytes;
   impl->redial_wait = options.redial_wait;
   impl->dial_limit = options.dial_limit;
-  // At least 1 ms, so a redial wait under 10 ms never spins.
+  // A tenth of the redial wait, so a redial trails a leave by the same share
+  // of the wait; at most kWatch, and at least 1 ms, so a redial wait under
+  // 10 ms never spins.
   impl->watch = std::clamp<std::chrono::milliseconds>(
       options.redial_wait / 10, std::chrono::milliseconds{1}, kWatch);
 
