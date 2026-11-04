@@ -8,6 +8,7 @@
 #include <glm/geometric.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/mat3x3.hpp>
+#include <glm/matrix.hpp>
 #include <glm/vec3.hpp>
 
 namespace volumetric_kit::ios_app {
@@ -19,6 +20,20 @@ glm::dmat4 rigid_inverse(const glm::dmat4& m) {
   const glm::dmat3 rt = glm::transpose(glm::dmat3(m));
   glm::dmat4 out(rt);
   out[3] = glm::dvec4(-(rt * glm::dvec3(m[3])), 1.0);
+  return out;
+}
+
+// @p m with its rotation made the nearest rotation, its translation kept: the
+// polar decomposition's rotation, by Newton steps R <- (R + R^-T) / 2. Each
+// step squares the error, so the three here take ARKit's 4.4e-7 to rounding.
+// The identity stays exact.
+glm::dmat4 orthonormalized(const glm::dmat4& m) {
+  glm::dmat3 r(m);
+  for (int i = 0; i < 3; ++i) {
+    r = (r + glm::inverse(glm::transpose(r))) * 0.5;
+  }
+  glm::dmat4 out(r);
+  out[3] = m[3];
   return out;
 }
 
@@ -100,9 +115,13 @@ glm::dmat4 MapSteps::take(std::uint64_t timestamp_ns,
   expected[3] = glm::dvec4(predicted, 1.0);
   // sent = step * expected: the step is on the world's side, so it moves
   // every later pose alike, and raw = (the steps before) * step * expected.
+  // Made rigid again before it is logged and inverted: ARKit's float
+  // rotations are a little off orthonormal, and composed by transposes the
+  // error grew about threefold a step (1.6e-7 after one, 9.1e-6 after six on
+  // a recorded take); kept rigid, the transpose is its inverse.
   const glm::dmat4 step = sent * rigid_inverse(expected);
-  const glm::dmat4 raw_from_sent =
-      (steps_.empty() ? glm::dmat4(1.0) : steps_.back().raw_from_sent) * step;
+  const glm::dmat4 raw_from_sent = orthonormalized(
+      (steps_.empty() ? glm::dmat4(1.0) : steps_.back().raw_from_sent) * step);
   steps_.push_back({timestamp_ns, raw_from_sent});
   sent_from_raw_ = rigid_inverse(raw_from_sent);
   remember(expected);

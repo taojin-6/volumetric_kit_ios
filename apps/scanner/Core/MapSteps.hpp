@@ -22,7 +22,11 @@
 /// The rule needs every frame the camera gives, so it runs on each pose
 /// before the stream's rate gate (RateGate.hpp), and a frame sent carries the
 /// pose with every step so far taken out. Until the first step, a pose comes
-/// back as it was given, bit for bit.
+/// back as it was given, bit for bit. Each step's `raw_from_sent` is rigid to
+/// rounding however many steps there are: its rotation is made the nearest
+/// rotation as the step is composed, since ARKit's float rotations are up to
+/// 4.4e-7 off orthonormal, and composed as they are the error would grow
+/// about threefold a step.
 ///
 /// A run of steps lasting longer than @ref MapSteps::kMaxStepNs is not one of
 /// ARKit's, whose steps last a few frames, but motion, such as a bump or the
@@ -61,7 +65,8 @@ namespace volumetric_kit::ios_app {
 ///        `raw_from_sent * sent`, the steps so far all in it.
 struct MapStep {
   std::uint64_t pts_ns = 0;  ///< The capture time of the first frame it moved.
-  glm::dmat4 raw_from_sent = glm::dmat4(1.0);  ///< Rigid.
+  /// Rigid: its rotation orthonormal to rounding.
+  glm::dmat4 raw_from_sent = glm::dmat4(1.0);
 };
 
 class MapSteps {
