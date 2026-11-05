@@ -190,6 +190,10 @@ target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
                "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
 
+include(ScannerEntitlements)
+vi_write_scanner_entitlements("${CMAKE_CURRENT_BINARY_DIR}/scanner.entitlements"
+                              "${VI_EXTENDED_VIRTUAL_ADDRESSING}")
+
 set_target_properties(
   ${VI_APP_NAME}
   PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
@@ -220,25 +224,27 @@ set_target_properties(
              # gigabytes: the run that motivated this held 3 GB of mesh arena
              # beside a 0.8 GB voxel grid and was SIGKILLed by jetsam, which
              # reports nothing -- the process just disappears. See
-             # scanner.entitlements, which also records why
-             # extended-virtual-addressing is *not* here (a personal development
-             # team cannot provision it, and its presence fails the build rather
-             # than being dropped).
+             # scanner.entitlements.in, which also records why
+             # extended-virtual-addressing is only there under
+             # VI_EXTENDED_VIRTUAL_ADDRESSING (a personal development team
+             # cannot provision it, and its presence fails the build rather than
+             # being dropped).
              #
              # Capability entitlements fail signing loudly when the App ID lacks
              # them, which is the good outcome -- a silently dropped entitlement
              # would look like a fix that quietly is not one. So a build that
-             # runs at all is already carrying this one; to confirm it on the
-             # binary rather than infer it from a running app:
+             # runs at all is already carrying the ones it was configured with;
+             # to confirm them on the binary rather than infer them from a
+             # running app:
              #
              # codesign -d --entitlements - <path to scanner.app>
              #
-             # That command lives here rather than in scanner.entitlements
+             # That command lives here rather than in scanner.entitlements.in
              # because a doubled hyphen cannot appear inside an XML comment --
              # see the note at the top of that file.
              # ~~~
              XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
-             "${CMAKE_CURRENT_SOURCE_DIR}/scanner.entitlements")
+             "${CMAKE_CURRENT_BINARY_DIR}/scanner.entitlements")
 
 if(NOT VI_DEVELOPMENT_TEAM)
   message(

@@ -20,13 +20,13 @@ namespace volumetric_kit::ios_app {
 /// opportunity to shrink first. Every knob that decides whether a scan fits --
 /// `FusionConfig::voxel_size`, `max_buckets`, `mesh_slots` -- was nonetheless
 /// tuned against a figure read off one device once and written into a comment
-/// in `scanner.entitlements`. This is that figure, read at runtime, on whatever
-/// device is actually running.
+/// in `scanner.entitlements.in`. This is that figure, read at runtime, on
+/// whatever device is actually running.
 ///
 /// The ceiling is **not** the device's RAM, and not a constant: it depends on
 /// the hardware, the OS version, and on whether the app carries
 /// `com.apple.developer.kernel.increased-memory-limit` (this one does -- see
-/// `scanner.entitlements`).
+/// `scanner.entitlements.in`).
 ///
 /// @note @ref device_ram_bytes is context, not evidence. An earlier version of
 ///       this comment offered the limit/RAM ratio as the one in-app sign that
@@ -50,14 +50,14 @@ namespace volumetric_kit::ios_app {
 ///         it (MoltenVK reports it as the heap budget), so reaching it
 ///         surfaces as a `vkc::Status` too. `VolumetricRenderer` reads that
 ///         one separately and prints it directly beneath this reading; see
-///         `scanner.entitlements`.
+///         `scanner.entitlements.in`.
 ///       - **Virtual address space**, lifted by
 ///         `com.apple.developer.kernel.extended-virtual-addressing`, which this
-///         app deliberately does not carry (a personal development team cannot
-///         provision it). Exhausting *that* one fails an allocation rather than
-///         the process, so it surfaces as a `vkc::Status` out of a library --
-///         which is what distinguishes the two after the fact: one reports, one
-///         does not.
+///         app carries only when built with `VI_EXTENDED_VIRTUAL_ADDRESSING`
+///         (a personal development team cannot provision it). Exhausting *that*
+///         one fails an allocation rather than the process, so it surfaces as a
+///         `vkc::Status` out of a library -- which is what distinguishes the
+///         two after the fact: one reports, one does not.
 struct MemoryBudget {
   /// Bytes this process is charged for: `phys_footprint`, the ledger jetsam
   /// compares against the limit.

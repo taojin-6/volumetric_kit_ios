@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  cmake/ScannerEntitlements.cmake writes the file the scanner is signed with
+  from apps/scanner/scanner.entitlements.in into the build tree, with the keys
+  the build asks for: edit the template, not the written copy.
+
   On the dashes below: this comment uses em-dashes where the rest of the repo
   writes a doubled hyphen. That is deliberate, and normalising it back to house
   style breaks the build in a way nothing in the gate catches. A doubled hyphen
@@ -51,14 +55,15 @@
   sits below hw.memsize either way. The way to check the entitlement is to read
   it off the signed binary; the way to check the ceiling is Bridge/MemoryBudget.
 
-  extended-virtual-addressing would normally sit beside it — the arena ring can
-  exceed the 4 GB a 32-bit address space covers — but it is deliberately absent:
-  a **personal** (free) development team cannot provision it. Xcode fails the
-  build outright with "Personal development teams ... do not support the Extended
-  Virtual Addressing capability", so adding it back costs the whole build, not
-  just the capability. It needs a paid Apple Developer Program membership with
-  the capability enabled on the App ID. increased-memory-limit alone does
-  provision on a personal team.
+  extended-virtual-addressing sits beside it only when the build sets
+  VI_EXTENDED_VIRTUAL_ADDRESSING=ON. The arena ring can exceed the 4 GB a 32-bit
+  address space covers, but the key is opt-in because a **personal** (free)
+  development team cannot provision it: Xcode fails the build outright with
+  "Personal development teams ... do not support the Extended Virtual Addressing
+  capability", so carrying it by default would cost such a team the whole build,
+  not just the capability. It needs a paid Apple Developer Program membership
+  with the capability enabled on the App ID. increased-memory-limit alone does
+  provision on a personal team, so every build carries it.
 
   Not a licence to be careless: this moves the wall, it does not remove it.
   iOS still jetsams entitled processes under system-wide memory pressure, and
@@ -70,6 +75,6 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
-	<true/>
+	<true/>@VI_EXTENDED_VIRTUAL_ADDRESSING_KEY@
 </dict>
 </plist>

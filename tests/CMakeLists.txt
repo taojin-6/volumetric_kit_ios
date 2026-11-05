@@ -111,3 +111,14 @@ add_executable(vi_failure_tests failure_handling_test.cpp
 target_link_libraries(vi_failure_tests PRIVATE vi_core GTest::gtest_main
                                                Threads::Threads)
 gtest_discover_tests(vi_failure_tests)
+
+# The scanner's entitlements as cmake/ScannerEntitlements.cmake writes them for
+# the app, with VI_EXTENDED_VIRTUAL_ADDRESSING off and on. A script, not a
+# binary: nothing to build, and plutil does the reading.
+add_test(
+  NAME scanner_entitlements
+  COMMAND
+    "${CMAKE_COMMAND}" "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/entitlements" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/scanner_entitlements_test.cmake")
+set_tests_properties(scanner_entitlements PROPERTIES SKIP_REGULAR_EXPRESSION
+                                                     "SKIP: plutil not found")

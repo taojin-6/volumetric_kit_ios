@@ -150,7 +150,7 @@ namespace {
 // Metal's recommended working-set ceiling in bytes, or 0 when unavailable.
 //
 // The third of the three ceilings this app runs under, and by the numbers in
-// scanner.entitlements the *lowest* of them: two thirds of physical RAM against
+// scanner.entitlements.in the *lowest*: two thirds of physical RAM against
 // a jetsam limit near the whole of it. It is also the one the voxel grid and
 // the mesh arenas are charged against, since both are Metal buffers underneath
 // MoltenVK -- so a comfortable jetsam percentage on its own is the reassuring
@@ -158,7 +158,7 @@ namespace {
 //
 // Deliberately not in Bridge/MemoryQuery: that file reads the jetsam ledger
 // through Mach and stays plain C++, and these are separate subsystems that
-// scanner.entitlements is explicit about keeping apart.
+// scanner.entitlements.in is explicit about keeping apart.
 //
 // It is also now where allocation stops, not only a figure to watch. The
 // core's Device enables VK_EXT_memory_budget wherever it is offered, and its

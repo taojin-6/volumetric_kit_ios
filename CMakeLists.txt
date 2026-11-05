@@ -82,6 +82,13 @@ set(VI_DEVELOPMENT_TEAM
     ""
     CACHE STRING "Apple Development Team ID used to sign the app bundle")
 
+# Signs the scanner with extended-virtual-addressing as well. It needs a paid
+# Apple Developer Program team whose App ID can carry the capability (Xcode's
+# automatic signing adds it under -allowProvisioningUpdates); a personal team
+# fails signing.
+option(VI_EXTENDED_VIRTUAL_ADDRESSING
+       "Sign the scanner with the extended-virtual-addressing entitlement" OFF)
+
 set(VI_BUNDLE_PREFIX
     "io.taojin.volumetrickit"
     CACHE STRING "Reverse-DNS prefix for app bundle identifiers")

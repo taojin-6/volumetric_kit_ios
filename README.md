@@ -50,6 +50,10 @@ cd build-ios && xcodebuild -project volumetric_kit_ios.xcodeproj \
 Find your team id with `security find-identity -v -p codesigning` (the
 parenthesised code) or in Xcode → Settings → Accounts.
 
+`-DVI_EXTENDED_VIRTUAL_ADDRESSING=ON` also signs the scanner with the
+extended-virtual-addressing entitlement; it needs a paid Apple Developer Program
+team.
+
 `CMakeLists.txt` fetches the siblings by commit, in this order:
 
 | Sibling | What the apps take from it |

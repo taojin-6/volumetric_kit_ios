@@ -51,9 +51,9 @@ app::GrowthInputs due_to_grow() {
 
 // --- The sizing arithmetic ---------------------------------------------------
 
-/// The figure `scanner.entitlements` records for the grid at 16384 buckets is
-/// 805 MB. This is the arithmetic that has to agree with that measurement, and
-/// the input to every headroom decision below.
+/// The figure `scanner.entitlements.in` records for the grid at 16384 buckets
+/// is 805 MB. This is the arithmetic that has to agree with that measurement,
+/// and the input to every headroom decision below.
 ///
 /// 16384 * 8 blocks * 512 voxels * 12 B is 805,306,368 bytes exactly -- which
 /// is the recorded 805 MB decimal and 768 MiB, the same quantity under the two

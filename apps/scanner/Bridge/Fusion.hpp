@@ -118,7 +118,7 @@ struct FusionConfig {
   ///       grid-only derivation (805 -> 1610 MB), which is the smaller half:
   ///       grid's `MarchingCubes::plan_capacity` sizes the mesh arena from
   ///       `num_active`, so the reachable block count scales the arena ring
-  ///       too, and `scanner.entitlements` records the measured split as 3089
+  ///       too; `scanner.entitlements.in` records the measured split as 3089
   ///       MB of arenas beside an 805 MB grid. The arenas are what got a scan
   ///       SIGKILLed, and @ref mesh_slots was not revisited when this doubled.
   ///
@@ -148,7 +148,8 @@ struct FusionConfig {
   /// blocks). Coarsening @ref voxel_size buys area ~4x faster than raising this
   /// does, and costs no memory. Raising it further needs the
   /// `extended-virtual-addressing` entitlement, which a personal signing team
-  /// cannot provision -- see apps/scanner/scanner.entitlements.
+  /// cannot provision: `VI_EXTENDED_VIRTUAL_ADDRESSING` asks for it -- see
+  /// apps/scanner/scanner.entitlements.in.
   std::int32_t max_buckets = 32768;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;

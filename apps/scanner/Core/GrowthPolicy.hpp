@@ -193,8 +193,8 @@ constexpr ToneThresholds occupancy_thresholds(float grow_threshold) noexcept {
 /// and @ref kAttributeBytesPerVoxel of attributes per voxel -- every factor
 /// named, and `Fusion::start` configures the grid from the same three rather
 /// than from literals beside them. At 16384 buckets that is 805 MB, the figure
-/// `scanner.entitlements` records for the grid, so the arithmetic here and the
-/// measurement there agree.
+/// `scanner.entitlements.in` records for the grid, so the arithmetic here and
+/// the measurement there agree.
 ///
 /// The grid only. The mesh arena ring is the larger term and is not derived
 /// from this; see `FusionConfig::max_buckets` for what that means for the
