@@ -34,6 +34,7 @@ add_executable(
   allocation_stop_test.cpp
   camera_open_test.cpp
   capture_report_test.cpp
+  frame_fanout_test.cpp
   freshness_test.cpp
   growth_policy_test.cpp
   keyframe_binding_test.cpp
@@ -47,12 +48,18 @@ add_executable(
   stat_tone_test.cpp
   view_orientation_test.cpp)
 
-target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main)
+find_package(Threads REQUIRED)
+target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main
+                                            Threads::Threads)
 
 # Registers each TEST() with ctest individually, so a failure names the case
-# rather than the binary.
+# rather than the binary; the time limit makes a case that hangs fail by name
+# too, rather than at the job's limit.
 include(GoogleTest)
-gtest_discover_tests(vi_core_tests)
+gtest_discover_tests(
+  vi_core_tests
+  PROPERTIES
+  TIMEOUT 60)
 
 # vi_session's writer, on a fake sensor's frames, read back through grid's
 # reader and sensor's wire form; with vi_core's map-step rule and rate gate in
@@ -105,7 +112,6 @@ gtest_discover_tests(vi_config_tests)
 
 # Allocation injection stays in its own process; these exercise the exact
 # platform-free policies used by capture and worker entry points.
-find_package(Threads REQUIRED)
 add_executable(vi_failure_tests failure_handling_test.cpp
                                 allocation_failure.cpp)
 target_link_libraries(vi_failure_tests PRIVATE vi_core GTest::gtest_main

@@ -196,6 +196,8 @@ CaptureReport pattern_report() {
   r.delivered = 600;
   r.dropped = 1;
   r.fused = 600;
+  r.skipped = 40;
+  r.thermal = "fair";
   r.first_frame_s = 0.024;
   r.poll_ms = {0.10, 0.20, 0.30, 0.40};
   r.fuse_ms = {2.0, 4.0, 3.0, 1.0};
@@ -215,7 +217,8 @@ TEST(CaptureReportLine, CarriesCountsTimesStatesAndCodes) {
   EXPECT_EQ(line.rfind("sa pattern 10.0 s: tracking normal | ", 0), 0u) << line;
   EXPECT_TRUE(has(line,
                   "received 601 delivered 600 dropped 1 failed 0 (withheld 0 "
-                  "refused 0) missed 0 | fused 600 | first frame 0.02 s | "))
+                  "refused 0) missed 0 | fused 600 skipped 40 | thermal fair "
+                  "| first frame 0.02 s | "))
       << line;
   // Nearest rank: p50 of four is the second, p95 the fourth.
   EXPECT_TRUE(has(line, "poll ms p50 0.200 p95 0.400 (4)")) << line;
@@ -241,11 +244,12 @@ TEST(CaptureReportLine, SaysWhatIsMissingOrWrong) {
   r.breach = "frame 12: sequence 5 after 7";
   r.index_mismatches = 3;
   r.session_error = "camera in use";
+  r.thermal.clear();
   const std::string line = app::capture_report_line(r);
   EXPECT_EQ(
       line.rfind("sa stop pattern 10.0 s: tracking normal, interrupted", 0), 0u)
       << line;
-  EXPECT_TRUE(has(line, "| first frame - |")) << line;
+  EXPECT_TRUE(has(line, "skipped 40 | first frame - |")) << line;
   EXPECT_TRUE(has(line, "poll ms - (0) | fuse ms - (0), prep - (0)")) << line;
   EXPECT_TRUE(has(line, "codes -")) << line;
   EXPECT_TRUE(has(line, "contract: frame 12: sequence 5 after 7")) << line;

@@ -98,6 +98,9 @@ struct CameraReadout {
   /// checked, since the start; both 0 for the camera.
   std::uint64_t index_mismatches = 0;
   std::uint64_t index_checked = 0;
+  /// Frames fusion let go unfused since the start, a newer one having come
+  /// while it fused (`FrameFanout::Counts::skipped`).
+  std::uint64_t fusion_skipped = 0;
 };
 
 namespace vkc = volumetric_kit::core;
@@ -184,7 +187,7 @@ struct RendererImpl {
   bool fusion_wanted = false;
   CameraReadout camera_readout;
   // The camera's frames as a stream (Session/rgbd_stream_sender.hpp): the
-  // fuse thread offers it every frame it takes, and its own thread copies the
+  // fuse thread offers it every frame it polls, and its own thread copies the
   // taken frames' pictures into the encoder's own on `compute_device`, codes
   // them and writes them to the file and the live link, or counts them (the
   // dry run). Opened as the camera becomes `arkit`, whose
@@ -200,6 +203,8 @@ struct RendererImpl {
 
   // --- Reconstruction ------------------------------------------------------
   Fusion fusion;
+  // Polls the camera, offers the stream every frame and fusion's worker the
+  // newest, and ends the worker before it ends (Bridge/FuseLoop.hpp).
   std::thread fuse_thread;
   std::atomic<bool> fusing{false};
 

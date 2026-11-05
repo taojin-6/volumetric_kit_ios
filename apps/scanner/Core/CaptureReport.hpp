@@ -107,6 +107,12 @@ struct CaptureReport {
   std::uint64_t refused = 0;    ///< `ArkitStatus::refused`, part of failed.
   std::uint64_t missed = 0;     ///< `ArkitStatus::missed`.
   std::uint64_t fused = 0;      ///< Frames fused since the start.
+  /// Frames the on-device model let go unfused since the start, a newer one
+  /// having come while it fused (`FrameFanout::Counts::skipped`).
+  std::uint64_t skipped = 0;
+  /// The device's thermal state ("nominal", "fair", "serious", "critical");
+  /// empty when not read.
+  std::string thermal;
   /// This window's polls that took a frame, ms each.
   std::vector<double> poll_ms;
   /// This window's fused frames, ms each: prep + allocate + integrate.
@@ -131,10 +137,10 @@ struct CaptureReport {
 };
 
 /// @return @p report as one line, "sa <source> <seconds> s: ..." ("sa stop"
-///         at a stop): tracking; the counters; frames fused; when the first
-///         frame came; poll, fuse and prep ms at p50 and p95 over the window,
-///         with their counts; the colour codes; the contract; and, for the
-///         pattern, the index check.
+///         at a stop): tracking; the counters; frames fused and skipped; the
+///         thermal state; when the first frame came; poll, fuse and prep ms at
+///         p50 and p95 over the window, with their counts; the colour codes;
+///         the contract; and, for the pattern, the index check.
 std::string capture_report_line(const CaptureReport& report);
 
 /// @brief The stream's part of a window, as its console line says it: the

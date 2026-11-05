@@ -25,6 +25,7 @@
 #import "RendererErrors.hpp"
 #import "RendererImpl.hpp"
 #import "StatTone.hpp"
+#import "ThermalState.hpp"
 #import "ViewOrientation.hpp"
 
 #include <os/log.h>
@@ -430,6 +431,10 @@ void take_camera(app::RendererImpl& impl) {
     _contractBreach = app::to_ns_string(o.breach);
     _indexChecked = o.index_checked;
     _indexMismatches = o.index_mismatches;
+    _fusionSkipped = o.fusion_skipped;
+  }
+  if (impl.stream) {
+    _streamBusy = impl.stream->stats().busy;
   }
   return self;
 }
@@ -1402,6 +1407,10 @@ void take_camera(app::RendererImpl& impl) {
   out.arenaFill = pair(app::kArenaFillThresholds);
   out.memory = pair(app::kMemoryThresholds);
   return out;
+}
+
++ (NSString*)thermalState {
+  return app::to_ns_string(app::thermal_state());
 }
 
 + (VolumetricStatTone)toneForFraction:(double)fraction

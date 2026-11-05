@@ -838,6 +838,10 @@ final class ScannerViewController: UIViewController {
       counterLines = [
         "source    \(cam.pattern ? "test pattern (no camera)" : cam.model)",
         "frames    \(counts)",
+        // Fusion takes the newest frame when it is free: what it skipped, from
+        // this start. Beside it, a sign only, the `st` line's busy count.
+        "skipped   \(cam.fusionSkipped) by the model  (stream busy \(cam.streamBusy) since launch)",
+        "thermal   \(VolumetricRenderer.thermalState)",
         "depth     \(cam.depthWidth) x \(cam.depthHeight)  (confidence medium and up)",
         "colour    \(cam.colorWidth) x \(cam.colorHeight)",
         // What the picture's own tags say, as H.273 code points: the stream's
