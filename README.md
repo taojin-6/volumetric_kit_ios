@@ -134,14 +134,17 @@ it is fed through are `vi_core`'s: `MapSteps` takes ARKit's map steps out of
 every pose and logs them, then `RateGate` cuts 60 Hz to the stream's 10 Hz.
 
 `vi_stream` (`Session/rgbd_stream_sender.hpp`) is what feeds it on the iPad:
-`RgbdStreamSender::offer` takes each frame the fuse loop polls through
-`MapSteps` and `RateGate`, and a thread of the sender's own copies each taken
-frame's picture on the compute device into one of the hardware encoder's own
-(`HevcEncoder::target`), codes it (one picture in flight), then appends the
-frame. The copy is because VideoToolbox's low-latency session keeps the last
-picture it coded until it codes the next: with ARKit's own, one of the
-camera's few pictures would be out for the 100 ms between codings, beside the
-scanner's keyframe ring, which on the pattern's 4 stops the camera for good.
+`RgbdStreamSender::offer` takes each frame the fuse loop polls, at once and
+whatever fusion is doing (`Core/FrameFanout.hpp`: fusion takes the newest
+frame on a worker of its own when it is free, and the frames it cannot keep
+up with are let go at once), through `MapSteps` and `RateGate`, and a thread
+of the sender's own copies each taken frame's picture on the compute device
+into one of the hardware encoder's own (`HevcEncoder::target`), codes it (one
+picture in flight), then appends the frame. The copy is because
+VideoToolbox's low-latency session keeps the last picture it coded until it
+codes the next: with ARKit's own, one of the camera's few pictures would be
+out for the 100 ms between codings, beside the scanner's keyframe ring, which
+on the pattern's 4 stops the camera for good.
 A frame the fuse loop let go unseen is a gap to `MapSteps`, which finds no
 step across 100 ms or more. A picture the encoder drops leaves its frame out
 whole, and the next is a key; so is the session's first frame and the next
@@ -261,25 +264,31 @@ xcrun devicectl device process launch --console --device <id> \
 
 Every 10 s the fuse thread prints one `sa` line of counts, times, states and
 colour codes, never a pixel, a depth value, a pose or a path: the camera's
-tracking and counters (`SensorStats`, `ArkitStatus`), frames fused, seconds
-to the first frame, poll and fuse (prep + allocate + integrate) milliseconds
-at p50 and p95 over the window, the picture's H.273 colour codes, sensor's
-frame contract (`testing::RgbdContract`), and for the pattern how many frames
-carried their own index. Each stop prints an `sa stop` line, a lock or
-backgrounding as well as the run's end; the next start counts its seconds and
-counters from 0 again, so its first frame says how soon the camera came back.
-Beside it an `st` line says what the stream did: `dry` or `session`; frames
-taken, coded (keys), failed, written and refused since launch; this window's
-video and depth Mbit/s, send and send-to-access-unit ms at p50 and p95; the
-live readers and failed dials. `Core/CaptureReport.hpp` reads the arguments
-and writes both lines, and is host-tested.
+tracking and counters (`SensorStats`, `ArkitStatus`), frames fused and frames
+fusion skipped (a newer one came while it fused), the device's thermal state,
+seconds to the first frame, poll and fuse (prep + allocate + integrate)
+milliseconds at p50 and p95 over the window, the picture's H.273 colour codes,
+sensor's frame contract (`testing::RgbdContract`), and for the pattern how
+many frames carried their own index. Each stop prints an `sa stop` line, a
+lock or backgrounding as well as the run's end; the next start counts its
+seconds and counters from 0 again, so its first frame says how soon the camera
+came back. Beside it an `st` line says what the stream did: `dry` or
+`session`; frames taken, busy (due but left, the one before still waiting to
+be coded), coded (keys), failed, written and refused since launch; this
+window's video and depth Mbit/s, send and send-to-access-unit ms at p50 and
+p95; the live readers and failed dials. The Capture card shows the skipped
+and busy counts and the thermal state too. `Core/CaptureReport.hpp` reads the
+arguments and writes both lines, and is host-tested.
 
 The pattern has 4 pictures, and a tick that finds all 4 held is skipped and
-counted `missed`. The scanner and the camera's queue hold up to 8 (3 in the
-keyframe ring, the published keyframe, the frame being fused, the frame
-waiting to be polled, and the stream's frame being copied and coded and the
-one waiting behind it), so a pattern run skips ticks by design: `received +
-missed` is the pattern's 60 Hz, and `received` alone is not. The stream's
+counted `missed`. The scanner and the camera's queue hold up to 9 (3 in the
+keyframe ring, the published keyframe, the frame being fused, the newest
+waiting for fusion, the frame waiting to be polled, and the stream's frame
+being copied and coded and the one waiting behind it), so a pattern run skips
+ticks by design: `received + missed` is the pattern's 60 Hz, and `received`
+alone is not. The ring and the frame being fused take all 4 there, so the
+pattern runs at fusion's pace; every holder but the ring lets its picture go
+without waiting for a newer frame, so none can stop the camera. The stream's
 encoder holds none: it codes and keeps pictures of its own.
 
 ## Development

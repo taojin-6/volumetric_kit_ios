@@ -34,6 +34,7 @@ add_executable(
   allocation_stop_test.cpp
   camera_open_test.cpp
   capture_report_test.cpp
+  frame_fanout_test.cpp
   freshness_test.cpp
   growth_policy_test.cpp
   keyframe_binding_test.cpp
@@ -47,7 +48,9 @@ add_executable(
   stat_tone_test.cpp
   view_orientation_test.cpp)
 
-target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main)
+find_package(Threads REQUIRED)
+target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main
+                                            Threads::Threads)
 
 # Registers each TEST() with ctest individually, so a failure names the case
 # rather than the binary.
@@ -105,7 +108,6 @@ gtest_discover_tests(vi_config_tests)
 
 # Allocation injection stays in its own process; these exercise the exact
 # platform-free policies used by capture and worker entry points.
-find_package(Threads REQUIRED)
 add_executable(vi_failure_tests failure_handling_test.cpp
                                 allocation_failure.cpp)
 target_link_libraries(vi_failure_tests PRIVATE vi_core GTest::gtest_main

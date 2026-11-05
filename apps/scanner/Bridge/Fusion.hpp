@@ -151,7 +151,8 @@ struct FusionConfig {
   /// cannot provision: `VI_EXTENDED_VIRTUAL_ADDRESSING` asks for it -- see
   /// apps/scanner/scanner.entitlements.in.
   std::int32_t max_buckets = 32768;
-  /// Fuse every Nth captured frame; 1 = every frame.
+  /// Fuse every Nth frame handed to @ref Fusion::fuse (the newest each time
+  /// fusion is free, Core/FrameFanout.hpp); 1 = every one.
   std::uint32_t fuse_every = 1;
   /// Re-extract the mesh every Nth *fused* frame; 1 = every frame.
   ///

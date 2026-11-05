@@ -573,6 +573,13 @@ typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
 /// those that did not carry their own; 0 for the camera.
 @property(nonatomic, readonly) uint64_t indexChecked;
 @property(nonatomic, readonly) uint64_t indexMismatches;
+/// Frames fusion let go unfused since the start, a newer one having come
+/// while it fused: the stream still had them.
+@property(nonatomic, readonly) uint64_t fusionSkipped;
+/// Frames due at the stream's rate that the stream left, the one before
+/// still waiting to be coded (`RgbdStreamSenderStats::busy`), since the
+/// sender opened; 0 with no sender.
+@property(nonatomic, readonly) uint64_t streamBusy;
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
@@ -603,8 +610,8 @@ NS_SWIFT_NAME(VolumetricRenderer)
 ///                    from the first frame, or nil for none. As the camera
 ///                    becomes the renderer's, here or at the -startFusion
 ///                    after a later open, its stream sender opens
-///                    (Session/rgbd_stream_sender.hpp): every frame the fuse
-///                    thread takes goes to it, and at 10 Hz each frame's
+///                    (Session/rgbd_stream_sender.hpp): every frame the
+///                    camera hands out goes to it, and at 10 Hz each frame's
 ///                    picture is copied on the compute device into the
 ///                    hardware encoder's own and coded, and the frame written
 ///                    to the file and the live link (@ref streamHandle), or,
@@ -913,6 +920,10 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// that actually stops the panel restating them. See @ref
 /// VolumetricGaugeThresholds for what restating them already cost once.
 @property(class, nonatomic, readonly) VolumetricGaugeThresholds gaugeThresholds;
+
+/// The device's thermal state (`NSProcessInfo.thermalState`) as the console
+/// lines name it: "nominal", "fair", "serious" or "critical".
+@property(class, nonatomic, readonly, copy) NSString* thermalState;
 
 /// @brief The tone @p fraction reads as against @p thresholds.
 ///

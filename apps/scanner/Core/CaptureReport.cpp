@@ -156,7 +156,8 @@ std::string capture_report_line(const CaptureReport& r) {
   char counts[256];
   std::snprintf(counts, sizeof counts,
                 " | received %llu delivered %llu dropped %llu failed %llu "
-                "(withheld %llu refused %llu) missed %llu | fused %llu",
+                "(withheld %llu refused %llu) missed %llu | fused %llu "
+                "skipped %llu",
                 static_cast<unsigned long long>(r.received),
                 static_cast<unsigned long long>(r.delivered),
                 static_cast<unsigned long long>(r.dropped),
@@ -164,8 +165,10 @@ std::string capture_report_line(const CaptureReport& r) {
                 static_cast<unsigned long long>(r.withheld),
                 static_cast<unsigned long long>(r.refused),
                 static_cast<unsigned long long>(r.missed),
-                static_cast<unsigned long long>(r.fused));
+                static_cast<unsigned long long>(r.fused),
+                static_cast<unsigned long long>(r.skipped));
   line += counts;
+  if (!r.thermal.empty()) line += " | thermal " + r.thermal;
   if (r.first_frame_s) {
     char first[48];
     std::snprintf(first, sizeof first, " | first frame %.2f s",

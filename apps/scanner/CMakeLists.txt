@@ -46,6 +46,7 @@ function(vi_add_scanner_bridge bridge_target)
     Bridge/RendererErrors.mm
     Bridge/ScannerLaunch.mm
     Bridge/ScannerSelfTest.mm
+    Bridge/ThermalState.mm
     Bridge/VolumetricLink.mm)
 
   # ARC, selected by language rather than by a second copy of the source list.

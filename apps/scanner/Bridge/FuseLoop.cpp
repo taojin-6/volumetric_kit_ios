@@ -6,14 +6,18 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "CaptureReport.hpp"
 #include "FailureHandling.hpp"
+#include "FrameFanout.hpp"
 #include "RendererImpl.hpp"
+#include "ThermalState.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/sensor/apple/core_video_color.hpp"
 #include "volumetric_kit/sensor/apple/pixel_buffer_importer.hpp"
@@ -39,12 +43,18 @@ float ms_since(Clock::time_point t0) {
   return std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
 }
 
-// The window a line reports, and the run's own counts since its start.
+// A frame polled, and the span of the poll that took it.
+struct Polled {
+  sensor::RgbdFrame frame;
+  float poll_ms = 0.0f;
+};
+
+using Fanout = FrameFanout<Polled>;
+
+// The window a line reports, and the run's own counts since its start: the
+// poller's half.
 struct Window {
   std::vector<double> poll_ms;
-  std::vector<double> fuse_ms;
-  std::vector<double> prep_ms;
-  std::uint64_t fused = 0;  // since the start
   // When the first frame came, since the start: after a lock, how soon the
   // camera is back.
   std::optional<double> first_frame_s;
@@ -53,16 +63,22 @@ struct Window {
   std::uint64_t video_bytes = 0;
   std::uint64_t depth_bytes = 0;
   Clock::time_point since = Clock::now();
-  void clear() {
-    poll_ms.clear();
-    fuse_ms.clear();
-    prep_ms.clear();
-  }
 };
 
-// One frame taken: checked, its codes read now and then, and fused.
+// Fusion's half, written on its worker.
+struct FusedWindow {
+  std::mutex mutex;
+  // Guarded by mutex:
+  std::vector<double> fuse_ms;
+  std::vector<double> prep_ms;
+  std::uint64_t fused = 0;  // since the start
+};
+
+// One frame polled: checked, its codes read now and then, then offered to
+// the stream and to fusion (FrameFanout).
 void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
-          Window& window, const sensor::RgbdFrame& frame, float poll_ms) {
+          Window& window, Fanout& fanout, sensor::RgbdFrame frame,
+          float poll_ms) {
   contract.take(frame);
   window.poll_ms.push_back(poll_ms);
 
@@ -101,20 +117,28 @@ void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
     }
   }
 
-  // Before the fuse, so the picture codes on the sender's thread meanwhile.
-  if (impl.stream) impl.stream->offer(frame);
+  fanout.offer(Polled{std::move(frame), poll_ms});
+  const std::uint64_t skipped = fanout.counts().skipped;
+  std::lock_guard<std::mutex> lock(impl.camera_readout.mutex);
+  impl.camera_readout.fusion_skipped = skipped;
+}
 
-  if (const std::optional<FuseTimes> fused = impl.fusion.fuse(frame, poll_ms)) {
-    ++window.fused;
-    window.fuse_ms.push_back(fused->fuse_ms());
-    window.prep_ms.push_back(fused->prep_ms);
-  }
+// A fused frame's spans, on fusion's worker.
+void fuse(RendererImpl& impl, FusedWindow& fused, const Polled& polled) {
+  const std::optional<FuseTimes> times =
+      impl.fusion.fuse(polled.frame, polled.poll_ms);
+  if (!times) return;
+  std::lock_guard<std::mutex> lock(fused.mutex);
+  ++fused.fused;
+  fused.fuse_ms.push_back(times->fuse_ms());
+  fused.prep_ms.push_back(times->prep_ms);
 }
 
 // The window as its line, printed to stdout, where the device console reads
 // it, with the contract's verdict published for the read-out.
 void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
-            Window& window, Clock::time_point started, bool stop) {
+            Window& window, FusedWindow& fused, const Fanout& fanout,
+            Clock::time_point started, bool stop) {
   const sensor::ArkitSensor& camera = *impl.arkit;
   const sensor::SensorStats stats = camera.stats();
   const sensor::ArkitStatus status = camera.status();
@@ -134,15 +158,24 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   r.withheld = status.withheld;
   r.refused = status.refused;
   r.missed = status.missed;
-  r.fused = window.fused;
-  // Copied, so the window keeps its capacity for the next one.
+  // Copied, so the windows keep their capacity for the next one.
   r.poll_ms = window.poll_ms;
-  r.fuse_ms = window.fuse_ms;
-  r.prep_ms = window.prep_ms;
+  window.poll_ms.clear();
+  {
+    std::lock_guard<std::mutex> lock(fused.mutex);
+    r.fused = fused.fused;
+    r.fuse_ms = fused.fuse_ms;
+    r.prep_ms = fused.prep_ms;
+    fused.fuse_ms.clear();
+    fused.prep_ms.clear();
+  }
+  r.skipped = fanout.counts().skipped;
+  r.thermal = thermal_state();
   r.breach = contract.breach(stats);
   {
     std::lock_guard<std::mutex> lock(impl.camera_readout.mutex);
     impl.camera_readout.breach = r.breach;
+    impl.camera_readout.fusion_skipped = r.skipped;
     const CameraReadout& o = impl.camera_readout;
     r.codes_known = o.codes_known;
     r.matrix = o.codes.matrix;
@@ -203,7 +236,6 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   std::fputs(stream_line.c_str(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
-  window.clear();
 }
 
 }  // namespace
@@ -218,6 +250,7 @@ void run_fuse_loop(RendererImpl& impl) {
     impl.camera_readout.breach.clear();
     impl.camera_readout.index_checked = 0;
     impl.camera_readout.index_mismatches = 0;
+    impl.camera_readout.fusion_skipped = 0;
   }
   Window window;
   if (impl.stream) {
@@ -231,8 +264,21 @@ void run_fuse_loop(RendererImpl& impl) {
   // A line's worth of samples at the camera's 60 Hz, so the hot path does not
   // grow them.
   window.poll_ms.reserve(1024);
-  window.fuse_ms.reserve(1024);
-  window.prep_ms.reserve(1024);
+  FusedWindow fused;
+  fused.fuse_ms.reserve(1024);
+  fused.prep_ms.reserve(1024);
+  // Every frame to the stream at once; fusion, on its worker, takes the
+  // newest when it is free, so a slow fuse never slows the stream.
+  Fanout fanout(
+      [&impl](const Polled& p) {
+        if (impl.stream) impl.stream->offer(p.frame);
+      },
+      [&impl, &fused](const Polled& p) { fuse(impl, fused, p); },
+      [&impl](std::string_view message) noexcept {
+        impl.fusion.note_error(message, "fusion worker: ");
+      });
+  // A worker that did not start has said why; the stream goes on.
+  (void)fanout.start();
   const Clock::time_point started = Clock::now();
   const auto every = std::chrono::seconds(kReportEverySeconds);
   Clock::time_point next_line = started + every;
@@ -265,7 +311,8 @@ void run_fuse_loop(RendererImpl& impl) {
             window.first_frame_s =
                 std::chrono::duration<double>(Clock::now() - started).count();
           }
-          take(impl, contract, window, *got.value(), poll_ms);
+          take(impl, contract, window, fanout, std::move(*got.value()),
+               poll_ms);
         },
         [&impl](std::string_view message) noexcept {
           impl.fusion.note_error(message, "fuse thread: ");
@@ -275,15 +322,24 @@ void run_fuse_loop(RendererImpl& impl) {
     }
     if (Clock::now() >= next_line) {
       (void)contain_frame_failure(
-          [&] { report(impl, contract, window, started, false); },
+          [&] {
+            report(impl, contract, window, fused, fanout, started, false);
+          },
           [&impl](std::string_view message) noexcept {
             impl.fusion.note_error(message, "fuse thread report: ");
           });
       next_line += every;
     }
   }
+  // The fuse under way ends before the stop's line, and before the caller
+  // stops the camera.
+  (void)contain_frame_failure([&] { fanout.stop(); },
+                              [&impl](std::string_view message) noexcept {
+                                impl.fusion.note_error(message,
+                                                       "fusion worker stop: ");
+                              });
   (void)contain_frame_failure(
-      [&] { report(impl, contract, window, started, true); },
+      [&] { report(impl, contract, window, fused, fanout, started, true); },
       [&impl](std::string_view message) noexcept {
         impl.fusion.note_error(message, "fuse thread report: ");
       });
