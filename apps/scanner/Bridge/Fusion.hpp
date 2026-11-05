@@ -148,7 +148,8 @@ struct FusionConfig {
   /// blocks). Coarsening @ref voxel_size buys area ~4x faster than raising this
   /// does, and costs no memory. Raising it further needs the
   /// `extended-virtual-addressing` entitlement, which a personal signing team
-  /// cannot provision -- see apps/scanner/scanner.entitlements.
+  /// cannot provision: `VI_EXTENDED_VIRTUAL_ADDRESSING` asks for it -- see
+  /// apps/scanner/scanner.entitlements.in.
   std::int32_t max_buckets = 32768;
   /// Fuse every Nth captured frame; 1 = every frame.
   std::uint32_t fuse_every = 1;
