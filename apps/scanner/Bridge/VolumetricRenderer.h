@@ -576,9 +576,11 @@ typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
 /// Frames fusion let go unfused since the start, a newer one having come
 /// while it fused: the stream still had them.
 @property(nonatomic, readonly) uint64_t fusionSkipped;
-/// Frames due at the stream's rate that the stream left, the one before
-/// still waiting to be coded (`RgbdStreamSenderStats::busy`), since the
-/// sender opened; 0 with no sender.
+/// Camera frames due at the stream's rate that the stream left, the one
+/// before still waiting to be coded (`RgbdStreamSenderStats::busy`), since
+/// the sender opened; 0 with no sender. The gate stays due until one is
+/// taken, so one late picture counts every camera frame that came meanwhile:
+/// a sign of a slow copy or coder, not a count of stream frames lost.
 @property(nonatomic, readonly) uint64_t streamBusy;
 @end
 
@@ -922,7 +924,7 @@ NS_SWIFT_NAME(VolumetricRenderer)
 @property(class, nonatomic, readonly) VolumetricGaugeThresholds gaugeThresholds;
 
 /// The device's thermal state (`NSProcessInfo.thermalState`) as the console
-/// lines name it: "nominal", "fair", "serious" or "critical".
+/// lines name it: "nominal", "fair", "serious" or "critical", or "unknown".
 @property(class, nonatomic, readonly, copy) NSString* thermalState;
 
 /// @brief The tone @p fraction reads as against @p thresholds.

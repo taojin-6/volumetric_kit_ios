@@ -53,9 +53,13 @@ target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main
                                             Threads::Threads)
 
 # Registers each TEST() with ctest individually, so a failure names the case
-# rather than the binary.
+# rather than the binary; the time limit makes a case that hangs fail by name
+# too, rather than at the job's limit.
 include(GoogleTest)
-gtest_discover_tests(vi_core_tests)
+gtest_discover_tests(
+  vi_core_tests
+  PROPERTIES
+  TIMEOUT 60)
 
 # vi_session's writer, on a fake sensor's frames, read back through grid's
 # reader and sensor's wire form; with vi_core's map-step rule and rate gate in
