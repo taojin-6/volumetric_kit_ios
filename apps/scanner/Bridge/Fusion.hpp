@@ -118,7 +118,7 @@ struct FusionConfig {
   ///       grid-only derivation (805 -> 1610 MB), which is the smaller half:
   ///       grid's `MarchingCubes::plan_capacity` sizes the mesh arena from
   ///       `num_active`, so the reachable block count scales the arena ring
-  ///       too, and `scanner.entitlements` records the measured split as 3089
+  ///       too; `scanner.entitlements.in` records the measured split as 3089
   ///       MB of arenas beside an 805 MB grid. The arenas are what got a scan
   ///       SIGKILLed, and @ref mesh_slots was not revisited when this doubled.
   ///

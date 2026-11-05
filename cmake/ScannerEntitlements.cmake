@@ -9,9 +9,11 @@
 # The app's configure and the host test (tests/scanner_entitlements_test.cmake)
 # both call this, so the test checks the file the app is signed with.
 function(vi_write_scanner_entitlements output extended_virtual_addressing)
+  # The key goes on from the end of the line before it, so an OFF build leaves
+  # no blank line inside <dict>.
   if(extended_virtual_addressing)
     set(VI_EXTENDED_VIRTUAL_ADDRESSING_KEY
-        "\t<key>com.apple.developer.kernel.extended-virtual-addressing</key>\n\t<true/>"
+        "\n\t<key>com.apple.developer.kernel.extended-virtual-addressing</key>\n\t<true/>"
     )
   else()
     set(VI_EXTENDED_VIRTUAL_ADDRESSING_KEY "")

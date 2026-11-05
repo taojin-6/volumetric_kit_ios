@@ -75,7 +75,6 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
-	<true/>
-@VI_EXTENDED_VIRTUAL_ADDRESSING_KEY@
+	<true/>@VI_EXTENDED_VIRTUAL_ADDRESSING_KEY@
 </dict>
 </plist>
