@@ -7,12 +7,16 @@
 
 #include "ScannerMode.hpp"
 
+#include <chrono>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "CaptureReport.hpp"
+#include "ViewPicture.hpp"
 
 namespace {
 
@@ -99,6 +103,81 @@ TEST(ModePlan, TheModelRunsItAllAndDrawsIt) {
   EXPECT_TRUE(plan.grid);
   EXPECT_TRUE(plan.fusion);
   EXPECT_FALSE(plan.camera_view);
+}
+
+/// Asking starts the camera's hold on a picture, so only the view's mode asks.
+TEST(ModePlan, OnlyTheClientAsksForWithheldPictures) {
+  EXPECT_TRUE(app::mode_plan(ScannerMode::Client).withheld_pictures);
+  EXPECT_FALSE(app::mode_plan(ScannerMode::Model).withheld_pictures);
+}
+
+// One fuse-loop turn with no frame, counting what it does. @p answer is what
+// the camera gives each time it is asked.
+struct Turn {
+  int asked = 0;
+  int offered = 0;
+  std::chrono::milliseconds wait{0};
+
+  void run(ScannerMode mode, std::optional<int> answer) {
+    wait = app::no_frame_turn(
+        app::mode_plan(mode),
+        [&]() -> std::optional<int> {
+          ++asked;
+          return answer;
+        },
+        [&](const int& picture) {
+          EXPECT_EQ(picture, *answer);
+          ++offered;
+        });
+  }
+};
+
+TEST(NoFrameTurn, TheModelNeverAsksEvenWithAPictureThere) {
+  Turn turn;
+  turn.run(ScannerMode::Model, 1);
+  EXPECT_EQ(turn.asked, 0);
+  EXPECT_EQ(turn.offered, 0);
+  EXPECT_EQ(turn.wait, app::kIdleWait);
+}
+
+/// As in normal tracking, or a stopped camera: nothing changes but the ask.
+TEST(NoFrameTurn, TheClientAsksAndWithNoneNewWaitsAsEver) {
+  Turn turn;
+  turn.run(ScannerMode::Client, std::nullopt);
+  EXPECT_EQ(turn.asked, 1);
+  EXPECT_EQ(turn.offered, 0);
+  EXPECT_EQ(turn.wait, app::kIdleWait);
+}
+
+/// About 30 a second: faster than the idle wait gives, and no busy loop.
+TEST(NoFrameTurn, APictureGoesToTheViewAndShortensTheWait) {
+  Turn turn;
+  turn.run(ScannerMode::Client, 1);
+  EXPECT_EQ(turn.asked, 1);
+  EXPECT_EQ(turn.offered, 1);
+  EXPECT_EQ(turn.wait, app::kWithheldPictureWait);
+  EXPECT_LT(turn.wait, app::kIdleWait);
+  EXPECT_GE(turn.wait, std::chrono::milliseconds(30));
+}
+
+/// The camera's limit (`poll_withheld_picture`): a view holding its last
+/// picture must not stop the asks, and what it leaves goes back at once.
+TEST(NoFrameTurn, WithTheViewBusyTheAsksGoOnAndThePictureIsLetGo) {
+  using Picture = std::shared_ptr<const int>;
+  app::ViewPicture<Picture> view;
+  const app::ModePlan plan = app::mode_plan(ScannerMode::Client);
+  const Picture kept = std::make_shared<const int>(1);
+  const Picture left = std::make_shared<const int>(2);
+  const auto turn = [&](const Picture& given) {
+    return app::no_frame_turn(
+        plan, [&] { return std::optional<Picture>(given); },
+        [&](const Picture& p) { (void)view.offer(p); });
+  };
+  EXPECT_EQ(turn(kept), app::kWithheldPictureWait);
+  EXPECT_EQ(kept.use_count(), 2);  // the view's
+  EXPECT_EQ(turn(left), app::kWithheldPictureWait);
+  EXPECT_EQ(left.use_count(), 1);  // only this test's
+  EXPECT_EQ(kept.use_count(), 2);
 }
 
 TEST(SectionShown, TheClientKeepsOnlyWhatIsNotAboutFusion) {

@@ -147,7 +147,8 @@ final class DashboardModel: ObservableObject {
   var allocationStopped: Bool { allocationStopReason != nil }
 
   @Published var trackingText = ""
-  @Published var trackingHealthy = true
+  @Published var trackingTone: VolumetricStatTone = .good
+  @Published var streamPaused = false
   @Published var framesIn = 0
   @Published var framesDropped = 0
 
@@ -402,8 +403,8 @@ struct DashboardView: View {
   //
   // Two layouts, because one does not fit. Laid out end to end at default text
   // size these pieces want roughly 660 pt -- the status pair, a 34 pt triangle
-  // count, the meter, and a tracking chip whose longest real value is "limited
-  // (insufficient features)" -- against the ~373 pt a portrait iPhone offers.
+  // count, the meter, and a tracking chip whose longest real value is "Camera
+  // interrupted" -- against the ~373 pt a portrait iPhone offers.
   // SwiftUI resolves that by compressing the most compressible child, and the
   // meter was it: a GeometryReader accepts a zero-width proposal, so the one
   // element carrying the 85% threshold silently became 0 pt wide while the
@@ -503,11 +504,15 @@ struct DashboardView: View {
     if let word = link.chip {
       Chip(word, tone: Self.tone(for: link.state))
     }
-    Chip(model.trackingText, tone: model.trackingHealthy ? .good : .warn)
+    Chip(model.trackingText, tone: Self.tone(for: model.trackingTone))
     if model.modelOn {
       Chip("\(Int(model.fps)) fps", tone: .neutral)
     } else {
-      Chip("stream \(Int(model.streamFps.rounded())) fps", tone: .neutral)
+      if model.streamPaused {
+        Chip("stream paused", tone: .warn)
+      } else {
+        Chip("stream \(Int(model.streamFps.rounded())) fps", tone: .neutral)
+      }
       Chip("thermal \(model.thermal)", tone: model.thermalTone == .neutral ? .neutral : .warn)
       // Alerts is behind the client's closed expand, and a failing camera view
       // is otherwise a black screen under "Capturing".

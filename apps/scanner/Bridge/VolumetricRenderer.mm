@@ -27,6 +27,7 @@
 #import "ScannerMode.hpp"
 #import "StatTone.hpp"
 #import "ThermalState.hpp"
+#import "TrackingLine.hpp"
 #import "ViewOrientation.hpp"
 
 #include <os/log.h>
@@ -481,6 +482,7 @@ BOOL draw_client_frame(app::RendererImpl& impl, const vg::windowing::Frame& f,
       app::to_ns_string(app::camera_open_text(impl.camera_open, steady_ns()));
   _model = @"";
   _tracking = @"";
+  _trackingWords = @"";
   _sessionError = @"";
   _lastRefusal = @"";
   _colorCodes = @"-";
@@ -497,7 +499,13 @@ BOOL draw_client_frame(app::RendererImpl& impl, const vg::windowing::Frame& f,
   _opened = YES;
   _model = app::to_ns_string(info.model);
   _tracking = app::to_ns_string(sensor::to_string(status.tracking));
-  _trackingNormal = status.tracking == sensor::ArkitTracking::Normal ? YES : NO;
+  const app::TrackingLine line =
+      app::tracking_line(sensor::to_string(status.tracking), status.interrupted,
+                         impl.stream != nullptr);
+  _trackingWords = app::to_ns_string(line.text);
+  // Value for value: Readout.mm checks.
+  _trackingTone = static_cast<VolumetricStatTone>(line.tone);
+  _streamPaused = line.stream_paused ? YES : NO;
   _interrupted = status.interrupted ? YES : NO;
   _sessionError = app::to_ns_string(status.session_error);
   _lastRefusal = app::to_ns_string(status.last_refusal);

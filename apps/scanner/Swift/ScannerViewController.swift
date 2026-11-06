@@ -1035,11 +1035,9 @@ final class ScannerViewController: UIViewController {
     dashboard.thermalTone = VolumetricRenderer.thermalTone
     dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
     dashboard.fps = fps
-    dashboard.trackingText = cam.opened ? cam.tracking : Self.openChip(cam.openState)
-    // Normal is the one tracking whose frames go out; anything else -- limited,
-    // initializing, relocalizing -- means frames are being withheld from
-    // fusion, which is exactly when this chip should stop being quiet.
-    dashboard.trackingHealthy = cam.trackingNormal
+    dashboard.trackingText = cam.opened ? cam.trackingWords : Self.openChip(cam.openState)
+    dashboard.trackingTone = cam.opened ? cam.trackingTone : .warn
+    dashboard.streamPaused = cam.streamPaused
     dashboard.framesIn = Int(cam.received)
     dashboard.framesDropped = Int(cam.dropped)
     // Both ceilings, not one. The earlier note here picked the working set on

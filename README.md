@@ -438,6 +438,12 @@ over. A reader that says nothing shows nothing. A note 3 s old or more reads
 `Server quiet for N s` (`Core/ReaderLine.hpp`), the scanner's one line of its
 own.
 
+While ARKit does not track normally, as for some seconds after a lock, the
+camera withholds its frames and the stream pauses. The client's camera view goes
+on with their pictures (`ArkitSensor::poll_withheld_picture`), which reach
+nothing else, and the top bar's chips say why (`Core/TrackingLine.hpp`). The
+model never asks for them.
+
 #### The shared device
 
 One `VkDevice` serves every library, built by volumetric_kit_core's

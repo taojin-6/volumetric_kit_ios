@@ -49,6 +49,7 @@ add_executable(
   self_test_test.cpp
   stat_tone_test.cpp
   stream_rate_test.cpp
+  tracking_line_test.cpp
   view_orientation_test.cpp
   view_picture_test.cpp)
 
@@ -93,6 +94,7 @@ if(APPLE)
     vi_stream_tests
     PRIVATE vi_stream
             vi_session
+            vi_core
             volumetric_kit::sensor_arkit
             volumetric_kit::sensor_prep
             volumetric_kit::sensor_video

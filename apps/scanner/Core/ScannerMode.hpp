@@ -11,6 +11,7 @@
 /// the bridge builds, runs and draws what @ref mode_plan says. The camera and
 /// its stream run in both, the same.
 
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 
@@ -38,10 +39,40 @@ struct ModePlan {
   bool fusion = false;
   /// The camera's picture fills the screen, instead of the model.
   bool camera_view = false;
+  /// With no frame to show, the view asks for the picture of one the camera
+  /// withheld (`ArkitSensor::poll_withheld_picture`). A camera never asked
+  /// holds none for it.
+  bool withheld_pictures = false;
 };
 
 /// @return What @p mode runs.
 ModePlan mode_plan(ScannerMode mode) noexcept;
+
+/// How long the fuse loop waits for a frame before it looks at its stop flag
+/// again: a stop is seen within this, as is a frame the signal missed.
+inline constexpr std::chrono::milliseconds kIdleWait{50};
+
+/// The wait after a withheld picture came. No signal fires for one, so this
+/// sets their rate: about 30 a second.
+inline constexpr std::chrono::milliseconds kWithheldPictureWait{33};
+
+/// @brief The fuse loop's turn when a poll gave no frame: @p ask, if @p plan
+///        says, and @p offer what comes.
+///
+/// Only a picture shortens the wait. Normal tracking gives none and a stopped
+/// camera neither, so each waits as it always did.
+/// @tparam Ask    `std::optional<Picture>()`.
+/// @tparam Offer  `void(const Picture&)`.
+/// @return How long to wait for the next frame.
+template <typename Ask, typename Offer>
+std::chrono::milliseconds no_frame_turn(const ModePlan& plan, Ask&& ask,
+                                        Offer&& offer) {
+  if (!plan.withheld_pictures) return kIdleWait;
+  const auto picture = ask();
+  if (!picture) return kIdleWait;
+  offer(*picture);
+  return kWithheldPictureWait;
+}
 
 /// @return Whether @p mode shows the read-out section named @p title
 ///         (`stat_sections`): every section in the model; in the client only

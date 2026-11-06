@@ -38,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include "TrackingLine.hpp"
 #include "dial_entry.hpp"
 #include "rgbd_stream_sender.hpp"
 #include "session_test_support.hpp"
@@ -556,6 +557,27 @@ TEST_F(RgbdStreamSenderTest, AConnectOpensTheSessionAndAReaderGetsAKey) {
   EXPECT_EQ(stats.keys, 3u);
   EXPECT_EQ(stats.written, 5u);
   EXPECT_TRUE(sender->finish().ok());
+}
+
+/// Core names no sensor type, so it reads `to_string`'s names: each has its
+/// words, and normal alone reads as normal.
+TEST(TrackingLineOfSensorNames, EachStateHasItsOwnWords) {
+  using Tracking = sensor::ArkitTracking;
+  struct Named {
+    Tracking tracking;
+    const char* words;
+  };
+  for (const Named& named :
+       {Named{Tracking::NotAvailable, "No tracking yet"},
+        Named{Tracking::Initializing, "Initializing"},
+        Named{Tracking::Relocalizing, "Relocalizing"},
+        Named{Tracking::ExcessiveMotion, "Moving too fast"},
+        Named{Tracking::InsufficientFeatures, "Too little in view"},
+        Named{Tracking::Normal, "normal"}}) {
+    EXPECT_EQ(
+        app::tracking_line(sensor::to_string(named.tracking), false, true).text,
+        named.words);
+  }
 }
 
 /// The sender refuses a sensor with no picture, a QP past 51, no device to

@@ -31,6 +31,7 @@ add_library(
   ReaderLine.cpp
   ScannerMode.cpp
   SelfTest.cpp
+  TrackingLine.cpp
   ViewOrientation.cpp)
 
 # The same warning set the sibling libraries build under, and here for a reason
