@@ -183,15 +183,15 @@ vkc_require_sibling(
 
 # grid: the sparse voxel block grid and Marching Cubes, whose DeviceMesh gfx
 # draws in place, and the .vrst container (grid_stream) vi_session writes and
-# serves to the reader it dials (grid_networking).
+# serves to the reader it dials (grid_networking), whose notes it reads back.
 FetchContent_Declare(
   volumetric_kit_grid
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_grid.git
-  GIT_TAG 17d48f30b3058a7ac9e2548ce2f11b95f659deab) # grid #18 (0.12.0)
+  GIT_TAG af459730f2696f8121b6c6bb773c16b17888333f) # grid #24 (0.15.0)
 FetchContent_MakeAvailable(volumetric_kit_grid)
 vkc_require_sibling(
   volumetric_kit::grid
-  0.12.0
+  0.15.0
   TARGETS
   volumetric_kit::grid_volume
   volumetric_kit::grid_mesh
