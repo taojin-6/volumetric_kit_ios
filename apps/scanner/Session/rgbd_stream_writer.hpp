@@ -223,7 +223,8 @@ class RgbdStreamWriter {
   ///        (@ref RgbdStreamOptions::dial_limit), and a live reader gets the
   ///        records queued for it before its end (`StreamServer::finish`,
   ///        within `kFinishLimit`), though a note it sends as the socket closes
-  ///        can cost it the last ones, which the file keeps. Idempotent.
+  ///        can cost it the last ones, which a file, if there is one, keeps.
+  ///        Idempotent.
   /// @return OK; the footer's write error, or the file's earlier one; a
   ///         later call returns the first's. `Status::Code::OutOfMemory`
   ///         leaves the session open, and a later call tries again.
