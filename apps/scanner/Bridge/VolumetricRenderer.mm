@@ -1401,7 +1401,7 @@ BOOL draw_client_frame(app::RendererImpl& impl, const vg::windowing::Frame& f,
     const vkc::Status started = start_model(impl);
     if (!started) {
       free_model(impl);
-      app::set_error(error, started, "the on-device model");
+      app::set_error(error, started, "start_model");
       return NO;
     }
     // Made again at the client's first picture.

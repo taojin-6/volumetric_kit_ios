@@ -660,7 +660,8 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @pre @ref stopFusion and @ref waitIdle have returned and nothing renders:
 ///      this frees what the frames in flight and the fuse thread read. Building
 ///      compiles the compute pipelines and commits the first grid, as bring-up
-///      does, so call it off the main thread.
+///      does, so call it off the main thread, and begin it only in the
+///      foreground.
 /// @param on  Whether the model runs from here. As it is already, nothing
 ///            happens.
 /// @param error  Why the model did not build; the renderer is then still the

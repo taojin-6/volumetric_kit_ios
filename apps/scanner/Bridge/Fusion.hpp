@@ -966,7 +966,8 @@ class Fusion {
 
   /// @brief Free what @ref start built: the frame prep, the grid, the compute
   ///        pipelines and the mesh arenas. @ref valid is false until the next
-  ///        @ref start, and the read-out reads as before any scan.
+  ///        @ref start, and the read-out's counts read as before any scan; that
+  ///        start clears its clocks.
   /// @pre No thread is in @ref fuse, the GPU is idle, and the consumer has let
   ///      go of every @ref Published it took.
   void release();

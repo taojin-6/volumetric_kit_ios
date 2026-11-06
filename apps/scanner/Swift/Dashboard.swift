@@ -505,6 +505,11 @@ struct DashboardView: View {
     } else {
       Chip("stream \(Int(model.streamFps.rounded())) fps", tone: .neutral)
       Chip("thermal \(model.thermal)", tone: model.thermalTone == .neutral ? .neutral : .warn)
+      // Alerts is behind the client's closed expand, and a failing camera view
+      // is otherwise a black screen under "Capturing".
+      if model.groups.contains(where: { $0.id == "Alerts" }) {
+        Chip("alert", tone: .warn)
+      }
     }
     if model.dropFraction > 0.2 {
       Chip("\(Int(model.dropFraction * 100))% dropped", tone: .warn)
