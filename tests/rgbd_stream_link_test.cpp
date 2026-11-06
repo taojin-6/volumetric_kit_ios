@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "ReaderLine.hpp"
 #include "dial_entry.hpp"
 #include "fake_rgbd_sensor.hpp"
 #include "rgbd_stream_writer.hpp"
@@ -501,6 +502,139 @@ TEST(RgbdStreamLink, DialToTheSameTargetKeepsTheDialUnderWay) {
   // end kLimit after it.
   EXPECT_TRUE(eventually([&] { return writer->stats().dial_failures >= 1; },
                          kLimit + kLimit / 3));
+}
+
+// --- What the reader says ----------------------------------------------------
+
+networking::ViewerNote note(networking::ViewerNote::Tone tone,
+                            const std::string& line) {
+  networking::ViewerNote said;
+  said.tone = tone;
+  said.line = line;
+  return said;
+}
+
+// Whether @p writer's note comes to read @p line, as what @p reader says lands.
+bool note_reads(const app::RgbdStreamWriter& writer, const std::string& line) {
+  return eventually([&] {
+    const auto said = writer.reader_note();
+    return said.has_value() && said->line == line;
+  });
+}
+
+/// What the reader says reaches the writer, newest first, its tone as the
+/// screen reads it; and the frames go on. A reader that says nothing, as an old
+/// server, leaves none, whatever it reads.
+TEST(RgbdStreamLink, AReadersNoteReachesTheWriterAndTheFramesGoOn) {
+  using Tone = networking::ViewerNote::Tone;
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = options_for("");
+  options.color = false;
+  options.dial_host = kLoopback;
+  options.dial_port = listener->port();
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+  const FakeRgbdSensor camera(info, kArkitNs);
+  auto reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
+
+  ASSERT_TRUE(writer->append(camera.frame(0), nullptr).ok());
+  ASSERT_EQ(read_records(*reader, 1).size(), 1u);
+  EXPECT_FALSE(writer->reader_note().has_value());
+
+  // One record a note, each read before the next: depth alone makes every
+  // record a key, and the server goes on from a newer key than one unsent.
+  struct Said {
+    Tone tone;
+    const char* line;
+    app::StatTone shown;
+  };
+  std::uint32_t next = 1;
+  for (const Said& said :
+       {Said{Tone::Neutral, "Looking for the tag", app::StatTone::Neutral},
+        Said{Tone::Good, "Tag seen: 3 of 6", app::StatTone::Good},
+        Said{Tone::Caution, "Tag refused, trying again", app::StatTone::Warn},
+        Said{Tone::Good, "Tag found, registered", app::StatTone::Good}}) {
+    const auto before = std::chrono::steady_clock::now();
+    ASSERT_TRUE(reader->send_note(note(said.tone, said.line)).ok());
+    ASSERT_TRUE(note_reads(*writer, said.line)) << said.line;
+    const auto got = writer->reader_note();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->tone, said.tone);
+    EXPECT_GE(got->received, before);
+    EXPECT_EQ(app::note_tone(static_cast<std::uint8_t>(got->tone)), said.shown);
+
+    ASSERT_TRUE(writer->append(camera.frame(next), nullptr).ok());
+    const std::vector<ReadRecord> records = read_records(*reader, 1);
+    ASSERT_EQ(records.size(), 1u) << said.line;
+    EXPECT_EQ(records[0].info.seq, next);
+    ++next;
+  }
+  EXPECT_EQ(writer->stats().viewers, 1u);
+  EXPECT_EQ(writer->stats().dial_failures, 0u);
+}
+
+/// The note goes with its reader, so the chip hides on a dropped link and a
+/// word from a reader gone can never show. The next reader has none until it
+/// says one, and the disconnect takes it too.
+TEST(RgbdStreamLink, AReadersNoteGoesWithIt) {
+  using Tone = networking::ViewerNote::Tone;
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  app::RgbdStreamOptions options = fast(options_for(""));
+  options.color = false;
+  options.dial_host = kLoopback;
+  options.dial_port = listener->port();
+  auto writer = open_or_fail(options, info);
+  ASSERT_NE(writer, nullptr);
+
+  auto reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(reader->send_note(note(Tone::Good, "Tag seen: 3 of 6")).ok());
+  ASSERT_TRUE(note_reads(*writer, "Tag seen: 3 of 6"));
+
+  // The reader leaves. No poll for a count of 0, which the redial can end
+  // first: the note stays gone either way, as no one says another.
+  reader.reset();
+  EXPECT_TRUE(eventually([&] { return !writer->reader_note().has_value(); }));
+
+  // It is dialled again: nothing to say until it speaks.
+  reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(eventually([&] { return writer->stats().viewers == 1; }));
+  EXPECT_FALSE(writer->reader_note().has_value());
+  ASSERT_TRUE(
+      reader->send_note(note(Tone::Neutral, "Looking for the tag")).ok());
+  ASSERT_TRUE(note_reads(*writer, "Looking for the tag"));
+
+  ASSERT_TRUE(writer->dial_to("", 0).ok());
+  EXPECT_TRUE(eventually([&] { return !writer->reader_note().has_value(); }));
+}
+
+/// No link is no note, before a target and after the end.
+TEST(RgbdStreamLink, AWriterWithNoReaderHasNoNote) {
+  TempFile file("link_no_note");
+  const sensor::SensorInfo info = ios_test::arkit_like();
+  auto writer = open_or_fail(options_for(file.path()), info);  // the file alone
+  ASSERT_NE(writer, nullptr);
+  EXPECT_FALSE(writer->reader_note().has_value());
+
+  auto listener = listen_or_fail();
+  ASSERT_NE(listener, nullptr);
+  ASSERT_TRUE(writer->dial_to(kLoopback, listener->port()).ok());
+  auto reader = take_reader(*listener);
+  ASSERT_NE(reader, nullptr);
+  ASSERT_TRUE(reader
+                  ->send_note(note(networking::ViewerNote::Tone::Good,
+                                   "Tag found, registered"))
+                  .ok());
+  ASSERT_TRUE(note_reads(*writer, "Tag found, registered"));
+  ASSERT_TRUE(writer->finish().ok());
+  EXPECT_FALSE(writer->reader_note().has_value());
 }
 
 // --- Refusals ----------------------------------------------------------------

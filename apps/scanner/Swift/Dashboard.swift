@@ -496,6 +496,11 @@ struct DashboardView: View {
   }
 
   @ViewBuilder private var chips: some View {
+    // First, so its changing width moves none of the others: they are laid out
+    // from the right.
+    if let line = link.readerLine {
+      Chip(line, tone: Self.tone(for: link.readerTone))
+    }
     if let word = link.chip {
       Chip(word, tone: Self.tone(for: link.state))
     }
@@ -820,6 +825,14 @@ struct DashboardView: View {
     switch link {
     case .connected: return .good
     case .retrying, .needsLocalNetwork: return .warn
+    default: return .neutral
+    }
+  }
+
+  private static func tone(for reader: VolumetricStatTone) -> Tone {
+    switch reader {
+    case .good: return .good
+    case .warn, .critical: return .warn
     default: return .neutral
     }
   }

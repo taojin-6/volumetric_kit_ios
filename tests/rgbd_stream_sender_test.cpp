@@ -487,7 +487,8 @@ TEST_F(RgbdStreamSenderTest, AConnectOpensTheSessionAndAReaderGetsAKey) {
   camera();
   auto sender = open(options(""));
   ASSERT_NE(sender, nullptr);
-  ASSERT_EQ(offer(*sender, 3).size(), 3u);  // dry: one key, then P
+  EXPECT_FALSE(sender->reader_note().has_value());  // no session yet
+  ASSERT_EQ(offer(*sender, 3).size(), 3u);          // dry: one key, then P
 
   const auto take_reader = [&]() -> std::unique_ptr<networking::StreamClient> {
     const auto end = std::chrono::steady_clock::now() + 5s;
@@ -528,9 +529,22 @@ TEST_F(RgbdStreamSenderTest, AConnectOpensTheSessionAndAReaderGetsAKey) {
   EXPECT_TRUE(first_record_is_a_key(*first));
   EXPECT_EQ(sender->stats().keys, 2u);  // the dry run's, and the session's
 
+  // What the reader says comes out of the sender, and goes with the reader.
+  EXPECT_FALSE(sender->reader_note().has_value());
+  networking::ViewerNote said;
+  said.line = "Looking for the tag";
+  ASSERT_TRUE(first->send_note(said).ok());
+  const auto said_by = std::chrono::steady_clock::now() + 5s;
+  while (!sender->reader_note() && std::chrono::steady_clock::now() < said_by) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(sender->reader_note().has_value());
+  EXPECT_EQ(sender->reader_note()->line, said.line);
+
   // The reader goes, and another joins: it asks, and gets, a key.
   ASSERT_TRUE(sender->dial_to("", 0).ok());
   ASSERT_TRUE(served(0));
+  EXPECT_FALSE(sender->reader_note().has_value());
   first.reset();
   ASSERT_TRUE(sender->dial_to("127.0.0.1", port).ok());
   std::unique_ptr<networking::StreamClient> second = take_reader();
