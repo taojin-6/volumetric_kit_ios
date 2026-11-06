@@ -49,6 +49,23 @@ bool keyframe_sampled(const Keyframe& keyframe) {
          chroma_sampled(keyframe.chroma_location);
 }
 
+/// @brief Sets @p coding to how @p keyframe's values code R'G'B': its matrix
+///        weights, range and chroma siting, which @ref chroma_sampled allows.
+/// @tparam Coding    gfx's `YcbcrCoding`: `kr`, `kb`, `full_range` and
+///                   `chroma_siting`.
+/// @tparam Keyframe  sensor's `YuvImage`.
+template <typename Coding, typename Keyframe>
+void set_coding(Coding& coding, const Keyframe& keyframe) {
+  using Location = decltype(keyframe.chroma_location);
+  using Siting = decltype(coding.chroma_siting);
+  coding.chroma_siting = keyframe.chroma_location == Location::Left
+                             ? Siting::Left
+                             : Siting::Center;
+  coding.kr = keyframe.kr;
+  coding.kb = keyframe.kb;
+  coding.full_range = keyframe.full_range;
+}
+
 /// @brief Points @p slot at @p keyframe through @p bind, or at white through
 ///        @p bind_white when the keyframe has no planes, its chroma is sited
 ///        other than left or centre, or @p bind refuses it.
@@ -69,8 +86,6 @@ bool keyframe_sampled(const Keyframe& keyframe) {
 template <typename Planes, typename Keyframe, typename Bind, typename BindWhite>
 const char* rebind_keyframe(PictureSlot<Keyframe>& slot, Keyframe keyframe,
                             Bind&& bind, BindWhite&& bind_white) {
-  using Location = decltype(keyframe.chroma_location);
-  using Siting = decltype(Planes{}.coding.chroma_siting);
   std::optional<Keyframe> picture;
   if (keyframe.image[0] != nullptr && keyframe.image[1] != nullptr) {
     picture = std::move(keyframe);
@@ -84,14 +99,10 @@ const char* rebind_keyframe(PictureSlot<Keyframe>& slot, Keyframe keyframe,
           refusal = "keyframe: its chroma siting is neither left nor centre";
           return false;
         }
-        planes.coding.chroma_siting =
-            k.chroma_location == Location::Left ? Siting::Left : Siting::Center;
+        set_coding(planes.coding, k);
         planes.luma = k.image[0].get();
         planes.chroma = k.image[1].get();
         planes.extent = {k.width, k.height};
-        planes.coding.kr = k.kr;
-        planes.coding.kb = k.kb;
-        planes.coding.full_range = k.full_range;
         return static_cast<bool>(bind(planes));
       },
       std::forward<BindWhite>(bind_white));

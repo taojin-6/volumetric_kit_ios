@@ -4,8 +4,8 @@
 #pragma once
 
 /// @file CaptureReport.hpp
-/// @brief What a scanner launch asks for (`-source`, `-minutes`, `-record`,
-///        `-connect`), and the console lines a run prints every
+/// @brief What a scanner launch asks for (`-source`, `-model`, `-minutes`,
+///        `-record`, `-connect`), and the console lines a run prints every
 ///        @ref kReportEverySeconds: counts, times, states and colour codes,
 ///        never a pixel, a depth value, a pose or a path.
 ///
@@ -19,6 +19,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "ScannerMode.hpp"
 
 namespace volumetric_kit::ios_app {
 
@@ -37,6 +39,8 @@ struct LaunchOptions {
   /// The source; empty when an argument was refused, so a mistyped launch
   /// opens no camera rather than falling back to it.
   std::optional<CaptureSource> source = CaptureSource::Camera;
+  /// How the scanner starts: the client, or with `-model` the on-device model.
+  ScannerMode mode = ScannerMode::Client;
   /// Minutes the scanner runs before it stops and exits; 0 runs on.
   std::uint32_t minutes = 0;
   /// The session file the stream writes, a plain name the app's Documents
@@ -70,6 +74,8 @@ inline constexpr std::size_t kMaxRecordName = 64;
 
 /// @return What @p arguments (the process's, the program first) ask for:
 ///         `-source camera` or `-source pattern` (the camera when absent);
+///         `-model`, which takes no value and goes with any of the others (the
+///         client when absent);
 ///         `-minutes N` with N a whole number from 1 to @ref kMaxRunMinutes
 ///         (run on when absent); `-record <name>`, a name of letters, digits,
 ///         `.`, `_` and `-`, not starting with `.`, ending `.vrst`, at most
@@ -92,8 +98,9 @@ inline constexpr std::uint32_t kReportEverySeconds = 10;
 /// backgrounding too); the times are this window's.
 struct CaptureReport {
   CaptureSource source = CaptureSource::Camera;
-  double seconds = 0.0;  ///< Since the start.
-  bool stop = false;     ///< The line at a stop: each stop prints one.
+  ScannerMode mode = ScannerMode::Client;  ///< The mode this start runs in.
+  double seconds = 0.0;                    ///< Since the start.
+  bool stop = false;  ///< The line at a stop: each stop prints one.
   /// Seconds from the start to its first frame; empty before one came.
   std::optional<double> first_frame_s;
   std::string tracking;         ///< ARKit's tracking at the last frame, named.
@@ -106,9 +113,10 @@ struct CaptureReport {
   std::uint64_t withheld = 0;   ///< `ArkitStatus::withheld`, part of failed.
   std::uint64_t refused = 0;    ///< `ArkitStatus::refused`, part of failed.
   std::uint64_t missed = 0;     ///< `ArkitStatus::missed`.
-  std::uint64_t fused = 0;      ///< Frames fused since the start.
+  std::uint64_t fused = 0;  ///< Frames fused since the start; 0 in the client.
   /// Frames the on-device model let go unfused since the start, a newer one
-  /// having come while it fused (`FrameFanout::Counts::skipped`).
+  /// having come while it fused (`FrameFanout::Counts::skipped`); 0 in the
+  /// client.
   std::uint64_t skipped = 0;
   /// The device's thermal state ("nominal", "fair", "serious", "critical");
   /// empty when not read.
@@ -140,7 +148,7 @@ struct CaptureReport {
 ///         at a stop): tracking; the counters; frames fused and skipped; the
 ///         thermal state; when the first frame came; poll, fuse and prep ms at
 ///         p50 and p95 over the window, with their counts; the colour codes;
-///         the contract; and, for the pattern, the index check.
+///         the contract; for the pattern, the index check; and the mode.
 std::string capture_report_line(const CaptureReport& report);
 
 /// @brief The stream's part of a window, as its console line says it: the

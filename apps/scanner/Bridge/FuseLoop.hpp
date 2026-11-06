@@ -5,7 +5,8 @@
 
 /// @file FuseLoop.hpp
 /// @brief The fuse thread's body: the camera's frames into the stream and
-///        fusion, and the run's console lines every `kReportEverySeconds`.
+///        fusion, or in the client the stream and the camera view, and the
+///        run's console lines every `kReportEverySeconds`.
 
 namespace volumetric_kit::ios_app {
 
@@ -21,6 +22,10 @@ struct RendererImpl;
 ///        the device's thermal state ("sa"), and the stream's ("st"), until
 ///        `impl.fusing` goes false; then end the worker, after the fuse under
 ///        way, and print the stop's lines ("sa stop", "st stop").
+///
+/// In the client (`mode_plan`) no worker runs and nothing is fused: each frame
+/// goes to the stream, then to the camera view, which keeps it only when it
+/// wants one (Core/ViewPicture.hpp). Fused and skipped read 0.
 ///
 /// Waits on `impl.frame_signal` while the camera holds nothing. Each frame
 /// is checked against sensor's frame contract (`testing::RgbdContract`) and,

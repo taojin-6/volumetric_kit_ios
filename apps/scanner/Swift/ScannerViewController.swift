@@ -14,9 +14,13 @@ final class ScannerViewController: UIViewController {
   private var metalView: MetalView!
   private var renderer: VolumetricRenderer?
   /// What the launch asks of the camera and its stream: `-source
-  /// camera|pattern`, `-minutes N`, `-record <name>`, `-connect <address>`
-  /// and `-dry`.
+  /// camera|pattern`, `-model`, `-minutes N`, `-record <name>`,
+  /// `-connect <address>` and `-dry`.
   private let launch = ScannerLaunch(arguments: ProcessInfo.processInfo.arguments)
+  /// Whether the on-device model is wanted: `-model`, then the panel's switch.
+  /// The renderer's `modelOn` is what it holds: `suspend`'s teardown frees the
+  /// model, and `resume` builds it.
+  private var modelWanted = false
   private var displayLink: CADisplayLink?
   /// What the dashboard draws. Populated in `updateStatus`, at the display
   /// cadence -- the *history* it charts is sampled per fused frame on the
@@ -54,8 +58,9 @@ final class ScannerViewController: UIViewController {
   /// Bring-up runs off the main thread now, so this is what stops a second
   /// layout pass from starting a second one while the first is in flight.
   private var bringUpInFlight = false
-  /// Set while `suspend()`'s drain is finishing on a background queue. `resume`
-  /// refuses to start a second loop on top of one still winding down.
+  /// Set while `suspend()`'s drain is finishing on a background queue, or
+  /// `buildModel`'s build. `resume` refuses to start a second loop on top of one
+  /// still winding down.
   private var teardownInFlight = false
   /// Set once a frame has failed fatally. The loop is not restarted afterwards:
   /// a `VK_ERROR_DEVICE_LOST` does not heal, and resuming onto the lost device
@@ -89,8 +94,12 @@ final class ScannerViewController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = .black
 
+    modelWanted = launch.model
+    dashboard.modelOn = launch.model
+
+    // Placed by `placeMetalView`, not by a mask: its frame is undefined once it
+    // is turned.
     metalView = MetalView(frame: view.bounds)
-    metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     view.addSubview(metalView)
 
     // Attached here, not after bring-up: the recognizers belong to the view,
@@ -149,7 +158,10 @@ final class ScannerViewController: UIViewController {
     // it -- so the reconstruction gets the lower 45% and, collapsed, all but
     // the headline.
     let host = UIHostingController(
-      rootView: DashboardView(model: dashboard, link: link) {
+      rootView: DashboardView(
+        model: dashboard, link: link,
+        onModelChange: { [weak self] on in self?.changeModel(to: on) }
+      ) {
         [weak self] expanded in
         // The height constraint follows the toggle. Collapsed, the body is a
         // plain VStack and sizes itself; expanded, it contains a ScrollView,
@@ -157,6 +169,9 @@ final class ScannerViewController: UIViewController {
         // was last given.
         self?.expandedHeight?.isActive = expanded
       })
+    // Collapsed, the panel holds cards whose height changes, with no toggle to
+    // say so; expanded, the height constraint wins.
+    host.sizingOptions = .intrinsicContentSize
     host.view.backgroundColor = .clear
     host.view.translatesAutoresizingMaskIntoConstraints = false
     addChild(host)
@@ -234,8 +249,9 @@ final class ScannerViewController: UIViewController {
     isCapturing = false
     renderer?.beginStopFusion()
     // A suspend's teardown still in its `stopFusion` owns the stop, and its
-    // completion exits: a second `stopFusion` from here would join the one
-    // fuse thread from two threads at once, which terminates the app.
+    // completion exits, as a build's does: a second `stopFusion` from here would
+    // join the one fuse thread from two threads at once, which terminates the
+    // app.
     guard !teardownInFlight else { return }
     let renderer = self.renderer
     DispatchQueue.global(qos: .userInitiated).async {
@@ -245,6 +261,65 @@ final class ScannerViewController: UIViewController {
       fflush(stdout)
       exit(0)
     }
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    placeMetalView()
+  }
+
+  /// Where the Metal view sits, and which way it is turned.
+  ///
+  /// The model fills the view as it is. The client's camera view turns the layer
+  /// instead: gfx's image pipeline places a picture but cannot turn it, and a
+  /// picture is as the sensor took it, so the view's drawable stays on the
+  /// sensor's axes and the compositor stands it upright. Exact quarter turns, so
+  /// nothing is resampled.
+  private func placeMetalView() {
+    // The layer has crossed to bring-up's thread; the way back places it again.
+    guard !metalView.defersLayerUpdates else { return }
+    let turns =
+      modelWanted
+      ? 0 : VolumetricRenderer.cameraViewQuarterTurns(for: currentViewOrientation())
+    let size = view.bounds.size
+    metalView.transform = Self.clockwise(turns)
+    metalView.bounds = CGRect(
+      origin: .zero,
+      size: turns % 2 == 1 ? CGSize(width: size.height, height: size.width) : size)
+    metalView.center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+    metalView.layoutIfNeeded()
+  }
+
+  private static func clockwise(_ quarterTurns: Int) -> CGAffineTransform {
+    switch quarterTurns {
+    case 1: return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0)
+    case 2: return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: 0, ty: 0)
+    case 3: return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 0)
+    default: return .identity
+    }
+  }
+
+  /// The panel's switch. The capture stops and starts again around the change,
+  /// through the lifecycle's own wind-down: `suspend`'s teardown frees the model
+  /// with the fuse thread joined and the GPU idle, and `resume` builds it, in the
+  /// foreground alone. The stream's session goes on across it.
+  private func changeModel(to on: Bool) {
+    guard on != modelWanted, isCapturing, !teardownInFlight else { return }
+    modelWanted = on
+    dashboard.modelOn = on
+    dashboard.modelSwitchEnabled = false
+    dashboard.scanning = false
+    dashboard.failure = nil
+    suspend()
+  }
+
+  /// What follows from the mode the renderer now holds. The panel says the mode
+  /// asked for, so a model still to build does not flip it back meanwhile.
+  private func modelSettled(_ renderer: VolumetricRenderer) {
+    dashboard.modelOn = modelWanted
+    // The gestures move the model's camera, and the client has none to move.
+    cameraGestures?.renderer = renderer.modelOn ? renderer : nil
+    placeMetalView()
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -319,15 +394,70 @@ final class ScannerViewController: UIViewController {
     guard isRunnable, !isCapturing, !teardownInFlight, let renderer else {
       return
     }
+    if modelWanted && !renderer.modelOn {
+      buildModel(renderer)
+      return
+    }
     isCapturing = true
+    // Held without a touch the device would lock, which stops the camera and the
+    // stream.
+    UIApplication.shared.isIdleTimerDisabled = true
     // Before the first frame: ARKit poses are in the sensor's frame, which does
     // not turn with the interface, so the renderer has to be told which way the
-    // viewport is facing or the scan renders on its side.
+    // viewport is facing or the scan renders on its side. The layer too: a turn
+    // while locked keeps the view's size, so no layout places it.
     renderer.viewOrientation = currentViewOrientation()
+    placeMetalView()
     // The camera starts, then fusion pulls from it on its own thread; the
     // render loop only ever picks up whatever mesh it has published.
     renderer.startFusion()
     startDisplayLink()
+  }
+
+  /// The switch's build, for `resume` alone, so it never begins in the
+  /// background. Off the main thread, as it compiles the pipelines and commits the
+  /// grid as bring-up does. `suspend`'s teardown has joined the fuse thread and
+  /// idled the GPU, and `teardownInFlight` keeps the loop from starting. If it
+  /// fails the renderer stays the client and the capture goes on.
+  private func buildModel(_ renderer: VolumetricRenderer) {
+    teardownInFlight = true
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let failure: String? = {
+        do {
+          try renderer.setModelOn(true)
+          return nil
+        } catch {
+          return error.localizedDescription
+        }
+      }()
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.teardownInFlight = false
+        if self.runEnded {
+          Self.finishRun(renderer)
+          return
+        }
+        if let failure {
+          let message = "The on-device model did not start: \(failure)"
+          self.dashboard.failure = message
+          print("scanner: \(message)")
+        }
+        self.modelWanted = renderer.modelOn
+        self.modelSettled(renderer)
+        self.resume()
+      }
+    }
+  }
+
+  /// The exit of a `-minutes N` run that ended during a teardown or a build; see
+  /// `endTimedRun`. The stream's finish waits for its thread and the link's end,
+  /// so off the main thread.
+  private static func finishRun(_ renderer: VolumetricRenderer) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      renderer.finishStream()
+      fflush(stdout)
+      exit(0)
+    }
   }
 
   /// Wind the loop down, in the one order that is safe.
@@ -358,6 +488,7 @@ final class ScannerViewController: UIViewController {
   private func suspend() {
     guard isCapturing else { return }
     isCapturing = false
+    UIApplication.shared.isIdleTimerDisabled = false
     stopDisplayLink()
     // Fusion first, and explicitly. It submits compute work on the same queue the
     // drain below empties, so a fuse thread still running would enqueue behind
@@ -371,25 +502,25 @@ final class ScannerViewController: UIViewController {
     renderer?.beginStopFusion()
     guard let renderer else { return }
     teardownInFlight = true
+    let wanted = modelWanted
     // `renderer` is captured strongly, deliberately: the drain must not race a
     // release of the object whose queues it is draining.
     DispatchQueue.global(qos: .userInitiated).async {
       renderer.stopFusion()
       renderer.waitIdle()
+      // The switch's freeing, here for the idle GPU. Its build is `resume`'s,
+      // since the app may be in the background by now.
+      if !wanted {
+        try? renderer.setModelOn(false)
+      }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.teardownInFlight = false
-        // A `-minutes N` run that ended during this teardown left its exit
-        // here; see endTimedRun. The stream's finish waits for its thread
-        // and the link's end, so off the main thread.
         if self.runEnded {
-          DispatchQueue.global(qos: .userInitiated).async {
-            renderer.finishStream()
-            fflush(stdout)
-            exit(0)
-          }
+          Self.finishRun(renderer)
           return
         }
+        self.modelSettled(renderer)
         // Reconciled rather than assumed: the app may have been foregrounded,
         // or the view re-appeared, while the drain was running. `resume` is
         // precondition-checked, so this is a no-op whenever it should not run.
@@ -408,6 +539,7 @@ final class ScannerViewController: UIViewController {
     coordinator.animate(alongsideTransition: nil) { [weak self] _ in
       guard let self else { return }
       self.renderer?.viewOrientation = self.currentViewOrientation()
+      self.placeMetalView()
     }
   }
 
@@ -489,6 +621,8 @@ final class ScannerViewController: UIViewController {
     let dry = launch.dry
     // `-fail-opens N`: the pattern's first N opens fail, a test of the retry.
     let failOpens = launch.failOpens
+    // The client, or with `-model` the on-device model.
+    let modelOn = modelWanted
     // `-record <name>`: the stream's session file, in the app's own Documents.
     let recordPath: String? =
       launch.record.isEmpty
@@ -520,7 +654,8 @@ final class ScannerViewController: UIViewController {
         }
         return try VolumetricRenderer(
           layer: layer, configurationPath: url.path, source: source,
-          recordPath: recordPath, dryRun: dry, failOpens: failOpens)
+          recordPath: recordPath, dryRun: dry, failOpens: failOpens,
+          modelOn: modelOn)
       }
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
@@ -537,6 +672,9 @@ final class ScannerViewController: UIViewController {
           // it a bring-up failure is visible only on the screen.
           print(message)
         }
+        // Last: `adopt` has set `renderer`, so a size change starts no second
+        // bring-up on this layer. After a failure, one is the retry.
+        self.placeMetalView()
       }
     }
   }
@@ -544,7 +682,7 @@ final class ScannerViewController: UIViewController {
   /// Take ownership of a renderer that finished bring-up, on the main thread.
   private func adopt(_ brought: VolumetricRenderer) {
     renderer = brought
-    cameraGestures?.renderer = brought
+    modelSettled(brought)
     link.renderer = brought
     announceStream(brought, camera: brought.cameraStatus)
     // Cleared, because bring-up has a documented retry path: a first layout
@@ -730,6 +868,13 @@ final class ScannerViewController: UIViewController {
     framesSinceUpdate = 0
     lastFPSUpdate = now
 
+    // A direct 180-degree turn keeps the view's size, so no layout says so.
+    let orientation = currentViewOrientation()
+    if orientation != renderer.viewOrientation {
+      renderer.viewOrientation = orientation
+      placeMetalView()
+    }
+
     let size = metalView.metalLayer.drawableSize
     // Which camera is driving, and -- once the user is driving -- the way back.
     // A manual camera pointed away from the scan and a scan that stopped
@@ -777,12 +922,16 @@ final class ScannerViewController: UIViewController {
     // nothing else; and the two ARKit fault lines collapsed into a boolean, so
     // a device without LiDAR showed "Paused 00:00 / 0.00 M tris" indefinitely
     // with nothing on screen saying why.
-    let renderLines = [
+    let modelOn = renderer.modelOn
+    var renderLines = [
+      "mode      \(renderer.modeName)",
       "drawable  \(Int(size.width)) x \(Int(size.height)) px",
       "orient    \(orientationName(renderer.viewOrientation))",
       "presented \(renderer.framesPresented)",
-      "camera    \(camera)",
     ]
+    if modelOn {
+      renderLines.append("camera    \(camera)")
+    }
     // The capture read-out, as two groups of lines built ONCE.
     //
     // Every figure below used to be written out twice -- appended to `text` for
@@ -840,7 +989,9 @@ final class ScannerViewController: UIViewController {
         "frames    \(counts)",
         // Fusion takes the newest frame when it is free: what it skipped, from
         // this start. Beside it, a sign only, the `st` line's busy count.
-        "skipped   \(cam.fusionSkipped) by the model  (stream busy \(cam.streamBusy) since launch)",
+        modelOn
+          ? "skipped   \(cam.fusionSkipped) by the model  (stream busy \(cam.streamBusy) since launch)"
+          : "busy      \(cam.streamBusy) on the stream since launch",
         "thermal   \(VolumetricRenderer.thermalState)",
         "depth     \(cam.depthWidth) x \(cam.depthHeight)  (confidence medium and up)",
         "colour    \(cam.colorWidth) x \(cam.colorHeight)",
@@ -877,6 +1028,11 @@ final class ScannerViewController: UIViewController {
     // frozen on screen with nothing capturing, fusing or drawing; a non-fatal
     // didFailWithError flipped it to "Paused" while fps and triangles climbed.
     dashboard.scanning = isCapturing && !renderFailed
+    dashboard.modelOn = modelOn
+    dashboard.modelSwitchEnabled = isCapturing && !teardownInFlight && !renderFailed && !runEnded
+    dashboard.streamFps = cam.streamFps
+    dashboard.thermal = VolumetricRenderer.thermalState
+    dashboard.thermalTone = VolumetricRenderer.thermalTone
     dashboard.elapsed = CFAbsoluteTimeGetCurrent() - sessionStartedAt
     dashboard.fps = fps
     dashboard.trackingText = cam.opened ? cam.tracking : Self.openChip(cam.openState)

@@ -86,6 +86,10 @@ LaunchOptions launch_options(const std::vector<std::string>& arguments) {
       out.dry = true;
       continue;
     }
+    if (flag == "-model") {
+      out.mode = ScannerMode::Model;
+      continue;
+    }
     if (flag != "-source" && flag != "-minutes" && flag != "-record" &&
         flag != "-connect" && flag != "-fail-opens") {
       continue;
@@ -194,6 +198,7 @@ std::string capture_report_line(const CaptureReport& r) {
     line += " | index " + std::to_string(r.index_checked - r.index_mismatches) +
             "/" + std::to_string(r.index_checked);
   }
+  line += std::string(" | mode ") + to_string(r.mode);
   if (!r.session_error.empty()) {
     line += " | session failed: " + r.session_error;
   }

@@ -10,6 +10,8 @@
 /// host. The Objective-C `VolumetricStatTone` mirrors @ref StatTone value for
 /// value and `Readout.mm` static_asserts the two agree.
 
+#include <string_view>
+
 namespace volumetric_kit::ios_app {
 
 /// @brief How a stat should read: plain, healthy, or wanting attention.
@@ -64,6 +66,15 @@ struct ToneThresholds {
 /// @overload
 constexpr StatTone tone_for(double fraction, ToneThresholds t) noexcept {
   return tone_for(fraction, t.warn, t.critical);
+}
+
+/// @return The tone of the device's thermal state as the console lines name it
+///         (`thermal_state`): "serious" warns, "critical" is critical, and any
+///         other is routine.
+constexpr StatTone thermal_tone(std::string_view state) noexcept {
+  if (state == "critical") return StatTone::Critical;
+  if (state == "serious") return StatTone::Warn;
+  return StatTone::Neutral;
 }
 
 /// @name The panel's gauge thresholds

@@ -1,12 +1,19 @@
 # volumetric_kit_ios
 
-The iOS application shell of the `volumetric_kit` family: ARKit capture →
+The iOS application shell of the `volumetric_kit` family: ARKit capture → an
+RGBD stream to the server that holds the scene, with the camera on screen
+through
+[`volumetric_kit_gfx`](https://github.com/taojin-6/volumetric_kit_gfx); and, on
+request,
 [`volumetric_kit_recon`](https://github.com/taojin-6/volumetric_kit_recon)
 fusion on
 [`volumetric_kit_grid`](https://github.com/taojin-6/volumetric_kit_grid)'s
-voxel grid and meshing →
-[`volumetric_kit_gfx`](https://github.com/taojin-6/volumetric_kit_gfx)
-rendering, all on MoltenVK, on a phone.
+voxel grid and meshing → gfx rendering, all on MoltenVK, on a phone.
+
+The scanner runs as the client by default, streaming and showing the camera with
+no grid or mesh on the device; `-model`, or the panel's switch, adds the
+on-device TSDF, mesh and textured model, with or without a stream
+(`apps/scanner/Core/ScannerMode.hpp`).
 
 This repo holds only what is genuinely iOS: the cross-compilation toolchain, the
 app targets, and the Xcode packaging. The libraries stay independent siblings —

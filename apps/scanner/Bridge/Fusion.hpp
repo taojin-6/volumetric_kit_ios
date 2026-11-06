@@ -964,6 +964,14 @@ class Fusion {
   vkc::Status start(vkc::Device& device, vkc::Allocator& allocator,
                     const FusionConfig& config);
 
+  /// @brief Free what @ref start built: the frame prep, the grid, the compute
+  ///        pipelines and the mesh arenas. @ref valid is false until the next
+  ///        @ref start, and the read-out's counts read as before any scan; that
+  ///        start clears its clocks.
+  /// @pre No thread is in @ref fuse, the GPU is idle, and the consumer has let
+  ///      go of every @ref Published it took.
+  void release();
+
   /// @brief Fuse one camera frame, and remesh if the cadence says so.
   ///
   /// The frame goes to the device once: `GpuFramePrep::prepare` gates its

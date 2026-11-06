@@ -28,6 +28,7 @@ add_library(
   MemoryBudget.cpp
   OrbitCamera.cpp
   RateGate.cpp
+  ScannerMode.cpp
   SelfTest.cpp
   ViewOrientation.cpp)
 

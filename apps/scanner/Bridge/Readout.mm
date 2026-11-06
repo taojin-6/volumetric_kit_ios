@@ -418,6 +418,9 @@ std::string render_text(NSArray<VolumetricStatSection*>* sections,
       out += text_row(row);
     }
   }
+  if (!mode_plan(in.mode).fusion) {
+    return out;  // nothing fuses, so no stage has anything to say
+  }
   // The stage grid, which is not a section: it is a per-stage host/device split
   // the panel charts rather than lists, and it has no label/value shape to
   // borrow. Rendered here so the log still carries it.
@@ -580,6 +583,12 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
               ? fmt("%llu failed", (unsigned long long)in.atlas_failures)
               : fmt("%llu failed: %s", (unsigned long long)in.atlas_failures,
                     in.atlas_error.c_str()),
+          VolumetricStatToneWarn);
+    }
+    if (in.camera_view_failures > 0) {
+      add(r, @"camera view",
+          fmt("%llu failed: %s", (unsigned long long)in.camera_view_failures,
+              in.camera_view_error.c_str()),
           VolumetricStatToneWarn);
     }
     if (in.memory_warnings > 0) {
@@ -1140,12 +1149,20 @@ NSArray<VolumetricStatSection*>* stat_sections(const ReadoutInputs& in) {
     [out addObject:make_section(@"Memory", r)];
   }
 
+  // Built whole and filtered here, at a few hertz, rather than gating each
+  // builder above on the mode.
+  NSMutableArray<VolumetricStatSection*>* shown = [NSMutableArray array];
+  for (VolumetricStatSection* section in out) {
+    if (section_shown(in.mode, section.title.UTF8String)) {
+      [shown addObject:section];
+    }
+  }
   // Immutable, for the reason `stage_rows` gives over its own `[rows copy]`:
   // the property this feeds is declared `copy`, and `copy` synthesizes nothing
   // on a readonly property with a custom getter -- so handing back the live
   // mutable array is the attribute quietly not holding. A handful of sections
   // at a few hertz is not the cost worth keeping it live to save.
-  return [out copy];
+  return [shown copy];
 }
 
 namespace {

@@ -75,10 +75,11 @@ struct FusedWindow {
 };
 
 // One frame polled: checked, its codes read now and then, then offered to
-// the stream and to fusion (FrameFanout).
+// the stream and to fusion (FrameFanout), or, in the client, to the stream and
+// the camera view.
 void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
-          Window& window, Fanout& fanout, sensor::RgbdFrame frame,
-          float poll_ms) {
+          Window& window, Fanout& fanout, const ModePlan& plan,
+          sensor::RgbdFrame frame, float poll_ms) {
   contract.take(frame);
   window.poll_ms.push_back(poll_ms);
 
@@ -117,6 +118,11 @@ void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
     }
   }
 
+  if (!plan.fusion) {
+    if (impl.stream) impl.stream->offer(frame);
+    if (plan.camera_view) (void)impl.camera_view.picture.offer(frame.color);
+    return;
+  }
   fanout.offer(Polled{std::move(frame), poll_ms});
   const std::uint64_t skipped = fanout.counts().skipped;
   std::lock_guard<std::mutex> lock(impl.camera_readout.mutex);
@@ -145,6 +151,7 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   CaptureReport r;
   r.source =
       impl.camera_pattern ? CaptureSource::Pattern : CaptureSource::Camera;
+  r.mode = impl.mode;
   r.seconds = std::chrono::duration<double>(Clock::now() - started).count();
   r.stop = stop;
   r.first_frame_s = window.first_frame_s;
@@ -241,6 +248,9 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
 }  // namespace
 
 void run_fuse_loop(RendererImpl& impl) {
+  const ModePlan plan = mode_plan(impl.mode);
+  std::printf("scanner: %s mode\n", to_string(impl.mode));
+  std::fflush(stdout);
   sensor::ArkitSensor& camera = *impl.arkit;
   // One checker a start: the camera's sequences and counters begin again at
   // each.
@@ -277,8 +287,9 @@ void run_fuse_loop(RendererImpl& impl) {
       [&impl](std::string_view message) noexcept {
         impl.fusion.note_error(message, "fusion worker: ");
       });
-  // A worker that did not start has said why; the stream goes on.
-  (void)fanout.start();
+  // A worker that did not start has said why; the stream goes on. The client
+  // has none: `take` goes around the fan-out.
+  if (plan.fusion) (void)fanout.start();
   const Clock::time_point started = Clock::now();
   const auto every = std::chrono::seconds(kReportEverySeconds);
   Clock::time_point next_line = started + every;
@@ -311,7 +322,7 @@ void run_fuse_loop(RendererImpl& impl) {
             window.first_frame_s =
                 std::chrono::duration<double>(Clock::now() - started).count();
           }
-          take(impl, contract, window, fanout, std::move(*got.value()),
+          take(impl, contract, window, fanout, plan, std::move(*got.value()),
                poll_ms);
         },
         [&impl](std::string_view message) noexcept {

@@ -111,4 +111,11 @@ inline constexpr ViewOrientation kSensorBasisOrientation =
 /// to one of those comes out with the opposite sign.
 float viewport_turn(ViewOrientation orientation) noexcept;
 
+/// The camera's picture's turn on screen in @p orientation, in clockwise
+/// quarter turns, 0 to 3: what stands it upright. A picture is as the sensor
+/// took it, so it needs none at @ref kSensorBasisOrientation, and this is
+/// @ref viewport_turn counted in quarters: the world on screen turns clockwise
+/// as the camera's basis turns counterclockwise.
+int picture_quarter_turns(ViewOrientation orientation) noexcept;
+
 }  // namespace volumetric_kit::ios_app

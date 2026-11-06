@@ -38,6 +38,7 @@ namespace app = volumetric_kit::ios_app;
         break;
     }
   }
+  _model = options.mode == app::ScannerMode::Model ? YES : NO;
   _minutes = options.minutes;
   _record = app::to_ns_string(options.record);
   _connect = app::to_ns_string(options.connect);

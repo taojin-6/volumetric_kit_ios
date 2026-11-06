@@ -72,4 +72,12 @@ static_assert(tone_for(0.5, 0.75, 0.9) == StatTone::Neutral);
 static_assert(tone_for(0.8, 0.75, 0.9) == StatTone::Warn);
 static_assert(tone_for(0.99, 0.75, 0.9) == StatTone::Critical);
 
+TEST(ThermalTone, SeriousWarnsAndCriticalIsCritical) {
+  EXPECT_EQ(app::thermal_tone("nominal"), StatTone::Neutral);
+  EXPECT_EQ(app::thermal_tone("fair"), StatTone::Neutral);
+  EXPECT_EQ(app::thermal_tone("unknown"), StatTone::Neutral);
+  EXPECT_EQ(app::thermal_tone("serious"), StatTone::Warn);
+  EXPECT_EQ(app::thermal_tone("critical"), StatTone::Critical);
+}
+
 }  // namespace

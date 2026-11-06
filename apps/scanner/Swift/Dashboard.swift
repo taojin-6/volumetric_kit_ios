@@ -16,7 +16,9 @@
 /// hiding half of what it measures behind a gesture makes it a worse one. Every
 /// figure the text read-out carried is on screen. What changed is that it is
 /// *grouped*, and that the figures a reader has to act on carry visual state
-/// instead of waiting to be noticed in a column of digits.
+/// instead of waiting to be noticed in a column of digits. The client is the
+/// exception, its panel small over the camera view it is aimed with: the link,
+/// the switch and a few chips, and what is left behind the expand.
 ///
 /// **Each figure appears once.** The panel grew a card per source rather than a
 /// card per question, and the same quantity ended up on four of them: the
@@ -117,6 +119,16 @@ final class DashboardModel: ObservableObject {
   @Published var scanning = false
   @Published var elapsed: TimeInterval = 0
   @Published var fps: Double = 0
+
+  /// Whether the on-device model runs: what the panel's model cards are about.
+  /// Without it the scanner is the client, and the panel stays small over the
+  /// camera view.
+  @Published var modelOn = false
+  /// Off while the switch's change is under way, or nothing is running to change.
+  @Published var modelSwitchEnabled = false
+  @Published var streamFps: Double = 0
+  @Published var thermal = ""
+  @Published var thermalTone: VolumetricStatTone = .neutral
 
   @Published var triangles: Int = 0
   /// Beside `triangles` rather than derived from it: the extract emits an
@@ -231,12 +243,19 @@ struct DashboardView: View {
   @ObservedObject var model: DashboardModel
   /// The live link: its entry is the first card, its state a headline chip.
   @ObservedObject var link: LinkModel
+  /// The on-device model's switch, moved.
+  let onModelChange: (Bool) -> Void
   /// Told to UIKit rather than kept here alone: the host's height constraint
   /// has to follow, because a ScrollView has no intrinsic height and would
   /// otherwise keep its expanded size around a collapsed body.
   let onExpandedChange: (Bool) -> Void
 
-  @AppStorage("dashboardExpanded") private var expanded = true
+  @AppStorage("dashboardExpanded") private var modelExpanded = true
+  /// Apart from the model's, and closed until asked: the camera view is what the
+  /// client aims with, and an open panel covers it.
+  @AppStorage("clientExpanded") private var clientExpanded = false
+
+  private var expanded: Bool { model.modelOn ? modelExpanded : clientExpanded }
 
   /// Adaptive rather than a fixed column count: the same panel has to work on
   /// a landscape iPad, where six groups fit across, and a portrait phone, where
@@ -283,17 +302,31 @@ struct DashboardView: View {
         .padding(.bottom, 12)
       }
 
+      // In the client they stay on screen, outside the expand: someone holding
+      // the device connects and switches from here, with the camera in view.
+      if !model.modelOn {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+          linkCard
+          modelCard
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+      }
+
       if expanded {
         ScrollView {
           VStack(alignment: .leading, spacing: 10) {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-              Card("Link") { LinkEntry(link: link) }
-              Card("Timeline") { timeline }
-              // The stage bars, built here from `stages` and from no section.
-              // The bridge used to publish the same figures twice -- as bars
-              // and as a `Pipeline` section this loop then had to recognise by
-              // title and throw away. One source, one card, no title match.
-              Card("Latency") { latency }
+              if model.modelOn {
+                linkCard
+                modelCard
+                Card("Timeline") { timeline }
+                // The stage bars, built here from `stages` and from no section.
+                // The bridge used to publish the same figures twice -- as bars
+                // and as a `Pipeline` section this loop then had to recognise by
+                // title and throw away. One source, one card, no title match.
+                Card("Latency") { latency }
+              }
               // Sections in the order a reader works through them, not in the
               // order the bridge appends them. See `sectionOrder`.
               ForEach(orderedGroups) { group in
@@ -307,7 +340,7 @@ struct DashboardView: View {
               if !model.deviceLines.isEmpty {
                 Card("Device") { lines(model.deviceLines) }
               }
-              if !model.renderLines.isEmpty {
+              if model.modelOn && !model.renderLines.isEmpty {
                 Card("Render") { lines(model.renderLines) }
               }
               if !model.captureLines.isEmpty {
@@ -341,6 +374,29 @@ struct DashboardView: View {
     )
   }
 
+  private var linkCard: some View {
+    Card("Link") { LinkEntry(link: link) }
+  }
+
+  private var modelCard: some View {
+    Card("On-device model") {
+      VStack(alignment: .leading, spacing: 4) {
+        Toggle(
+          "Fuse and mesh here",
+          isOn: Binding(
+            get: { model.modelOn },
+            set: { onModelChange($0) })
+        )
+        .disabled(!model.modelSwitchEnabled)
+        .font(.footnote)
+        Text("Changing it restarts the capture; the stream's session goes on.")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
   // The one line that has to be readable without looking: capturing or not,
   // how much surface, how full the volume is.
   //
@@ -359,8 +415,10 @@ struct DashboardView: View {
       HStack(alignment: .center, spacing: 14) {
         status
         Divider().frame(height: 22)
-        triangleCount
-        occupancy.frame(maxWidth: 150)
+        if model.modelOn {
+          triangleCount
+          occupancy.frame(maxWidth: 150)
+        }
         Spacer(minLength: 0)
         HStack(spacing: 6) {
           chips
@@ -375,11 +433,15 @@ struct DashboardView: View {
           expandButton
         }
         HStack(alignment: .center, spacing: 12) {
-          triangleCount
-          Spacer(minLength: 0)
+          if model.modelOn {
+            triangleCount
+            Spacer(minLength: 0)
+          }
           chips
         }
-        occupancy
+        if model.modelOn {
+          occupancy
+        }
       }
     }
     .padding(.horizontal, 4)
@@ -390,7 +452,7 @@ struct DashboardView: View {
       Circle()
         .fill(model.scanning ? Color.red : Color.secondary)
         .frame(width: 8, height: 8)
-      Text(model.scanning ? "Scanning" : "Paused")
+      Text(model.scanning ? (model.modelOn ? "Scanning" : "Capturing") : "Paused")
         .font(.title3.weight(.semibold))
         .fixedSize()
       Text(Self.clock(model.elapsed))
@@ -438,7 +500,17 @@ struct DashboardView: View {
       Chip(word, tone: Self.tone(for: link.state))
     }
     Chip(model.trackingText, tone: model.trackingHealthy ? .good : .warn)
-    Chip("\(Int(model.fps)) fps", tone: .neutral)
+    if model.modelOn {
+      Chip("\(Int(model.fps)) fps", tone: .neutral)
+    } else {
+      Chip("stream \(Int(model.streamFps.rounded())) fps", tone: .neutral)
+      Chip("thermal \(model.thermal)", tone: model.thermalTone == .neutral ? .neutral : .warn)
+      // Alerts is behind the client's closed expand, and a failing camera view
+      // is otherwise a black screen under "Capturing".
+      if model.groups.contains(where: { $0.id == "Alerts" }) {
+        Chip("alert", tone: .warn)
+      }
+    }
     if model.dropFraction > 0.2 {
       Chip("\(Int(model.dropFraction * 100))% dropped", tone: .warn)
     }
@@ -446,7 +518,13 @@ struct DashboardView: View {
 
   private var expandButton: some View {
     Button {
-      withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+      withAnimation(.easeInOut(duration: 0.18)) {
+        if model.modelOn {
+          modelExpanded.toggle()
+        } else {
+          clientExpanded.toggle()
+        }
+      }
     } label: {
       Image(
         systemName: expanded
