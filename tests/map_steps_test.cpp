@@ -269,8 +269,9 @@ double rotation_entry(const glm::dmat4& a, const glm::dmat4& b) {
   return worst;
 }
 
-// @p pose as ARKit hands one over: each rotation entry off by up to 4.4e-7
-// (a fixed pseudo-random pattern per frame), as its float rotations are.
+// @p pose as ARKit's float rotations leave it: each rotation entry off by up to
+// 4.4e-7 (a fixed pseudo-random pattern per frame). Harsher than the poses
+// MapSteps takes, which sensor has made exact since 0.46.0.
 glm::dmat4 as_arkit_gives(const glm::dmat4& pose, std::uint32_t frame) {
   std::uint32_t state = frame * 2654435761u + 1u;
   glm::dmat4 out = pose;
@@ -284,7 +285,7 @@ glm::dmat4 as_arkit_gives(const glm::dmat4& pose, std::uint32_t frame) {
   return out;
 }
 
-/// Many steps on ARKit's slightly non-orthonormal rotations: each logged
+/// Many steps on slightly non-orthonormal rotations: each logged
 /// raw_from_sent stays rigid to rounding, within 1e-12 of orthonormal, and
 /// the step math holds: every step found where it happened, every pose sent
 /// within 1 mm and 0.05 deg of the hand, and the log rebuilding every pose
@@ -344,7 +345,7 @@ TEST(MapSteps, ManyStepsStayRigid) {
   }
   EXPECT_LT(worst_mm, 1.0);
   EXPECT_LT(worst_entry, 8.7e-4);
-  // A step's own frame is rebuilt only as well as ARKit's rotations are
+  // A step's own frame is rebuilt only as well as these rotations are
   // rigid: 4.4e-7 off, 30 m from the world's origin, is 0.013 mm.
   EXPECT_LT(worst_rebuilt_mm, 0.1);
   EXPECT_LT(worst_rebuilt_entry, 1e-5);

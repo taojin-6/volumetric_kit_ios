@@ -25,8 +25,8 @@ glm::dmat4 rigid_inverse(const glm::dmat4& m) {
 
 // @p m with its rotation made the nearest rotation, its translation kept: the
 // polar decomposition's rotation, by Newton steps R <- (R + R^-T) / 2. Each
-// step squares the error, so the three here take ARKit's 4.4e-7 to rounding.
-// The identity stays exact.
+// step squares the error, so the three here take a float rotation's 4.4e-7 to
+// rounding. The identity stays exact.
 glm::dmat4 orthonormalized(const glm::dmat4& m) {
   glm::dmat3 r(m);
   for (int i = 0; i < 3; ++i) {
