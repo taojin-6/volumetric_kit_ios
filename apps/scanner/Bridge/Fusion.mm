@@ -229,10 +229,8 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
     //
     // Note this block can only clear what *this* object owns. A renderer that
     // has already taken a mesh keeps naming those buffers until its next
-    // successful take, so a genuine mid-session restart also needs the consumer
-    // to drop what it holds. Nothing wires that today because `start` is called
-    // exactly once, from -initWithLayer: -- which is a property of the caller,
-    // not of this method, and is why the rest of this is worth doing now.
+    // successful take, so a restart also needs the consumer to drop what it
+    // holds, which -setModelOn: does before `release`.
   }
   last_fuse_ns_.store(0, std::memory_order_relaxed);
   // With the same reasoning, and `gpu_timing_seen_` most of all: it is a
@@ -395,6 +393,24 @@ vkc::Status Fusion::start(vkc::Device& device, vkc::Allocator& allocator,
   texturer_.emplace(std::move(texturer).value());
 
   return vkc::Status();
+}
+
+void Fusion::release() {
+  texturer_.reset();
+  marching_cubes_.reset();
+  integrator_.reset();
+  grid_.reset();
+  prep_.reset();
+  const std::lock_guard<std::mutex> lock(mutex_);
+  // `mesh_version_` stays, for the reason `start` gives.
+  mesh_ = vgrid::mesh::DeviceMesh{};
+  published_keyframe_ = sensor::YuvImage{};
+  published_generation_ = 0;
+  published_taken_ = true;
+  consumer_released_ = 0;
+  stats_ = FusionStats{};
+  history_next_ = 0;
+  last_pose_ = sensor::Mat4f{1.0f};
 }
 
 std::optional<FuseTimes> Fusion::fuse(const sensor::RgbdFrame& frame,

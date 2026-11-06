@@ -24,6 +24,7 @@
 #import "Readout.hpp"
 #import "RendererErrors.hpp"
 #import "RendererImpl.hpp"
+#import "ScannerMode.hpp"
 #import "StatTone.hpp"
 #import "ThermalState.hpp"
 #import "ViewOrientation.hpp"
@@ -248,6 +249,9 @@ app::ReadoutInputs readout_inputs(const app::RendererImpl& impl,
   in.mesh_upload_error = impl.mesh_upload_error;
   in.atlas_failures = impl.atlas_failures;
   in.atlas_error = impl.atlas_error;
+  in.mode = impl.mode;
+  in.camera_view_failures = impl.camera_view_failures;
+  in.camera_view_error = impl.camera_view_error;
   in.memory_warnings = impl.memory_warnings;
   in.memory_warning_footprint_bytes = impl.memory_warning_footprint_bytes;
   return in;
@@ -366,15 +370,105 @@ void take_camera(app::RendererImpl& impl) {
   }
 }
 
+// --- The on-device model -----------------------------------------------------
+
+/// The model's allocator, then fusion on it: the grid, meshing and texturing.
+vkc::Status start_model(app::RendererImpl& impl) {
+  vkc::Result<vkc::Allocator> allocator = vkc::Allocator::create(
+      impl.shared->instance().handle(), *impl.compute_device);
+  if (!allocator) {
+    return allocator.status();
+  }
+  impl.compute_allocator.emplace(std::move(allocator).value());
+  return impl.fusion.start(*impl.compute_device, *impl.compute_allocator,
+                           impl.fusion_config);
+}
+
+/// Everything the model holds let go, the renderer's half first: no frame in
+/// flight and no fuse thread reads any of it (-setModelOn:), so its slots and
+/// sets may change, and its arenas and grid, then its allocator's blocks, go.
+/// A later start begins as the first did, but for the mesh version, which
+/// stays monotonic (Fusion::start).
+void free_model(app::RendererImpl& impl) {
+  for (app::AtlasSlot& slot : impl.atlas.slots) {
+    (void)app::bind_keyframe(slot, app::Keyframe{}, impl.atlas_texture.view());
+  }
+  for (vgrid::mesh::DeviceMesh& mesh : impl.mesh_slots) {
+    mesh = vgrid::mesh::DeviceMesh{};
+  }
+  impl.have_mesh = false;
+  impl.mesh_unusable = false;
+  impl.newest_taken_generation = 0;
+  for (std::uint64_t& generation : impl.frame_generations) {
+    generation = 0;
+  }
+  impl.mesh_upload_failures = 0;
+  impl.mesh_upload_error.clear();
+  impl.atlas_failures = 0;
+  impl.atlas_error.clear();
+  impl.fusion.release();
+  impl.compute_allocator.reset();
+}
+
+/// Submit and present @p f: a frame's end, in either mode.
+BOOL end_frame(app::RendererImpl& impl, const vg::windowing::Frame& f,
+               NSError** error) {
+  const vkc::Status end = impl.app.end_frame(f);
+  if (!end.ok()) {
+    // A stale swapchain is the normal signal that the drawable changed size;
+    // the next begin_frame rebuilds. Only a genuine error propagates.
+    if (!vg::windowing::swapchain_stale(end)) {
+      // The frame may not have run, so what it recorded for the camera view
+      // may not have happened.
+      impl.camera_view.texture.discard();
+      // Dumped here as well as out of begin_frame. gfx reports a vkQueueSubmit
+      // or present failure from this call, and a VK_ERROR_DEVICE_LOST is a
+      // normal way MoltenVK surfaces one -- `swapchain_stale` matches only
+      // OUT_OF_DATE and SUBOPTIMAL, so a lost device took this path and threw
+      // the whole ring away in silence. ScannerViewController suspends the
+      // loop on the NO below, so the 24 entries would die with _impl.
+      impl.trace.dump(app::describe(end, "end_frame").c_str());
+      app::set_error(error, end, "end_frame");
+      return NO;
+    }
+    return YES;
+  }
+  ++impl.frames_presented;
+  return YES;
+}
+
+/// The client's frame: the camera's newest picture, or the one before.
+BOOL draw_client_frame(app::RendererImpl& impl, const vg::windowing::Frame& f,
+                       VkExtent2D extent, NSError** error) {
+  // A read that failed is a lost device, which the next begin_frame reports;
+  // until then the picture stays held.
+  const vkc::Result<std::uint64_t> completed =
+      impl.app.frame_loop().completed();
+  const vkc::Status updated =
+      app::update_camera_view(impl.camera_view, impl.app.allocator(), f.cmd,
+                              f.number, completed ? completed.value() : 0);
+  if (!updated.ok()) {
+    ++impl.camera_view_failures;
+    impl.camera_view_error = std::string(updated.message());
+  }
+  vg::RenderTargetBeginInfo begin{};
+  begin.load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  begin.clear_color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+  f.target->begin(f.cmd, begin);
+  app::draw_camera_view(impl.camera_view, f.cmd, extent);
+  f.target->end(f.cmd);
+  return end_frame(impl, f, error);
+}
+
 }  // namespace
 
 @interface VolumetricCameraStatus ()
-- (instancetype)initWithImpl:(const app::RendererImpl&)impl;
+- (instancetype)initWithImpl:(app::RendererImpl&)impl;
 @end
 
 @implementation VolumetricCameraStatus
 
-- (instancetype)initWithImpl:(const app::RendererImpl&)impl {
+- (instancetype)initWithImpl:(app::RendererImpl&)impl {
   self = [super init];
   if (self == nil) {
     return nil;
@@ -434,7 +528,10 @@ void take_camera(app::RendererImpl& impl) {
     _fusionSkipped = o.fusion_skipped;
   }
   if (impl.stream) {
-    _streamBusy = impl.stream->stats().busy;
+    const app::RgbdStreamSenderStats sent = impl.stream->stats();
+    _streamBusy = sent.busy;
+    _streamFps = impl.stream_rate.take(sent.coded,
+                                       static_cast<double>(steady_ns()) * 1e-9);
   }
   return self;
 }
@@ -451,6 +548,7 @@ void take_camera(app::RendererImpl& impl) {
                             recordPath:(nullable NSString*)recordPath
                                 dryRun:(BOOL)dryRun
                              failOpens:(uint32_t)failOpens
+                               modelOn:(BOOL)modelOn
                                  error:(NSError**)error {
   self = [super init];
   if (self == nil) {
@@ -465,6 +563,8 @@ void take_camera(app::RendererImpl& impl) {
   }
   const auto& settings = loaded.value();
   _impl = std::make_unique<app::RendererImpl>();
+  _impl->mode =
+      modelOn == YES ? app::ScannerMode::Model : app::ScannerMode::Client;
 
   // --- One VkDevice, adopted by both libraries ------------------------------
   // Not an optimisation: a VkBuffer is valid only on the VkDevice that created
@@ -584,21 +684,6 @@ void take_camera(app::RendererImpl& impl) {
   }
   _impl->compute_device.emplace(std::move(compute_device).value());
 
-  // The volume, mesh arena, staging buffers and imported pictures come from
-  // their own VMA allocator on the shared device -- separate accounting from
-  // gfx's, one device underneath.
-  vkc::Result<vkc::Allocator> compute_allocator = vkc::Allocator::create(
-      _impl->shared->instance().handle(), *_impl->compute_device);
-  if (!compute_allocator) {
-    // Its own Status, unflattened: an allocator failure on a user's phone is
-    // out-of-memory or a VkResult, and reporting it as "unsupported" would read
-    // as a capability the driver lacks.
-    app::set_error(error, compute_allocator.status(),
-                   "compute Allocator::create");
-    return nil;
-  }
-  _impl->compute_allocator.emplace(std::move(compute_allocator).value());
-
   VkDevice device = _impl->app.device().handle();
   vkc::Result<vg::ShaderModule> vert = vg::ShaderModule::create(
       device, reinterpret_cast<const std::uint32_t*>(vi_triangle_vert_spv),
@@ -693,7 +778,18 @@ void take_camera(app::RendererImpl& impl) {
     _impl->atlas.slots[i].set = std::move(slot_set).value();
   }
 
-  app::FusionConfig fusion_config;
+  // The camera view's pipeline, in either mode: the switch reaches the client
+  // later, and only the image it draws is worth leaving out of the model.
+  vkc::Result<vg::pipelines::ImagePipeline> image_pipeline =
+      vg::pipelines::ImagePipeline::create(_impl->app.device(),
+                                           _impl->app.swapchain().layout());
+  if (!image_pipeline) {
+    app::set_error(error, image_pipeline.status(), "ImagePipeline::create");
+    return nil;
+  }
+  _impl->camera_view.pipeline = std::move(image_pipeline).value();
+
+  app::FusionConfig& fusion_config = _impl->fusion_config;
   fusion_config.voxel_size = settings.fusion.voxel_size_m;
   fusion_config.trunc_dist = settings.fusion.truncation_m;
   fusion_config.num_buckets = settings.fusion.buckets;
@@ -718,13 +814,15 @@ void take_camera(app::RendererImpl& impl) {
   fusion_config.queue_families[1] = _impl->shared->graphics_family();
   fusion_config.queue_family_count = 2;
 
-  const vkc::Status fusion_started = _impl->fusion.start(
-      *_impl->compute_device, *_impl->compute_allocator, fusion_config);
-  if (!fusion_started) {
-    // Likewise: Fusion::start commits the volume, so its usual failure is an
-    // OutOfMemory that must reach Swift as one.
-    app::set_error(error, fusion_started, "Fusion::start");
-    return nil;
+  if (app::mode_plan(_impl->mode).grid) {
+    const vkc::Status model_started = start_model(*_impl);
+    if (!model_started) {
+      // Its own Status, unflattened: it commits the volume, so its usual
+      // failure is an OutOfMemory that must reach Swift as one, and reporting
+      // it as "unsupported" would read as a capability the driver lacks.
+      app::set_error(error, model_started, "the on-device model");
+      return nil;
+    }
   }
 
   // --- The camera, last ------------------------------------------------------
@@ -806,6 +904,10 @@ void take_camera(app::RendererImpl& impl) {
     return YES;
   }
   const vg::windowing::Frame& f = *frame.value();
+
+  if (app::mode_plan(_impl->mode).camera_view) {
+    return draw_client_frame(*_impl, f, extent, error);
+  }
 
   // Claimed here, not at the top of the tick: the window should hold the last
   // kCapacity frames that actually *drew*, not the last kCapacity calls. A
@@ -1164,25 +1266,7 @@ void take_camera(app::RendererImpl& impl) {
 
   f.target->end(f.cmd);
 
-  const vkc::Status end = _impl->app.end_frame(f);
-  if (!end.ok()) {
-    // A stale swapchain is the normal signal that the drawable changed size;
-    // the next begin_frame rebuilds. Only a genuine error propagates.
-    if (!vg::windowing::swapchain_stale(end)) {
-      // Dumped here as well as out of begin_frame. gfx reports a vkQueueSubmit
-      // or present failure from this call, and a VK_ERROR_DEVICE_LOST is a
-      // normal way MoltenVK surfaces one -- `swapchain_stale` matches only
-      // OUT_OF_DATE and SUBOPTIMAL, so a lost device took this path and threw
-      // the whole ring away in silence. ScannerViewController suspends the
-      // loop on the NO below, so the 24 entries would die with _impl.
-      _impl->trace.dump(app::describe(end, "end_frame").c_str());
-      app::set_error(error, end, "end_frame");
-      return NO;
-    }
-    return YES;
-  }
-  ++_impl->frames_presented;
-  return YES;
+  return end_frame(*_impl, f, error);
 }
 
 - (void)dealloc {
@@ -1294,6 +1378,44 @@ void take_camera(app::RendererImpl& impl) {
 
 - (VolumetricCameraStatus*)cameraStatus {
   return [[VolumetricCameraStatus alloc] initWithImpl:*_impl];
+}
+
+- (BOOL)modelOn {
+  return app::mode_plan(_impl->mode).grid ? YES : NO;
+}
+
+- (NSString*)modeName {
+  return app::to_ns_string(app::to_string(_impl->mode));
+}
+
+- (BOOL)setModelOn:(BOOL)on error:(NSError**)error {
+  app::RendererImpl& impl = *_impl;
+  const app::ScannerMode mode =
+      on == YES ? app::ScannerMode::Model : app::ScannerMode::Client;
+  if (impl.mode == mode) {
+    return YES;
+  }
+  if (!app::mode_plan(mode).grid) {
+    free_model(impl);
+  } else {
+    const vkc::Status started = start_model(impl);
+    if (!started) {
+      free_model(impl);
+      app::set_error(error, started, "the on-device model");
+      return NO;
+    }
+    // Made again at the client's first picture.
+    impl.camera_view.texture = vg::pipelines::ImageTexture{};
+    impl.camera_view_failures = 0;
+    impl.camera_view_error.clear();
+  }
+  impl.mode = mode;
+  return YES;
+}
+
++ (NSInteger)cameraViewQuarterTurns:(VolumetricViewOrientation)orientation {
+  return app::picture_quarter_turns(
+      static_cast<app::ViewOrientation>(orientation));
 }
 
 - (void*)streamHandle {
@@ -1411,6 +1533,11 @@ void take_camera(app::RendererImpl& impl) {
 
 + (NSString*)thermalState {
   return app::to_ns_string(app::thermal_state());
+}
+
++ (VolumetricStatTone)thermalTone {
+  return static_cast<VolumetricStatTone>(
+      app::thermal_tone(app::thermal_state()));
 }
 
 + (VolumetricStatTone)toneForFraction:(double)fraction
@@ -1540,6 +1667,8 @@ void take_camera(app::RendererImpl& impl) {
   if (_impl->shared) {
     _impl->shared->wait_idle();
   }
+  // No frame has it now, and none may keep the camera's picture while stopped.
+  _impl->camera_view.picture.clear();
 }
 
 - (NSString*)deviceName {

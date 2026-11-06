@@ -62,4 +62,26 @@ TEST(ViewOrientation, UpsideDownIsAQuarterTurnNegative) {
                   -kQuarter);
 }
 
+/// The picture's turn on screen, as numbers: a back-camera portrait frame is
+/// EXIF orientation 6, a quarter turn clockwise to stand upright.
+TEST(PictureQuarterTurns, StandsThePictureUpright) {
+  EXPECT_EQ(app::picture_quarter_turns(ViewOrientation::LandscapeRight), 0);
+  EXPECT_EQ(app::picture_quarter_turns(ViewOrientation::Portrait), 1);
+  EXPECT_EQ(app::picture_quarter_turns(ViewOrientation::LandscapeLeft), 2);
+  EXPECT_EQ(app::picture_quarter_turns(ViewOrientation::PortraitUpsideDown), 3);
+}
+
+/// One turn, said two ways: the measured render-camera turn and this one.
+TEST(PictureQuarterTurns, IsTheViewportTurnInQuarters) {
+  for (const ViewOrientation orientation :
+       {ViewOrientation::LandscapeLeft, ViewOrientation::Portrait,
+        ViewOrientation::LandscapeRight, ViewOrientation::PortraitUpsideDown}) {
+    const float turn = viewport_turn(orientation);
+    const float quarters =
+        static_cast<float>(app::picture_quarter_turns(orientation)) * kQuarter;
+    EXPECT_NEAR(std::remainder(turn - quarters, 2.0f * glm::pi<float>()), 0.0f,
+                1e-5f);
+  }
+}
+
 }  // namespace

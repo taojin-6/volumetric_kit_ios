@@ -37,6 +37,7 @@ function(vi_add_scanner_bridge bridge_target)
     Bridge/AllocationStopDisplay.mm
     Bridge/AtlasRing.cpp
     Bridge/BridgeStrings.mm
+    Bridge/CameraView.cpp
     Bridge/FrameTrace.cpp
     Bridge/FuseLoop.cpp
     Bridge/Fusion.mm

@@ -38,4 +38,10 @@ float viewport_turn(ViewOrientation orientation) noexcept {
   return -quarter_turns * glm::half_pi<float>();
 }
 
+int picture_quarter_turns(ViewOrientation orientation) noexcept {
+  return (static_cast<int>(kSensorBasisOrientation) -
+          static_cast<int>(orientation) + 4) %
+         4;
+}
+
 }  // namespace volumetric_kit::ios_app

@@ -3,8 +3,8 @@
 
 /// @file ScannerLaunch.h
 /// @brief What a scanner launch's arguments ask of the camera and its
-///        stream: `-source camera|pattern`, `-minutes N`, `-record <name>`,
-///        `-connect <address>`, `-dry` and `-fail-opens N`
+///        stream: `-source camera|pattern`, `-model`, `-minutes N`,
+///        `-record <name>`, `-connect <address>`, `-dry` and `-fail-opens N`
 ///        (`Core/CaptureReport.hpp`'s `launch_options`).
 
 #import <Foundation/Foundation.h>
@@ -31,6 +31,9 @@ typedef NS_ENUM(NSInteger, VolumetricCameraSource) {
 
 /// The source the arguments name.
 @property(nonatomic, readonly) VolumetricCameraSource source;
+/// `-model`: start with the on-device model (`Core/ScannerMode.hpp`), not as
+/// the client.
+@property(nonatomic, readonly) BOOL model;
 /// Minutes the scanner runs before it stops and exits; 0 runs on.
 @property(nonatomic, readonly) uint32_t minutes;
 /// The session file the stream writes, a plain name in the app's Documents;

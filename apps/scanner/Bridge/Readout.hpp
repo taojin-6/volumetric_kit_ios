@@ -23,6 +23,7 @@
 
 #import "Fusion.hpp"
 #import "MemoryQuery.hpp"
+#import "ScannerMode.hpp"
 
 #include <cstdint>
 #include <string>
@@ -78,6 +79,9 @@ struct ReadoutInputs {
   const MemoryBudget& budget;
   /// Metal's recommended working-set ceiling, or 0 when unavailable.
   std::uint64_t gpu_working_set_bytes = 0;
+  /// Which sections the read-out carries (`section_shown`), and whether it
+  /// says anything of fused frames.
+  ScannerMode mode = ScannerMode::Client;
 
   // --- Counters that are not in FusionStats --------------------------------
   // The upload is the render thread's stage and the memory warning arrives on
@@ -93,6 +97,9 @@ struct ReadoutInputs {
   /// mesh fault's message on the very next frame.
   std::uint64_t atlas_failures = 0;
   std::string atlas_error;
+  /// Pictures the camera view could not draw, and why the last.
+  std::uint64_t camera_view_failures = 0;
+  std::string camera_view_error;
   /// The OS's own warning, and what the process held when it last fired.
   std::uint64_t memory_warnings = 0;
   std::uint64_t memory_warning_footprint_bytes = 0;
@@ -109,6 +116,7 @@ NSArray<VolumetricStageRow*>* stage_rows(const FusionStats& s);
 /// `Extract phases` appear only when `FusionConfig::measure_stages` is off:
 /// with it on, both arrive as stage rows, and a section carrying them
 /// as well would draw and print every figure twice. See where they are built.
+/// The client carries only the sections `section_shown` keeps.
 ///
 /// Every figure the read-out has is in here, including the ones the panel draws
 /// as a bar rather than a row -- those are marked with

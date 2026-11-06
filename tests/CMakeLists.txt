@@ -44,9 +44,12 @@ add_executable(
   orbit_camera_test.cpp
   picture_slot_test.cpp
   rate_gate_test.cpp
+  scanner_mode_test.cpp
   self_test_test.cpp
   stat_tone_test.cpp
-  view_orientation_test.cpp)
+  stream_rate_test.cpp
+  view_orientation_test.cpp
+  view_picture_test.cpp)
 
 find_package(Threads REQUIRED)
 target_link_libraries(vi_core_tests PRIVATE vi_core GTest::gtest_main

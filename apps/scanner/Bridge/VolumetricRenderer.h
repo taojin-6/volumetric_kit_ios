@@ -582,6 +582,9 @@ typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
 /// taken, so one late picture counts every camera frame that came meanwhile:
 /// a sign of a slow copy or coder, not a count of stream frames lost.
 @property(nonatomic, readonly) uint64_t streamBusy;
+/// Pictures the stream coded a second, over its last whole window
+/// (`Core/StreamRate.hpp`); 0 with no sender.
+@property(nonatomic, readonly) double streamFps;
 @end
 
 /// @brief Owns the renderer bring-up chain and draws one frame on demand.
@@ -625,6 +628,9 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// @param failOpens  `-fail-opens N` (`Core/CaptureReport.hpp`'s
 ///                   `LaunchOptions::fail_opens`), the pattern alone; 0 for
 ///                   none.
+/// @param modelOn  `-model`: start with the on-device model. `NO` is the client
+///                 (`Core/ScannerMode.hpp`): no grid or mesh arena is made, and
+///                 the camera's picture is what is drawn.
 /// @param error  Populated with the failing step's message on failure.
 /// @return The renderer, or `nil`.
 - (nullable instancetype)initWithLayer:(CAMetalLayer*)layer
@@ -633,12 +639,45 @@ NS_SWIFT_NAME(VolumetricRenderer)
                             recordPath:(nullable NSString*)recordPath
                                 dryRun:(BOOL)dryRun
                              failOpens:(uint32_t)failOpens
+                               modelOn:(BOOL)modelOn
                                  error:(NSError**)error
     NS_DESIGNATED_INITIALIZER;
 
 - (instancetype)init NS_UNAVAILABLE;
 
+/// Whether the on-device model runs: fusion, meshing and the model drawn. When
+/// not, the renderer is the client and draws the camera's picture.
+@property(nonatomic, readonly) BOOL modelOn;
+
+/// The mode as the console names it: "client" or "model".
+@property(nonatomic, readonly, copy) NSString* modeName;
+
+/// @brief Build the on-device model, or free it, memory and all.
+///
+/// The stream's session is not touched: it goes on as the next -startFusion
+/// starts the camera again.
+///
+/// @pre @ref stopFusion and @ref waitIdle have returned and nothing renders:
+///      this frees what the frames in flight and the fuse thread read. Building
+///      compiles the compute pipelines and commits the first grid, as bring-up
+///      does, so call it off the main thread.
+/// @param on  Whether the model runs from here. As it is already, nothing
+///            happens.
+/// @param error  Why the model did not build; the renderer is then still the
+///               client, with nothing of the model left.
+/// @return Whether the mode is now the one asked for.
+- (BOOL)setModelOn:(BOOL)on error:(NSError**)error;
+
+/// @brief The camera's picture's turn on screen, in clockwise quarter turns,
+///        0 to 3 (`Core/ViewOrientation.hpp`'s `picture_quarter_turns`): gfx
+///        draws the picture unturned, so the layer turns by this in the client.
++ (NSInteger)cameraViewQuarterTurns:(VolumetricViewOrientation)orientation
+    NS_SWIFT_NAME(cameraViewQuarterTurns(for:));
+
 /// @brief Start the camera, then fuse its frames on a background thread.
+///
+/// In the client that thread sends the frames to the stream and the camera
+/// view, and nothing fuses (`Bridge/FuseLoop.hpp`).
 ///
 /// Fusion runs off the render thread so a slow remesh does not stall
 /// presentation. They still *serialize on the GPU* — iOS gives one queue, so
@@ -926,6 +965,9 @@ NS_SWIFT_NAME(VolumetricRenderer)
 /// The device's thermal state (`NSProcessInfo.thermalState`) as the console
 /// lines name it: "nominal", "fair", "serious" or "critical", or "unknown".
 @property(class, nonatomic, readonly, copy) NSString* thermalState;
+
+/// The tone @ref thermalState reads as (`Core/StatTone.hpp`'s `thermal_tone`).
+@property(class, nonatomic, readonly) VolumetricStatTone thermalTone;
 
 /// @brief The tone @p fraction reads as against @p thresholds.
 ///

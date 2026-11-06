@@ -26,9 +26,12 @@
 
 #include "AtlasRing.hpp"
 #include "CameraOpen.hpp"
+#include "CameraView.hpp"
 #include "FrameTrace.hpp"
 #include "Fusion.hpp"
 #include "OrbitCamera.hpp"
+#include "ScannerMode.hpp"
+#include "StreamRate.hpp"
 #include "ViewOrientation.hpp"
 #include "rgbd_stream_sender.hpp"
 
@@ -157,7 +160,11 @@ struct RendererImpl {
   // has no public default constructor -- which is the invariant working, not an
   // inconvenience. There is no such thing as an empty one to default-construct.
   std::optional<volumetric_kit::core::Device> compute_device;
+  // Fusion's alone, so it exists with the model and its blocks go with it.
   std::optional<volumetric_kit::core::Allocator> compute_allocator;
+  // How the scanner runs (Core/ScannerMode.hpp). Set at bring-up, and by
+  // -setModelOn: while no fuse thread and no frame runs.
+  ScannerMode mode = ScannerMode::Client;
 
   // --- The camera ------------------------------------------------------------
   // The fuse thread's wake-up. Before the camera, which calls it from its own
@@ -197,14 +204,20 @@ struct RendererImpl {
   // thread. Null when it did not open, `stream_error` saying why.
   std::unique_ptr<RgbdStreamSender> stream;
   std::string stream_error;
+  // The stream's frames per second for the panel. Main thread.
+  StreamRate stream_rate;
   /// The session file's path, empty for none: never said on the console or
   /// the screen (`without_path`).
   std::string record_path;
 
   // --- Reconstruction ------------------------------------------------------
+  // Started with the model, and empty in the client (`Fusion::valid`).
   Fusion fusion;
+  // How it starts: what -setModelOn: builds it from.
+  FusionConfig fusion_config;
   // Polls the camera, offers the stream every frame and fusion's worker the
-  // newest, and ends the worker before it ends (Bridge/FuseLoop.hpp).
+  // newest, or the camera view in the client, and ends the worker before it
+  // ends (Bridge/FuseLoop.hpp).
   std::thread fuse_thread;
   std::atomic<bool> fusing{false};
 
@@ -236,6 +249,10 @@ struct RendererImpl {
   // than only into the text summary.
   std::uint64_t atlas_failures = 0;
   std::string atlas_error;
+  // Pictures the camera view could not draw, and why the last: the view keeps
+  // the picture before, so a refusal is a stale view rather than a dead one.
+  std::uint64_t camera_view_failures = 0;
+  std::string camera_view_error;
   // Memory warnings the OS pushed at us, and what the process was holding the
   // last time one arrived. See -noteMemoryWarning. Plain values rather than
   // atomics for the same reason the counter above is: UIKit delivers the
@@ -335,6 +352,9 @@ struct RendererImpl {
   /// of the teardown note above. The pictures are images sensor imported on
   /// `compute_device`, which is declared before both and outlives them.
   AtlasRing atlas;
+  /// What the client draws. After `app` for the same reason as the ring; its
+  /// picture is an image on `compute_device` as well.
+  CameraView camera_view;
   // The newest generation take_mesh has handed over, drawn or not. What the
   // release logic falls back to when *no* frame is holding a generation: the
   // per-frame minimum says nothing then, and without this the generations taken
