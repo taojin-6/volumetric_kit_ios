@@ -24,9 +24,9 @@
 /// pose with every step so far taken out. Until the first step, a pose comes
 /// back as it was given, bit for bit. Each step's `raw_from_sent` is rigid to
 /// rounding however many steps there are: its rotation is made the nearest
-/// rotation as the step is composed, since ARKit's float rotations are up to
-/// 4.4e-7 off orthonormal, and composed as they are the error would grow
-/// about threefold a step.
+/// rotation as the step is composed, since a step inverted by its transpose
+/// multiplies any error about threefold, and even poses exact to double's
+/// rounding would pass 1e-6 after about 20 steps.
 ///
 /// A run of steps lasting longer than @ref MapSteps::kMaxStepNs is not one of
 /// ARKit's, whose steps last a few frames, but motion, such as a bump or the

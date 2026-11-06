@@ -165,6 +165,8 @@ void report(RendererImpl& impl, const sensor::testing::RgbdContract& contract,
   r.withheld = status.withheld;
   r.refused = status.refused;
   r.missed = status.missed;
+  r.imported = status.pictures_imported;
+  r.surfaces = status.surfaces_made;
   // Copied, so the windows keep their capacity for the next one.
   r.poll_ms = window.poll_ms;
   window.poll_ms.clear();

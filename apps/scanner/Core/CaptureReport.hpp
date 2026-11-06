@@ -113,6 +113,11 @@ struct CaptureReport {
   std::uint64_t withheld = 0;   ///< `ArkitStatus::withheld`, part of failed.
   std::uint64_t refused = 0;    ///< `ArkitStatus::refused`, part of failed.
   std::uint64_t missed = 0;     ///< `ArkitStatus::missed`.
+  /// Pictures that came to the importer, and the surfaces whose images they
+  /// made (`ArkitStatus::pictures_imported`, `surfaces_made`): since the
+  /// open, so a resume does not start them again.
+  std::uint64_t imported = 0;
+  std::uint64_t surfaces = 0;
   std::uint64_t fused = 0;  ///< Frames fused since the start; 0 in the client.
   /// Frames the on-device model let go unfused since the start, a newer one
   /// having come while it fused (`FrameFanout::Counts::skipped`); 0 in the
@@ -145,10 +150,11 @@ struct CaptureReport {
 };
 
 /// @return @p report as one line, "sa <source> <seconds> s: ..." ("sa stop"
-///         at a stop): tracking; the counters; frames fused and skipped; the
-///         thermal state; when the first frame came; poll, fuse and prep ms at
-///         p50 and p95 over the window, with their counts; the colour codes;
-///         the contract; for the pattern, the index check; and the mode.
+///         at a stop): tracking; the counters; pictures imported and surfaces
+///         made; frames fused and skipped; the thermal state; when the first
+///         frame came; poll, fuse and prep ms at p50 and p95 over the window,
+///         with their counts; the colour codes; the contract; for the pattern,
+///         the index check; and the mode.
 std::string capture_report_line(const CaptureReport& report);
 
 /// @brief The stream's part of a window, as its console line says it: the

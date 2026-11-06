@@ -157,11 +157,11 @@ std::string capture_report_line(const CaptureReport& r) {
                 r.tracking.empty() ? "-" : r.tracking.c_str(),
                 r.interrupted ? ", interrupted" : "");
   std::string line = head;
-  char counts[256];
+  char counts[336];
   std::snprintf(counts, sizeof counts,
                 " | received %llu delivered %llu dropped %llu failed %llu "
-                "(withheld %llu refused %llu) missed %llu | fused %llu "
-                "skipped %llu",
+                "(withheld %llu refused %llu) missed %llu | imported %llu "
+                "surfaces %llu | fused %llu skipped %llu",
                 static_cast<unsigned long long>(r.received),
                 static_cast<unsigned long long>(r.delivered),
                 static_cast<unsigned long long>(r.dropped),
@@ -169,6 +169,8 @@ std::string capture_report_line(const CaptureReport& r) {
                 static_cast<unsigned long long>(r.withheld),
                 static_cast<unsigned long long>(r.refused),
                 static_cast<unsigned long long>(r.missed),
+                static_cast<unsigned long long>(r.imported),
+                static_cast<unsigned long long>(r.surfaces),
                 static_cast<unsigned long long>(r.fused),
                 static_cast<unsigned long long>(r.skipped));
   line += counts;

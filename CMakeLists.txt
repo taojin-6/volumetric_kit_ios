@@ -167,11 +167,11 @@ find_package(glm CONFIG REQUIRED)
 FetchContent_Declare(
   volumetric_kit_sensor
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_sensor.git
-  GIT_TAG f0d920822749c2378de89edcdce693d8b8f2ad0a) # sensor #52 (0.44.0)
+  GIT_TAG d7e192f1da225e83b8c4975c9d1dfa4c49d0e1a3) # sensor #55 (0.47.0)
 FetchContent_MakeAvailable(volumetric_kit_sensor)
 vkc_require_sibling(
   volumetric_kit::sensor
-  0.44.0
+  0.47.0
   TARGETS
   volumetric_kit::sensor_interface
   volumetric_kit::sensor_apple

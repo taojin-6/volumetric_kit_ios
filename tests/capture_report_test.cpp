@@ -195,6 +195,8 @@ CaptureReport pattern_report() {
   r.received = 601;
   r.delivered = 600;
   r.dropped = 1;
+  r.imported = 603;
+  r.surfaces = 4;
   r.fused = 600;
   r.skipped = 40;
   r.thermal = "fair";
@@ -217,8 +219,8 @@ TEST(CaptureReportLine, CarriesCountsTimesStatesAndCodes) {
   EXPECT_EQ(line.rfind("sa pattern 10.0 s: tracking normal | ", 0), 0u) << line;
   EXPECT_TRUE(has(line,
                   "received 601 delivered 600 dropped 1 failed 0 (withheld 0 "
-                  "refused 0) missed 0 | fused 600 skipped 40 | thermal fair "
-                  "| first frame 0.02 s | "))
+                  "refused 0) missed 0 | imported 603 surfaces 4 | fused 600 "
+                  "skipped 40 | thermal fair | first frame 0.02 s | "))
       << line;
   // Nearest rank: p50 of four is the second, p95 the fourth.
   EXPECT_TRUE(has(line, "poll ms p50 0.200 p95 0.400 (4)")) << line;
