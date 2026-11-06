@@ -271,12 +271,14 @@ xcrun devicectl device process launch --console --device <id> \
 
 Every 10 s the fuse thread prints one `sa` line of counts, times, states and
 colour codes, never a pixel, a depth value, a pose or a path: the camera's
-tracking and counters (`SensorStats`, `ArkitStatus`), frames fused and frames
-fusion skipped (a newer one came while it fused), the device's thermal state,
-seconds to the first frame, poll and fuse (prep + allocate + integrate)
-milliseconds at p50 and p95 over the window, the picture's H.273 colour codes,
-sensor's frame contract (`testing::RgbdContract`), and for the pattern how
-many frames carried their own index. Each stop prints an `sa stop` line, a
+tracking and counters (`SensorStats`, `ArkitStatus`), pictures imported and
+surfaces made since the camera opened (a pool keeps surfaces near its size),
+frames fused and frames fusion skipped (a newer one came while it fused), the
+device's thermal state, seconds to the first frame, poll and fuse (prep +
+allocate + integrate) milliseconds at p50 and p95 over the window, the
+picture's H.273 colour codes, sensor's frame contract
+(`testing::RgbdContract`), and for the pattern how many frames carried their
+own index. Each stop prints an `sa stop` line, a
 lock or backgrounding as well as the run's end; the next start counts its
 seconds and counters from 0 again, so its first frame says how soon the camera
 came back. Beside it an `st` line says what the stream did: `dry` or
