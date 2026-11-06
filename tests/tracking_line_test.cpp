@@ -24,7 +24,7 @@ TEST(TrackingLine, EachLostStateHasItsWordsAtWarnAndPausesTheStream) {
                            Lost{"initializing", "Initializing"},
                            Lost{"excessive motion", "Moving too fast"},
                            Lost{"insufficient features", "Too little in view"},
-                           Lost{"not available", "No tracking yet"}}) {
+                           Lost{"not available", "No tracking"}}) {
     const app::TrackingLine line = app::tracking_line(lost.name, false, true);
     EXPECT_EQ(line.text, lost.words);
     EXPECT_EQ(line.tone, StatTone::Warn) << lost.name;

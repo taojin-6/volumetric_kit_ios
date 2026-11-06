@@ -568,7 +568,7 @@ TEST(TrackingLineOfSensorNames, EachStateHasItsOwnWords) {
     const char* words;
   };
   for (const Named& named :
-       {Named{Tracking::NotAvailable, "No tracking yet"},
+       {Named{Tracking::NotAvailable, "No tracking"},
         Named{Tracking::Initializing, "Initializing"},
         Named{Tracking::Relocalizing, "Relocalizing"},
         Named{Tracking::ExcessiveMotion, "Moving too fast"},

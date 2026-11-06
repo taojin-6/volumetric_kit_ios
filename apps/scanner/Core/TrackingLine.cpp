@@ -12,7 +12,7 @@ std::string lost_words(std::string_view tracking, bool interrupted) {
   if (tracking == "initializing") return "Initializing";
   if (tracking == "excessive motion") return "Moving too fast";
   if (tracking == "insufficient features") return "Too little in view";
-  if (tracking == "not available") return "No tracking yet";
+  if (tracking == "not available") return "No tracking";
   return std::string(tracking);
 }
 
