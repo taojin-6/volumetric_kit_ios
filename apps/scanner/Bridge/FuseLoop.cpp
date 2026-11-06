@@ -17,6 +17,7 @@
 #include "FailureHandling.hpp"
 #include "FrameFanout.hpp"
 #include "RendererImpl.hpp"
+#include "ScannerMode.hpp"
 #include "ThermalState.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/sensor/apple/core_video_color.hpp"
@@ -25,15 +26,12 @@
 #include "volumetric_kit/sensor/testing/index_band.hpp"
 #include "volumetric_kit/sensor/testing/rgbd_contract.hpp"
 #include "volumetric_kit/sensor/testing/rgbd_pattern.hpp"
+#include "volumetric_kit/sensor/yuv_image.hpp"
 
 namespace volumetric_kit::ios_app {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-// How long the loop waits for a frame before it looks at its stop flag
-// again: a stop is seen within this, as is a frame the signal missed.
-constexpr std::chrono::milliseconds kIdleWait{50};
 
 // A picture's colour tags are read again every this many frames, so a change
 // mid-run shows in the next line without reading four attachments a frame.
@@ -127,6 +125,18 @@ void take(RendererImpl& impl, sensor::testing::RgbdContract& contract,
   const std::uint64_t skipped = fanout.counts().skipped;
   std::lock_guard<std::mutex> lock(impl.camera_readout.mutex);
   impl.camera_readout.fusion_skipped = skipped;
+}
+
+// The camera's withheld picture, if a new one waits. A failure is said as a
+// failed poll's is, and gives none.
+std::optional<sensor::YuvImage> ask_withheld(RendererImpl& impl) {
+  vkc::Result<std::optional<sensor::YuvImage>> picture =
+      impl.arkit->poll_withheld_picture();
+  if (!picture) {
+    impl.fusion.note_error(picture.status().message(), "camera: ");
+    return std::nullopt;
+  }
+  return std::move(picture).value();
 }
 
 // A fused frame's spans, on fusion's worker.
@@ -317,7 +327,11 @@ void run_fuse_loop(RendererImpl& impl) {
             return;
           }
           if (!got.value()) {
-            impl.frame_signal.wait_for(kIdleWait);
+            impl.frame_signal.wait_for(no_frame_turn(
+                plan, [&impl] { return ask_withheld(impl); },
+                [&impl](const sensor::YuvImage& picture) {
+                  (void)impl.camera_view.picture.offer(picture);
+                }));
             return;
           }
           if (!window.first_frame_s) {

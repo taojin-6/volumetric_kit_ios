@@ -539,8 +539,11 @@ typedef NS_ENUM(NSInteger, VolumetricCameraOpenState) {
 @property(nonatomic, readonly, copy) NSString* model;
 /// ARKit's tracking at the last frame, named (`ArkitTracking`).
 @property(nonatomic, readonly, copy) NSString* tracking;
-/// Whether that is normal tracking, the one whose frames go out.
-@property(nonatomic, readonly) BOOL trackingNormal;
+/// The tracking chip's words, its tone, and whether a stream gets nothing now
+/// (`Core/TrackingLine.hpp`).
+@property(nonatomic, readonly, copy) NSString* trackingWords;
+@property(nonatomic, readonly) VolumetricStatTone trackingTone;
+@property(nonatomic, readonly) BOOL streamPaused;
 /// ARKit has stopped the camera for a while; no frames until it ends.
 @property(nonatomic, readonly) BOOL interrupted;
 /// ARKit's failure, which ended the session; empty for none.

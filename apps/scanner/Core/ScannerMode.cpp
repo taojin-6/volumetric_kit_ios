@@ -20,6 +20,7 @@ ModePlan mode_plan(ScannerMode mode) noexcept {
   switch (mode) {
     case ScannerMode::Client:
       plan.camera_view = true;
+      plan.withheld_pictures = true;
       break;
     case ScannerMode::Model:
       plan.grid = true;

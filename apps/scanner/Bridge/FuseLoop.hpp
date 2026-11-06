@@ -27,6 +27,18 @@ struct RendererImpl;
 /// goes to the stream, then to the camera view, which keeps it only when it
 /// wants one (Core/ViewPicture.hpp). Fused and skipped read 0.
 ///
+/// The client also asks for a withheld frame's picture on each empty poll
+/// (`no_frame_turn`), so the view stays live while tracking is lost. It goes to
+/// the view alone: the stream, the contract and every frame's count never see
+/// it. From the first ask the camera holds one picture while tracking is lost,
+/// for its life, so the loop goes on asking until the stop gives it back.
+///
+/// The model never asks. Launched as the model, the camera holds nothing for
+/// it. Switched from the client, the camera's hold stays: the model keeps at
+/// most 4 through a loss (the ring's 3 and one published keyframe), so with the
+/// hold it needs no more of the pool than the ring, the frame it fuses and the
+/// one waiting already do.
+///
 /// Waits on `impl.frame_signal` while the camera holds nothing. Each frame
 /// is checked against sensor's frame contract (`testing::RgbdContract`) and,
 /// from the pattern, for the index its depth carries; a failed poll or fuse is
