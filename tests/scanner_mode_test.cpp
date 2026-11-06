@@ -85,8 +85,8 @@ TEST(ScannerMode, RefusalsStandBesideModel) {
   }
 }
 
-/// The owner's rule for the client: no TSDF grid, no meshing, no texturing, no
-/// mesh arenas and no fusion worker, and a camera view to aim with.
+/// The client's rule: no TSDF grid, no meshing, no texturing, no mesh arenas
+/// and no fusion worker, and a camera view to aim with.
 TEST(ModePlan, TheClientRunsNoModelAndShowsTheCamera) {
   const ModePlan plan = app::mode_plan(parse({}).mode);
   EXPECT_FALSE(plan.grid);
