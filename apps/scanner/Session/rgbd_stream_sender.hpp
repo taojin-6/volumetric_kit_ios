@@ -78,6 +78,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -181,6 +182,10 @@ class RgbdStreamSender {
 
   /// @return The counts so far.
   RgbdStreamSenderStats stats() const;
+
+  /// @return What the reader last said (`RgbdStreamWriter::reader_note`); none
+  ///         with no session. From any thread.
+  std::optional<grid::networking::ViewerNote> reader_note() const;
 
   /// @return The pictures' times since the last call, oldest first; at most
   ///         the last 1024 coded.

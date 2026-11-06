@@ -414,6 +414,14 @@ RgbdStreamSenderStats RgbdStreamSender::stats() const {
   return out;
 }
 
+std::optional<grid::networking::ViewerNote> RgbdStreamSender::reader_note()
+    const {
+  const Impl& s = *impl_;
+  const std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.writer) return std::nullopt;
+  return s.writer->reader_note();
+}
+
 std::vector<PictureTimes> RgbdStreamSender::take_times() {
   Impl& s = *impl_;
   std::vector<PictureTimes> out;

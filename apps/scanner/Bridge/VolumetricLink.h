@@ -23,7 +23,7 @@
 
 #import <Foundation/Foundation.h>
 
-@class VolumetricRenderer;
+#import "VolumetricRenderer.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -93,6 +93,15 @@ typedef struct {
 
 /// The link now.
 @property(nonatomic, readonly) VolumetricLinkStatus status;
+
+/// What the reader last said, as the screen words it (`Core/ReaderLine.hpp`);
+/// nil before its first note, from a reader that sends none, or once it has
+/// left.
+@property(nonatomic, readonly, nullable, copy) NSString* readerLine;
+
+/// How @ref readerLine reads; neutral when that is nil. Read apart from it, so
+/// the two can differ for one read as a new note lands.
+@property(nonatomic, readonly) VolumetricStatTone readerTone;
 
 @end
 

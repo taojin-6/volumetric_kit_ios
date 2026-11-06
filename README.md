@@ -429,6 +429,15 @@ it (`SensorInfo`), and its frames are the camera's at 10 Hz, each its HEVC
 picture then its depth; the line says how many frames it has sent, which a
 reader that stalls has not all read. A `-dry` launch refuses the connect.
 
+The reader can say one line up the same socket, with a tone (grid's
+`ViewerNote`; `RgbdStreamWriter::reader_note`), and the top bar's first chip
+shows it as it stands, in both modes: how its tag search goes, today. The
+scanner parses no word of it, so new words need no new app. The chip is hidden
+until the first note and once the reader leaves, when the link's own chip takes
+over. A reader that says nothing shows nothing. A note 3 s old or more reads
+`Server quiet for N s` (`Core/ReaderLine.hpp`), the scanner's one line of its
+own.
+
 #### The shared device
 
 One `VkDevice` serves every library, built by volumetric_kit_core's

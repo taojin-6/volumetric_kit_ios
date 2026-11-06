@@ -10,7 +10,7 @@
 
 import SwiftUI
 
-/// The bridge's link and what it shows, refreshed twice a second.
+/// The bridge's link and what it shows, refreshed four times a second.
 final class LinkModel: ObservableObject {
   @Published private(set) var state: VolumetricLinkState = .off
   @Published private(set) var target = ""
@@ -18,6 +18,9 @@ final class LinkModel: ObservableObject {
   /// Frames the session sent whole, from its start: what the scanner wrote,
   /// not what the reader has read.
   @Published private(set) var frames: UInt64 = 0
+  /// What the reader last said, for the headline's first chip: nil hides it.
+  @Published private(set) var readerLine: String?
+  @Published private(set) var readerTone: VolumetricStatTone = .neutral
   /// Why the last connect was refused, for under the fields; nil after one
   /// that was not.
   @Published private(set) var entryError: String?
@@ -30,7 +33,7 @@ final class LinkModel: ObservableObject {
 
   init() {
     // In the common modes, so it also runs while a scroll view is tracking.
-    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
       self?.refresh()
     }
     RunLoop.main.add(timer, forMode: .common)
@@ -63,6 +66,14 @@ final class LinkModel: ObservableObject {
     if frames != now.frames { frames = now.frames }
     let named = link.target
     if target != named { target = named }
+    let said = link.readerLine
+    if readerLine != said {
+      readerLine = said
+      // So a run with no one watching leaves a record.
+      if let said { print("scanner: reader says: \(said)") }
+    }
+    let tone = link.readerTone
+    if readerTone != tone { readerTone = tone }
   }
 
   /// The headline's chip: a word, nil while off.

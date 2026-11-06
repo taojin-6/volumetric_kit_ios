@@ -6,10 +6,13 @@
 #import "BridgeStrings.hpp"
 #import "VolumetricRenderer.h"
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "LinkState.hpp"
+#include "ReaderLine.hpp"
 #include "dial_entry.hpp"
 #include "rgbd_stream_sender.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -62,6 +65,21 @@ static app::RgbdStreamSender* sender_of(
   return renderer != nil
              ? static_cast<app::RgbdStreamSender*>([renderer streamHandle])
              : nullptr;
+}
+
+// What the screen says of @p renderer's reader now; none with no stream or no
+// note. Valid as sender_of is.
+static std::optional<app::ReaderLine> reader_line_of(
+    VolumetricRenderer* _Nullable renderer) {
+  const app::RgbdStreamSender* sender = sender_of(renderer);
+  if (sender == nullptr) return std::nullopt;
+  auto note = sender->reader_note();
+  if (!note) return std::nullopt;
+  const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - note->received);
+  return app::reader_line(std::move(note->line),
+                          app::note_tone(static_cast<std::uint8_t>(note->tone)),
+                          age);
 }
 
 - (instancetype)init {
@@ -138,6 +156,20 @@ static app::RgbdStreamSender* sender_of(
   out.key_wanted = s.key_wanted;
   out.frames = s.frames;
   return out;
+}
+
+- (nullable NSString*)readerLine {
+  VolumetricRenderer* renderer = _renderer;  // held through the call
+  const std::optional<app::ReaderLine> line = reader_line_of(renderer);
+  return line ? app::to_ns_string(line->text) : nil;
+}
+
+- (VolumetricStatTone)readerTone {
+  VolumetricRenderer* renderer = _renderer;  // held through the call
+  const std::optional<app::ReaderLine> line = reader_line_of(renderer);
+  // Value for value: Readout.mm checks.
+  return line ? static_cast<VolumetricStatTone>(line->tone)
+              : VolumetricStatToneNeutral;
 }
 
 @end

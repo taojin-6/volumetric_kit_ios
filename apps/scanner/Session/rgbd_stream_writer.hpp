@@ -40,7 +40,8 @@
 /// next key, which the file keeps. The on-screen connect and disconnect move
 /// the target (@ref dial_to) while the session and the file go on, so the
 /// reader's next connection is the same session, which it accepts. The link
-/// serves a frame once the file holds it whole.
+/// serves a frame once the file holds it whole. What the reader says up the
+/// socket is read too (@ref reader_note), and no record waits on it.
 ///
 /// @code
 /// namespace app = volumetric_kit::ios_app;
@@ -60,13 +61,15 @@
 /// @endcode
 ///
 /// @warning Not thread-safe: open, append and finish from one thread;
-///          @ref dial_to, @ref key_wanted and @ref stats from any.
+///          @ref dial_to, @ref key_wanted, @ref reader_note and @ref stats
+///          from any.
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -219,7 +222,9 @@ class RgbdStreamWriter {
   ///        dialling stops, within the dial under way
   ///        (@ref RgbdStreamOptions::dial_limit), and a live reader gets the
   ///        records queued for it before its end (`StreamServer::finish`,
-  ///        within `kFinishLimit`). Idempotent.
+  ///        within `kFinishLimit`), though a note it sends as the socket closes
+  ///        can cost it the last ones, which a file, if there is one, keeps.
+  ///        Idempotent.
   /// @return OK; the footer's write error, or the file's earlier one; a
   ///         later call returns the first's. `Status::Code::OutOfMemory`
   ///         leaves the session open, and a later call tries again.
@@ -227,6 +232,11 @@ class RgbdStreamWriter {
 
   /// @return The counts so far.
   RgbdStreamStats stats() const noexcept;
+
+  /// @return What the reader last said (`StreamServer::newest_note`); none
+  ///         with no link, before its first note, or once it has left, by the
+  ///         time @ref RgbdStreamStats::viewers stops counting it.
+  std::optional<grid::networking::ViewerNote> reader_note() const noexcept;
 
  private:
   struct Impl;

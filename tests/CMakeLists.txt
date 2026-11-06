@@ -44,6 +44,7 @@ add_executable(
   orbit_camera_test.cpp
   picture_slot_test.cpp
   rate_gate_test.cpp
+  reader_line_test.cpp
   scanner_mode_test.cpp
   self_test_test.cpp
   stat_tone_test.cpp

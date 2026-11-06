@@ -296,12 +296,14 @@ core::Result<std::unique_ptr<RgbdStreamWriter>> RgbdStreamWriter::open(
   depth.params = std::move(depth_params);
   session.tracks.push_back(std::move(depth));
 
-  // Dials out and listens on nothing; one reader, which asks for keys.
+  // Dials out and listens on nothing; one reader, which asks for keys and
+  // says how it is doing.
   networking::ServerOptions& serving = impl->server_options;
   serving.listen = false;
   serving.replay_gop = false;
   serving.max_viewers = 1;
   serving.max_gop_bytes = options.max_gop_bytes;
+  serving.read_notes = true;
   impl->redial_wait = options.redial_wait;
   impl->dial_limit = options.dial_limit;
   // A tenth of the redial wait, so a redial trails a leave by the same share
@@ -495,6 +497,14 @@ RgbdStreamStats RgbdStreamWriter::stats() const noexcept {
   out.dial_failures = s.dial_failures;
   out.no_route = s.no_route;
   return out;
+}
+
+std::optional<networking::ViewerNote> RgbdStreamWriter::reader_note()
+    const noexcept {
+  const networking::StreamServer* live =
+      impl_->live.load(std::memory_order_acquire);
+  if (live == nullptr) return std::nullopt;
+  return live->newest_note();
 }
 
 }  // namespace volumetric_kit::ios_app
