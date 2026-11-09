@@ -209,6 +209,48 @@ xcrun devicectl device process launch --console --device <id> \
 The device must be **unlocked** — mounting the developer disk image fails on a
 locked device.
 
+### Which build is installed
+
+Every build stamps the scanner's `Info.plist` with the commit it was built from
+(`cmake/ScannerVersion.cmake`). Apple documents both versions as
+period-separated integers, so neither holds a hash:
+
+| Key | Holds | `devicectl device info apps` |
+| --- | --- | --- |
+| `CFBundleShortVersionString` | the project's version, `0.0.1` | Version |
+| `CFBundleVersion` | the count of first-parent commits up to HEAD (`git rev-list --count --first-parent HEAD`) | Bundle Version |
+| `VIGitCommit` | HEAD's full hash, with `-dirty` after it when a tracked file differed from HEAD | — |
+
+main takes every change as a merge, so its count rises by one a merge, and a
+later main always has a larger Bundle Version. On main the count names one
+commit:
+
+```sh
+xcrun devicectl device info apps --device <id> --bundle-id <bundle id>
+git rev-list --first-parent --reverse origin/main | sed -n '<Bundle Version>p'
+```
+
+A branch counts its own commits on top of where it left main, so its number can
+equal a later main's; the hash names any build exactly. It is on the Device
+card (to 12 characters), in the console's `scanner: build` line at launch, and
+in the bundle:
+
+```sh
+/usr/libexec/PlistBuddy -c 'Print :VIGitCommit' \
+  build-ios/apps/scanner/Release-iphoneos/scanner.app/Info.plist
+```
+
+The configure writes the stamp, and so does every build, from a target the app
+depends on (`vi_scanner_info_plist`): a commit, a checkout or an edit since the
+last configure reaches the next `xcodebuild` without one, in a linked worktree
+too. The plist changes only when the stamp does, so an unchanged build
+re-processes and re-signs nothing. Untracked files do not make a build dirty.
+With no git, outside a checkout, before the first commit, or in a source tree
+that is not its checkout's top, the stamp is `0` and `unknown`; a shallow
+clone, as CI checks out, stamps its hash and `0`. The configure and each build
+print the stamp (`scanner Info.plist: …`). `scanner_version`, a host test,
+checks all of it on repositories it makes.
+
 ### `-self-test hevc`
 
 Launched with `-self-test hevc`, the scanner runs sensor's HEVC encoder check

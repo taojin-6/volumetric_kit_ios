@@ -189,8 +189,35 @@ target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 # on the GPU (sensor_prep), so Accelerate's vImage is gone with the host
 # conversion it did.
 
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
-               "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
+# The Info.plist, stamped with the commit it was built from (CFBundleVersion and
+# VIGitCommit; cmake/ScannerVersion.cmake says what each holds). Written here so
+# the file exists from the configure on, and again at every build by
+# vi_scanner_info_plist, which the app depends on: a commit, a checkout or an
+# edit since the configure reaches the next xcodebuild with no configure in
+# between (with INFOPLIST_FILE below naming this file, not CMake's copy). The
+# file changes only when the stamp does, so an unchanged build re-processes and
+# re-signs nothing.
+include("${PROJECT_SOURCE_DIR}/cmake/ScannerVersion.cmake")
+find_package(Git QUIET)
+vi_write_scanner_info_plist(
+  "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${PROJECT_SOURCE_DIR}"
+  "${GIT_EXECUTABLE}")
+add_custom_target(
+  vi_scanner_info_plist
+  COMMAND
+    "${CMAKE_COMMAND}" "-DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+    "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    "-DSOURCE_DIR=${PROJECT_SOURCE_DIR}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    "-DVI_APP_NAME=${VI_APP_NAME}" "-DVI_BUNDLE_ID=${VI_BUNDLE_ID}"
+    "-DPROJECT_VERSION=${PROJECT_VERSION}" -P
+    "${PROJECT_SOURCE_DIR}/cmake/ScannerVersion.cmake"
+  # Named as this target's output, or Xcode takes the file as a source it read
+  # before the build began and processes the old stamp into the app.
+  BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+  COMMENT "Stamping the scanner's Info.plist with its commit"
+  VERBATIM)
+add_dependencies(${VI_APP_NAME} vi_scanner_info_plist)
 
 include(ScannerEntitlements)
 vi_write_scanner_entitlements("${CMAKE_CURRENT_BINARY_DIR}/scanner.entitlements"
@@ -199,6 +226,14 @@ vi_write_scanner_entitlements("${CMAKE_CURRENT_BINARY_DIR}/scanner.entitlements"
 set_target_properties(
   ${VI_APP_NAME}
   PROPERTIES MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+             # ~~~
+             # The stamped plist itself. The Xcode generator copies
+             # MACOSX_BUNDLE_INFO_PLIST into CMakeFiles/scanner.dir/ as it
+             # generates and points Xcode at the copy, which only a configure
+             # refreshes: every build's stamp would be the last configure's.
+             # ~~~
+             XCODE_ATTRIBUTE_INFOPLIST_FILE
+             "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
              XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${VI_BUNDLE_ID}"
              # ~~~
              # Universal (1 = iPhone, 2 = iPad). This must be the *build

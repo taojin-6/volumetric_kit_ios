@@ -224,6 +224,11 @@ final class ScannerViewController: UIViewController {
     // choice decides it rather than this defaulting to one of them.
     expandedHeight?.isActive = false
 
+    // Which build this is, on the console with the whole hash and on the
+    // Device card from launch: a bring-up that fails still says which build.
+    print("scanner: build \(Self.build(fullCommit: true))")
+    dashboard.deviceLines = [Self.buildLine]
+
     // The launch's camera arguments, said once on the console: a refused one
     // opens no camera, and a bounded run says when it ends.
     if !launch.refusal.isEmpty {
@@ -702,6 +707,7 @@ final class ScannerViewController: UIViewController {
       Vulkan \(brought.apiVersion) via MoltenVK
       device    \(brought.sharedDeviceSummary)
       shared    \(brought.sharesOneDevice ? "yes - compute and gfx hold one VkDevice" : "NO - separate devices")
+      \(Self.buildLine)
       """
     // The view may have appeared, or been backgrounded, or both, while bring-up
     // was in flight. `resume` is what reconciles that rather than assuming.
@@ -763,6 +769,26 @@ final class ScannerViewController: UIViewController {
     let cores = ProcessInfo.processInfo.processorCount
     return "\(machine)  \(cores) cores"
   }
+
+  /// The build stamp cmake/ScannerVersion.cmake writes into Info.plist: the
+  /// version, the first-parent commit count `devicectl device info apps` shows
+  /// as Bundle Version, and the commit, e.g. `0.0.1 (412) 4289df0c1a2b`. The
+  /// card takes the hash to 12 characters, keeping `-dirty`; the console takes
+  /// it whole.
+  private static func build(fullCommit: Bool) -> String {
+    let info = Bundle.main.infoDictionary ?? [:]
+    let version = info["CFBundleShortVersionString"] as? String ?? "?"
+    let count = info["CFBundleVersion"] as? String ?? "?"
+    var commit = info["VIGitCommit"] as? String ?? "unknown"
+    if !fullCommit {
+      let dirty = commit.hasSuffix("-dirty")
+      commit = String(commit.prefix(12)) + (dirty ? "-dirty" : "")
+    }
+    return "\(version) (\(count)) \(commit)"
+  }
+
+  /// The Device card's line for it, read once: it cannot change in a run.
+  private static let buildLine = "build     \(build(fullCommit: false))"
 
   /// The console transcript, rendered from the same lines the panel draws.
   ///
