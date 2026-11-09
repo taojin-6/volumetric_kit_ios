@@ -190,28 +190,24 @@ target_sources(${VI_APP_NAME} PRIVATE config/scanner.json)
 # conversion it did.
 
 # The Info.plist, stamped with the commit it was built from (CFBundleVersion and
-# VIGitCommit; cmake/ScannerVersion.cmake says what each holds). Written here so
-# the file exists from the configure on, and again at every build by
-# vi_scanner_info_plist, which the app depends on: a commit, a checkout or an
-# edit since the configure reaches the next xcodebuild with no configure in
-# between (with INFOPLIST_FILE below naming this file, not CMake's copy). The
-# file changes only when the stamp does, so an unchanged build re-processes and
-# re-signs nothing.
+# VIGitCommit; cmake/ScannerVersion.cmake says what each holds). The configure
+# fills in Info.plist.in, all but the stamp, as Info.plist.stamp.in, and stamps
+# that as Info.plist, so the file exists from the configure on. Every build
+# stamps it again from vi_scanner_info_plist, which the app depends on, and
+# fills in nothing else: a commit, a checkout or an edit since the configure
+# reaches the next xcodebuild with no configure in between (with INFOPLIST_FILE
+# below naming this file, not CMake's copy), and a value the configure filled in
+# stays filled in. The file changes only when the stamp does, so an unchanged
+# build re-processes and re-signs nothing.
 include("${PROJECT_SOURCE_DIR}/cmake/ScannerVersion.cmake")
 find_package(Git QUIET)
-vi_write_scanner_info_plist(
+vi_configure_scanner_info_plist(
   "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
   "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${PROJECT_SOURCE_DIR}"
-  "${GIT_EXECUTABLE}")
+  "${GIT_EXECUTABLE}" vi_stamp_command)
 add_custom_target(
   vi_scanner_info_plist
-  COMMAND
-    "${CMAKE_COMMAND}" "-DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
-    "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
-    "-DSOURCE_DIR=${PROJECT_SOURCE_DIR}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
-    "-DVI_APP_NAME=${VI_APP_NAME}" "-DVI_BUNDLE_ID=${VI_BUNDLE_ID}"
-    "-DPROJECT_VERSION=${PROJECT_VERSION}" -P
-    "${PROJECT_SOURCE_DIR}/cmake/ScannerVersion.cmake"
+  COMMAND ${vi_stamp_command}
   # Named as this target's output, or Xcode takes the file as a source it read
   # before the build began and processes the old stamp into the app.
   BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
@@ -231,6 +227,9 @@ set_target_properties(
              # MACOSX_BUNDLE_INFO_PLIST into CMakeFiles/scanner.dir/ as it
              # generates and points Xcode at the copy, which only a configure
              # refreshes: every build's stamp would be the last configure's.
+             # The copy stays in the project as the target's "Info.plist",
+             # unused, with the last configure's stamp; the app's plist is
+             # apps/scanner/Info.plist in the build tree.
              # ~~~
              XCODE_ATTRIBUTE_INFOPLIST_FILE
              "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"

@@ -9,12 +9,17 @@
 # ~~~
 #
 # The count is first-parent, a merged branch adding one; a tracked edit marks
-# the hash -dirty and an untracked file does not; a linked worktree, whose .git
-# is a file, stamps its own HEAD; a shallow clone stamps its hash and no count;
-# and with no git, no checkout, no commit, or a tree inside another repository,
-# the stamp is 0 and unknown. Then the app's own Info.plist.in, written by the
-# app's own function: it must lint, carry the stamp in integer versions, and be
-# left untouched when the stamp has not changed, and rewritten when it has.
+# the hash -dirty and an untracked file does not; a local dependency marks it
+# +local; a linked worktree, whose .git is a file, stamps its own HEAD; a
+# shallow clone stamps its hash and no count; and with no git, no checkout, no
+# commit, or a tree inside another repository, the stamp is 0 and unknown. Then
+# the app's own Info.plist.in, by the app's own functions: the configure's
+# write, and the command the build runs, in a cmake of its own as Xcode runs it.
+# The plist must lint, carry the stamp in integer versions, keep every value the
+# configure filled in through a build's re-stamp, and be left untouched when the
+# stamp has not changed, and rewritten when it has. That the Xcode project runs
+# the command and builds its output into the app is CI's to check
+# (.github/workflows/build.yml), as only an iOS build has the project.
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/ScannerVersion.cmake")
 
 if(NOT OUT_DIR)
@@ -66,9 +71,9 @@ function(commit dir message)
   run_git("${dir}" commit --allow-empty --no-verify -m "${message}")
 endfunction()
 
-# expect(<case> <dir> <git> <build> <commit>)
+# expect(<case> <dir> <git> <build> <commit> [<local sources>])
 function(expect case dir git build commit)
-  vi_scanner_version("${dir}" "${git}")
+  vi_scanner_version("${dir}" "${git}" "${ARGN}")
   if(NOT VI_BUNDLE_VERSION STREQUAL build OR NOT VI_GIT_COMMIT STREQUAL commit)
     message(
       FATAL_ERROR
@@ -116,6 +121,31 @@ run_git("${repo}" rev-parse HEAD)
 set(next "${out}")
 expect("next commit" "${repo}" "${GIT}" 5 "${next}")
 
+# A dependency from a local tree is in no commit here.
+expect("local" "${repo}" "${GIT}" 5 "${next}+local" VOLUMETRIC_KIT_RECON)
+file(WRITE "${repo}/tracked.txt" "three\n")
+expect("edited, local" "${repo}" "${GIT}" 5 "${next}-dirty+local"
+       "VOLUMETRIC_KIT_GFX,VOLUMETRIC_KIT_RECON")
+run_git("${repo}" reset --hard HEAD)
+
+# Which dependencies are local: the FETCHCONTENT_SOURCE_DIR_<NAME>s that are
+# set, a cache entry or a variable alike. A function, so they go with it.
+function(expect_local_sources case expected)
+  vi_scanner_local_sources(names)
+  if(NOT names STREQUAL expected)
+    message(FATAL_ERROR "${case}: local sources '${names}', expected "
+                        "'${expected}'")
+  endif()
+endfunction()
+expect_local_sources("no local sources" "")
+function(local_sources_set)
+  set(FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON "${OUT_DIR}/recon")
+  set(FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_CORE "")
+  set(FETCHCONTENT_SOURCE_DIR_SPIRV-CROSS "${OUT_DIR}/spirv-cross")
+  expect_local_sources("local sources" "SPIRV-CROSS,VOLUMETRIC_KIT_RECON")
+endfunction()
+local_sources_set()
+
 # --- A linked worktree: .git is a file there ---------------------------------
 set(worktree "${OUT_DIR}/worktree")
 # Detached at the merge, which a commit given in place of a branch gives.
@@ -148,11 +178,28 @@ expect("git not found" "${repo}" "GIT-NOTFOUND" 0 unknown)
 expect("git missing" "${repo}" "${OUT_DIR}/no-such-git" 0 unknown)
 
 # --- The app's Info.plist ----------------------------------------------------
-set(template "${CMAKE_CURRENT_LIST_DIR}/../apps/scanner/Info.plist.in")
+# The template with a value of the configure's own added, as a later key would
+# add one: a build's re-stamp must keep it, though the build passes it no value.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../apps/scanner/Info.plist.in" text)
+set(end "</dict>\n</plist>\n")
+string(FIND "${text}" "${end}" at REVERSE)
+string(LENGTH "${text}" length)
+string(LENGTH "${end}" end_length)
+math(EXPR at_end "${at} + ${end_length}")
+if(at EQUAL -1 OR NOT at_end EQUAL length)
+  message(FATAL_ERROR "Info.plist.in no longer ends ${end}")
+endif()
+string(SUBSTRING "${text}" 0 ${at} text)
+string(APPEND text "  <key>VIExample</key>\n  <string>@VI_EXAMPLE@</string>\n"
+       "${end}")
+set(template "${OUT_DIR}/Info.plist.in")
+file(WRITE "${template}" "${text}")
+
 set(plist "${OUT_DIR}/Info.plist")
 set(VI_APP_NAME scanner)
 set(VI_BUNDLE_ID io.example.scanner)
 set(PROJECT_VERSION 1.2.3)
+set(VI_EXAMPLE configured-value)
 
 # plist_value(<key> <var>)
 function(plist_value key var)
@@ -197,33 +244,90 @@ function(check_plist case build commit)
         "${case}: carries ${short} (${bundle}) ${stamped}, expected 1.2.3 "
         "(${build}) ${commit}")
   endif()
+  # And the configure's values, all of them still there.
+  plist_value(CFBundleExecutable executable)
+  plist_value(CFBundleIdentifier identifier)
+  plist_value(VIExample example)
+  if(NOT executable STREQUAL "scanner"
+     OR NOT identifier STREQUAL "io.example.scanner"
+     OR NOT example STREQUAL "configured-value")
+    message(
+      FATAL_ERROR
+        "${case}: carries ${executable} ${identifier} VIExample '${example}', "
+        "expected scanner io.example.scanner VIExample 'configured-value'")
+  endif()
 endfunction()
 
-vi_write_scanner_info_plist("${template}" "${plist}" "${worktree}" "${GIT}")
+# build_stamp(<case>): the command the build runs, in a cmake of its own with
+# none of this script's variables, as Xcode runs it.
+function(build_stamp case)
+  execute_process(
+    COMMAND ${command}
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE out
+    ERROR_VARIABLE err)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "${case}: the build's stamp failed: ${out}${err}")
+  endif()
+endfunction()
+
+# plist_age(<var>): the plist's year, 2000 while it is untouched.
+function(plist_age var)
+  file(TIMESTAMP "${plist}" year "%Y")
+  set(${var}
+      "${year}"
+      PARENT_SCOPE)
+endfunction()
+
+vi_configure_scanner_info_plist("${template}" "${plist}" "${worktree}" "${GIT}"
+                                command)
 run_git("${worktree}" rev-parse HEAD)
 set(worktree_head "${out}")
-check_plist("plist" 5 "${worktree_head}")
+check_plist("configure" 5 "${worktree_head}")
+build_stamp("build")
+check_plist("build" 5 "${worktree_head}")
 
-# An unchanged stamp leaves the file alone, or Xcode would re-process and
-# re-sign the app at every build.
+# An unchanged stamp leaves the file alone, at a configure or a build, or Xcode
+# would re-process and re-sign the app at every build.
 execute_process(COMMAND touch -t 200001010000 "${plist}")
-file(TIMESTAMP "${plist}" before "%Y")
-vi_write_scanner_info_plist("${template}" "${plist}" "${worktree}" "${GIT}")
-file(TIMESTAMP "${plist}" after "%Y")
-if(NOT before STREQUAL "2000" OR NOT after STREQUAL "2000")
+build_stamp("unchanged build")
+vi_configure_scanner_info_plist("${template}" "${plist}" "${worktree}" "${GIT}"
+                                command)
+plist_age(age)
+if(NOT age STREQUAL "2000")
   message(FATAL_ERROR "plist: rewritten with an unchanged stamp")
 endif()
 
-# A commit since is in the next write.
+# A commit since the configure is in the next build's plist, with every value
+# the configure filled in kept.
 commit("${worktree}" w2)
 run_git("${worktree}" rev-parse HEAD)
-vi_write_scanner_info_plist("${template}" "${plist}" "${worktree}" "${GIT}")
-check_plist("plist after a commit" 6 "${out}")
-file(TIMESTAMP "${plist}" after "%Y")
-if(after STREQUAL "2000")
+set(worktree_next "${out}")
+build_stamp("build after a commit")
+check_plist("build after a commit" 6 "${worktree_next}")
+plist_age(age)
+if(age STREQUAL "2000")
   message(FATAL_ERROR "plist: not rewritten after a commit")
 endif()
 
-# And the fallback still makes a valid plist.
-vi_write_scanner_info_plist("${template}" "${plist}" "${plain}" "${GIT}")
-check_plist("plist outside a checkout" 0 unknown)
+# A local dependency at the configure reaches every build's stamp.
+function(configure_with_local_sources)
+  set(FETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_RECON "${OUT_DIR}/recon")
+  vi_configure_scanner_info_plist("${template}" "${plist}" "${worktree}"
+                                  "${GIT}" command)
+  set(command
+      "${command}"
+      PARENT_SCOPE)
+endfunction()
+configure_with_local_sources()
+file(REMOVE "${plist}")
+build_stamp("build with a local source")
+check_plist("build with a local source" 6 "${worktree_next}+local")
+
+# And the fallback still makes a valid plist, at the configure and the build.
+vi_configure_scanner_info_plist("${template}" "${plist}" "${plain}" "${GIT}"
+                                command)
+check_plist("configure outside a checkout" 0 unknown)
+file(REMOVE "${plist}")
+build_stamp("build outside a checkout")
+check_plist("build outside a checkout" 0 unknown)

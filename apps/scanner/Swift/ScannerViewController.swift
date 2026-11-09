@@ -773,16 +773,16 @@ final class ScannerViewController: UIViewController {
   /// The build stamp cmake/ScannerVersion.cmake writes into Info.plist: the
   /// version, the first-parent commit count `devicectl device info apps` shows
   /// as Bundle Version, and the commit, e.g. `0.0.1 (412) 4289df0c1a2b`. The
-  /// card takes the hash to 12 characters, keeping `-dirty`; the console takes
-  /// it whole.
+  /// card takes the hash to 12 characters, keeping what follows it (`-dirty`,
+  /// `+local`); the console takes it whole.
   private static func build(fullCommit: Bool) -> String {
     let info = Bundle.main.infoDictionary ?? [:]
     let version = info["CFBundleShortVersionString"] as? String ?? "?"
     let count = info["CFBundleVersion"] as? String ?? "?"
     var commit = info["VIGitCommit"] as? String ?? "unknown"
     if !fullCommit {
-      let dirty = commit.hasSuffix("-dirty")
-      commit = String(commit.prefix(12)) + (dirty ? "-dirty" : "")
+      let hash = commit.prefix { $0.isHexDigit }
+      commit = String(hash.prefix(12)) + commit.dropFirst(hash.count)
     }
     return "\(version) (\(count)) \(commit)"
   }

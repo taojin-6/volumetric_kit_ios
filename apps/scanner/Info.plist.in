@@ -16,12 +16,14 @@
   <string>Scanner</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
-  <!-- The build stamp, written at every build by cmake/ScannerVersion.cmake.
-       Both versions are period-separated integers, as Apple documents them:
-       the project's version, then the count of first-parent commits up to
-       HEAD, which rises with every merge to main. VIGitCommit is HEAD's full
-       hash, with -dirty after it when a tracked file had local changes; 0 and
-       unknown when the build had no commit to read. -->
+  <!-- The build stamp, written at every build by cmake/ScannerVersion.cmake;
+       every other value here is the configure's. Both versions are
+       period-separated integers, as Apple documents them: the project's
+       version, then the count of first-parent commits up to HEAD, which rises
+       with every merge to main. VIGitCommit is HEAD's full hash, with -dirty
+       after it when a tracked file had local changes and +local when a
+       dependency was built from a local tree; 0 and unknown when the build had
+       no commit to read. -->
   <key>CFBundleShortVersionString</key>
   <string>@PROJECT_VERSION@</string>
   <key>CFBundleVersion</key>

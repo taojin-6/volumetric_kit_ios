@@ -136,9 +136,10 @@ set_tests_properties(scanner_entitlements PROPERTIES SKIP_REGULAR_EXPRESSION
                                                      "SKIP: plutil not found")
 
 # The scanner's build stamp as cmake/ScannerVersion.cmake writes it into the
-# app's Info.plist: the first-parent count, the hash and its -dirty, a worktree,
-# a shallow clone and every fallback, on throwaway repositories. A script, like
-# the entitlements: git and plutil do the work.
+# app's Info.plist: the first-parent count, the hash and its -dirty and +local,
+# a worktree, a shallow clone and every fallback, on throwaway repositories; and
+# the plist from the configure and from the command each build runs. A script,
+# like the entitlements: git and plutil do the work.
 add_test(
   NAME scanner_version
   COMMAND "${CMAKE_COMMAND}" "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/version" -P
