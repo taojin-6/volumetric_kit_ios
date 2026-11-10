@@ -209,6 +209,63 @@ xcrun devicectl device process launch --console --device <id> \
 The device must be **unlocked** — mounting the developer disk image fails on a
 locked device.
 
+### Which build is installed
+
+Every build stamps the scanner's `Info.plist` with the commit it was built from
+(`cmake/ScannerVersion.cmake`). Apple documents both versions as
+period-separated integers, so neither holds a hash:
+
+| Key | Holds | `devicectl device info apps` |
+| --- | --- | --- |
+| `CFBundleShortVersionString` | the project's version, `0.0.1` | Version |
+| `CFBundleVersion` | the count of first-parent commits up to HEAD (`git rev-list --count --first-parent HEAD`) | Bundle Version |
+| `VIGitCommit` | HEAD's full hash, with `-dirty` after it when a tracked file differed from HEAD, and `+local` when a dependency was built from a local tree | — |
+
+main's count rises with every merge to it (by one for a merge commit or a
+squash, by the branch's commits for a rebase merge), so a later main always
+has a larger Bundle Version. On main the count names one commit:
+
+```sh
+xcrun devicectl device info apps --device <id> --bundle-id <bundle id>
+git rev-list --first-parent --reverse origin/main | sed -n '<Bundle Version>p'
+```
+
+A branch counts its own commits on top of where it left main, so its number can
+equal a later main's; the hash names the commit exactly. It is on the Device
+card (to 12 characters), in the console's `scanner: build` line at launch, and
+in the bundle:
+
+```sh
+/usr/libexec/PlistBuddy -c 'Print :VIGitCommit' \
+  build-ios/apps/scanner/Release-iphoneos/scanner.app/Info.plist
+```
+
+The hash is this repository's. A sibling built from a local checkout
+(`FETCHCONTENT_SOURCE_DIR_<NAME>`, [above](#build)), or any other dependency
+taken from a local tree, is in no commit here, so no commit rebuilds that app:
+such a build marks the hash `+local`, and its build log names the dependencies.
+
+The configure fills in `Info.plist.in`, all but the stamp, and stamps it; every
+build stamps it again, from a target the app depends on
+(`vi_scanner_info_plist`), and fills in nothing else. A commit, a checkout or
+an edit since the last configure reaches the next `xcodebuild` without one, in
+a linked worktree too. The stamped plist is `apps/scanner/Info.plist` in the
+build tree; CMake's copy in `CMakeFiles/scanner.dir/`, which the Xcode project
+lists as the target's `Info.plist`, is unused and keeps the last configure's
+stamp. The plist changes only when the stamp does, so an unchanged build
+re-processes and re-signs nothing. Untracked files do not make a build dirty.
+With no git, outside a checkout, before the first commit, or in a source tree
+that is not its checkout's top, the stamp is `0` and `unknown`; a shallow
+clone, as CI checks out, stamps its hash and `0`. The configure and each build
+print the stamp (`scanner Info.plist: …`).
+
+`scanner_version`, a host test, checks the stamp on repositories it makes, and
+the plist both from the configure's functions and from the command each build
+runs, in a `cmake` of its own as Xcode runs it. It cannot check the Xcode
+project, which only an iOS configure makes; CI's iOS build does: it commits
+after the build, rebuilds the scanner, and checks that the app carries the new
+commit.
+
 ### `-self-test hevc`
 
 Launched with `-self-test hevc`, the scanner runs sensor's HEVC encoder check

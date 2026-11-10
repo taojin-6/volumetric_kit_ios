@@ -107,6 +107,49 @@ jobs:
           fi
           echo "${found} app bundle(s) verified as iOS arm64."
 
+      # The scanner's build stamp comes from every build, not only from the
+      # configure (README, "Which build is installed"): a commit since the last
+      # build must reach the app at the next one, with no configure between.
+      # This checks the Xcode project's half, which no host test can: the stamp
+      # target runs, and its plist, not CMake's configure-time copy, is the one
+      # built into the app. The commit stays on the runner.
+      - name: Verify a commit reaches the scanner's build stamp
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(build-ios/apps/scanner/*-iphoneos/scanner.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::expected one scanner.app, found ${#apps[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          config="$(basename "$(dirname "${app}")")"
+          config="${config%-iphoneos}"
+          stamp() { /usr/libexec/PlistBuddy -c "Print :$1" "${app}/Info.plist"; }
+          # A shallow checkout, as actions/checkout makes, stamps no count.
+          check() {
+            local head count commit bundle
+            head="$(git rev-parse HEAD)"
+            count=0
+            if [ "$(git rev-parse --is-shallow-repository)" = false ]; then
+              count="$(git rev-list --count --first-parent HEAD)"
+            fi
+            commit="$(stamp VIGitCommit)"
+            bundle="$(stamp CFBundleVersion)"
+            echo "after $1: VIGitCommit ${commit}, CFBundleVersion ${bundle}"
+            if [ "${commit}" != "${head}" ] || [ "${bundle}" != "${count}" ]; then
+              echo "::error::after $1, scanner.app carries ${commit} (${bundle}), not HEAD ${head} (${count})"
+              exit 1
+            fi
+          }
+          check "the build"
+          git -c user.name=ci -c user.email=ci@example.invalid \
+            -c commit.gpgsign=false \
+            commit --allow-empty --no-verify --quiet -m "ci: build stamp check"
+          cmake --build build-ios --config "${config}" --target scanner -- \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          check "a commit and a rebuild"
+
       - name: Verify the scanner scenario is bundled
         run: |
           cmp apps/scanner/config/scanner.json \
